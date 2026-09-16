@@ -1,0 +1,21 @@
+# CMake and build output
+/build/
+/cmake-build-*/
+
+# Conan generated files and local caches
+/CMakeUserPresets.json
+/.conan/
+/conan_toolchain.cmake
+/generators/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# C/C++ tooling output
+compile_commands.json

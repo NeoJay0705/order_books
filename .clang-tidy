@@ -1,0 +1,12 @@
+---
+Checks: >-
+  -*,
+  bugprone-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  modernize-use-override
+WarningsAsErrors: ''
+HeaderFilterRegex: '^(.*order_books|.*tests)/.*'
+FormatStyle: file
+...
