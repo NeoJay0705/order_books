@@ -47,6 +47,15 @@
       "cacheVariables": {
         "ORDER_BOOKS_ENABLE_CLANG_TIDY": "ON"
       }
+    },
+    {
+      "name": "release-benchmark",
+      "displayName": "Release benchmark",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/build/ReleaseBenchmark",
+      "cacheVariables": {
+        "ORDER_BOOKS_BUILD_BENCHMARKS": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -65,6 +74,10 @@
     {
       "name": "debug-clang-tidy",
       "configurePreset": "debug-clang-tidy"
+    },
+    {
+      "name": "release-benchmark",
+      "configurePreset": "release-benchmark"
     }
   ],
   "testPresets": [

@@ -19,3 +19,6 @@
 
 # C/C++ tooling output
 compile_commands.json
+
+# Others
+tmp*

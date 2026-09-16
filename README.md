@@ -1,9 +1,9 @@
 # order_books
 
-`order_books` is a C++20 project scaffold for a future order book implementation.
-The first phase intentionally contains no order book business logic, public product API,
-CLI, service, or deployment image. It validates the cross-platform C++ development and
-testing toolchain that future domain work will use.
+`order_books` is a C++20, embeddable order book and matching-engine library. The first
+implementation slice provides the deterministic core, versioned binary persistence, and
+single-process multi-shard runtime described in
+[`docs/order-book-design.md`](docs/order-book-design.md).
 
 ## Current status
 
@@ -15,9 +15,11 @@ testing toolchain that future domain work will use.
 - Linux validation: GCC and Clang
 - License: Apache-2.0
 
-The design constraints and first-phase acceptance criteria are documented in
-[`docs/project-design.md`](docs/project-design.md). Tool comparisons and rationale are
-in [`docs/technical-decisions.md`](docs/technical-decisions.md).
+The requirements are documented in [`docs/Order-book-spec.md`](docs/Order-book-spec.md),
+and the current implementation source of truth is
+[`docs/order-book-design.md`](docs/order-book-design.md). The initial repository
+skeleton and tool comparisons remain in [`docs/project-design.md`](docs/project-design.md)
+and [`docs/technical-decisions.md`](docs/technical-decisions.md).
 
 ## Prerequisites
 
@@ -75,6 +77,14 @@ cmake --build --preset release
 ctest --preset release
 ```
 
+The benchmark is opt-in and has no performance gate:
+
+```bash
+cmake --preset release-benchmark
+cmake --build --preset release-benchmark
+./build/ReleaseBenchmark/benchmarks/order_books_benchmark --iterations=20 --warmup=5
+```
+
 ## Quality checks
 
 Run ASan and UBSan using the Debug Conan dependencies:
@@ -92,7 +102,7 @@ cmake --preset debug-clang-tidy
 cmake --build --preset debug-clang-tidy
 ```
 
-Check formatting without modifying files:
+The current CI formatting smoke check is non-mutating:
 
 ```bash
 clang-format --dry-run --Werror tests/toolchain_smoke_test.cpp
@@ -105,12 +115,12 @@ checks. Formatting fixes are intentionally explicit:
 clang-format -i tests/toolchain_smoke_test.cpp
 ```
 
-## Repository scope
+## Current scope
 
-This phase does not define order book data structures, matching rules, order types,
-threading, persistence, networking, performance targets, or a stable C++ API. Those
-decisions require product use cases and will be added to the design before product code
-is introduced.
+The current API supports limit GTC New, Amend, Replace, Cancel, price-time matching,
+queries, producer idempotency, WAL/Snapshot recovery, and an at-least-once `EventSink`.
+Networking, Kafka adapters, risk, replication/HA, and additional order types remain out
+of scope. The C++ API is not yet an installed or ABI-stable package.
 
 ## Contributing
 
