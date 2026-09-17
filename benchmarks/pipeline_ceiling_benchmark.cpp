@@ -39,7 +39,6 @@ namespace {
 
 using namespace std::chrono_literals;
 
-constexpr std::size_t kProducerLanes = 1'024;
 constexpr std::size_t kTombstoneLimit = 1'000'000;
 constexpr std::size_t kWalSegmentSize = 256U * 1024U * 1024U;
 constexpr auto kPhaseTimeout = 60s;
@@ -505,9 +504,11 @@ bool run_metrics_single(const PipelineBenchmarkOptions& options) {
                 static_cast<double>(elapsed_ns);
   print_timing("metrics", "writer_only", options, samples, observations, elapsed_ns,
                "metrics_return", "metric_group",
-               "metric_calls_per_command=" +
+               "contention_mode=single_worker writer_metric_calls_per_command=" +
                    std::to_string(kWriterMetricCallsPerCommand) +
-                   " metric_names=" + std::string(kWriterMetricNames) +
+                   " publisher_metric_calls_per_command=" +
+                   std::to_string(kPublisherMetricCallsPerCommand) +
+                   " writer_metric_names=" + std::string(kWriterMetricNames) +
                    " observations=" + std::to_string(observations) +
                    " observations_per_second=" + std::to_string(observations_rate),
                rate);
@@ -517,21 +518,28 @@ bool run_metrics_single(const PipelineBenchmarkOptions& options) {
 struct ContendedMetricResult {
   Samples samples;
   std::uint64_t commands{};
+  std::uint64_t elapsed_ns{};
 };
 
-bool run_metrics_contended(const PipelineBenchmarkOptions& options) {
-  NullMetricsSink downstream;
-  runtime::MetricsRegistry registry(downstream);
+bool run_metrics_parallel(const PipelineBenchmarkOptions& options,
+                          const bool separate_registries) {
+  NullMetricsSink shared_downstream;
+  runtime::MetricsRegistry shared_registry(shared_downstream);
+  runtime::MetricsRegistry writer_registry(shared_downstream);
+  runtime::MetricsRegistry publisher_registry(shared_downstream);
+  auto* writer_metrics = separate_registries ? &writer_registry : &shared_registry;
+  auto* publisher_metrics = separate_registries ? &publisher_registry : &shared_registry;
   const auto commands_per_worker = checked_multiply(options.iterations, options.batch_size);
   const auto warmup_commands = checked_multiply(options.warmup, options.batch_size);
-  const auto run_worker = [&registry, warmup_commands](
-                              const auto observer, const std::uint64_t seed) {
+  const auto run_worker = [warmup_commands](runtime::MetricsRegistry& registry,
+                                            const auto observer,
+                                            const std::uint64_t seed) {
     for (std::uint64_t index = 0; index < warmup_commands; ++index) {
       observer(registry, seed + index);
     }
   };
-  run_worker(observe_writer_metric_mix, 0);
-  run_worker(observe_publisher_metric_mix, commands_per_worker + 1U);
+  run_worker(*writer_metrics, observe_writer_metric_mix, 0);
+  run_worker(*publisher_metrics, observe_publisher_metric_mix, commands_per_worker + 1U);
   ContendedMetricResult first;
   ContendedMetricResult second;
   first.samples.values.reserve(options.iterations);
@@ -540,15 +548,17 @@ bool run_metrics_contended(const PipelineBenchmarkOptions& options) {
   std::barrier start_barrier(3, [&wall_start]() noexcept {
     wall_start = std::chrono::steady_clock::now();
   });
-  const auto measure_worker = [&registry, &options, &start_barrier](
-                                  const auto observer, const std::uint64_t seed,
-                                  ContendedMetricResult& result) {
+  const auto measure_worker = [&options, &start_barrier](runtime::MetricsRegistry* registry,
+                                                          const auto observer,
+                                                          const std::uint64_t seed,
+                                                          ContendedMetricResult& result) {
     start_barrier.arrive_and_wait();
+    const auto worker_start = std::chrono::steady_clock::now();
     std::uint64_t index = seed;
     for (std::uint64_t group = 0; group < options.iterations; ++group) {
       const auto start = std::chrono::steady_clock::now();
       for (std::size_t command = 0; command < options.batch_size; ++command) {
-        observer(registry, index++);
+        observer(*registry, index++);
       }
       result.samples.values.push_back(static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -556,9 +566,14 @@ bool run_metrics_contended(const PipelineBenchmarkOptions& options) {
               .count()));
     }
     result.commands = checked_multiply(options.iterations, options.batch_size);
+    result.elapsed_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - worker_start)
+            .count());
   };
-  std::thread first_thread(measure_worker, observe_writer_metric_mix, 0, std::ref(first));
-  std::thread second_thread(measure_worker, observe_publisher_metric_mix,
+  std::thread first_thread(measure_worker, writer_metrics, observe_writer_metric_mix, 0,
+                           std::ref(first));
+  std::thread second_thread(measure_worker, publisher_metrics, observe_publisher_metric_mix,
                             commands_per_worker + 1U, std::ref(second));
   start_barrier.arrive_and_wait();
   first_thread.join();
@@ -567,18 +582,20 @@ bool run_metrics_contended(const PipelineBenchmarkOptions& options) {
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now() - wall_start)
           .count());
-  auto samples = std::move(first.samples.values);
-  samples.insert(samples.end(), second.samples.values.begin(), second.samples.values.end());
-  std::sort(samples.begin(), samples.end());
-  const auto snapshot = registry.snapshot();
+  const auto writer_snapshot = writer_metrics->snapshot();
+  const auto publisher_snapshot = publisher_metrics->snapshot();
   const auto expected_writer_commands = checked_add(warmup_commands, first.commands);
   const auto expected_publisher_commands = checked_add(warmup_commands, second.commands);
-  if (snapshot.commands != expected_writer_commands ||
-      snapshot.replayed_records != expected_publisher_commands ||
-      snapshot.publish_latency.count != expected_publisher_commands) {
-    report_error("metrics", "validation", "contended_metric_count_mismatch");
+  if (first.samples.values.size() != options.iterations ||
+      second.samples.values.size() != options.iterations ||
+      writer_snapshot.commands != expected_writer_commands ||
+      publisher_snapshot.replayed_records != expected_publisher_commands ||
+      publisher_snapshot.publish_latency.count != expected_publisher_commands) {
+    report_error("metrics", "validation", "parallel_metric_count_mismatch");
     return false;
   }
+  auto samples = std::move(first.samples.values);
+  samples.insert(samples.end(), second.samples.values.begin(), second.samples.values.end());
   Samples aggregate{std::move(samples)};
   const auto writer_observations =
       checked_multiply(first.commands, kWriterMetricCallsPerCommand);
@@ -595,10 +612,31 @@ bool run_metrics_contended(const PipelineBenchmarkOptions& options) {
                         ? 0.0
                         : static_cast<double>(command_pairs) * 1'000'000'000.0 /
                               static_cast<double>(elapsed_ns);
-  print_timing("metrics", "writer_publisher_contended", options, aggregate,
+  const auto worker_rate = [](const std::uint64_t commands,
+                              const std::uint64_t duration_ns) {
+    return duration_ns == 0
+               ? 0.0
+               : static_cast<double>(commands) * 1'000'000'000.0 /
+                     static_cast<double>(duration_ns);
+  };
+  const auto test_case = separate_registries
+                             ? "writer_publisher_separate_registries"
+                             : "writer_publisher_contended";
+  const auto contention_mode = separate_registries
+                                   ? "separate_registries_two_workers"
+                                   : "shared_registry_two_workers";
+  print_timing("metrics", test_case, options, aggregate,
                observations, elapsed_ns, "metrics_return",
                "concurrent_worker_group",
-               "contention_mode=shared_registry_two_workers"
+               "contention_mode=" + std::string(contention_mode) +
+                   " writer_elapsed_ms=" +
+                   std::to_string(first.elapsed_ns / 1'000'000.0) +
+                   " publisher_elapsed_ms=" +
+                   std::to_string(second.elapsed_ns / 1'000'000.0) +
+                   " writer_commands_per_second=" +
+                   std::to_string(worker_rate(first.commands, first.elapsed_ns)) +
+                   " publisher_commands_per_second=" +
+                   std::to_string(worker_rate(second.commands, second.elapsed_ns)) +
                    " writer_commands=" + std::to_string(first.commands) +
                    " publisher_commands=" + std::to_string(second.commands) +
                    " writer_metric_calls_per_command=" +
@@ -613,6 +651,14 @@ bool run_metrics_contended(const PipelineBenchmarkOptions& options) {
                    " observations_per_second=" + std::to_string(observations_rate),
                rate);
   return true;
+}
+
+bool run_metrics_contended(const PipelineBenchmarkOptions& options) {
+  return run_metrics_parallel(options, false);
+}
+
+bool run_metrics_separate_registries(const PipelineBenchmarkOptions& options) {
+  return run_metrics_parallel(options, true);
 }
 
 struct HandoffLane {
@@ -809,7 +855,7 @@ bool run_runtime_handoff(const PipelineBenchmarkOptions& options,
     return false;
   }
   auto engine = std::get<std::unique_ptr<Engine>>(std::move(opened));
-  HandoffState state(kProducerLanes);
+  HandoffState state(options.producer_lanes);
   std::uint64_t next_order_id = 1;
   const auto command_count = checked_multiply(options.iterations, options.batch_size);
   const auto warmup_count = checked_multiply(options.warmup, options.batch_size);
@@ -846,7 +892,7 @@ bool run_runtime_handoff(const PipelineBenchmarkOptions& options,
       "queued=" + std::to_string(command_count) +
           " callbacks=" + std::to_string(state.completed) +
           " expected_error=invalid_command producer_lanes=" +
-          std::to_string(kProducerLanes) +
+          std::to_string(options.producer_lanes) +
           " engine_group_size=" + std::to_string(options.engine_group_size) +
           " engine_group_delay_us=" +
           std::to_string(options.engine_group_delay.count()),
@@ -1121,7 +1167,9 @@ bool run_pipeline_ceiling(const PipelineBenchmarkOptions& options,
         case PipelineStage::invariant_validation:
           return run_invariant_validation(options);
         case PipelineStage::metrics:
-          return run_metrics_single(options) && run_metrics_contended(options);
+          return run_metrics_single(options) &&
+                 run_metrics_separate_registries(options) &&
+                 run_metrics_contended(options);
         case PipelineStage::runtime_handoff:
           return run_runtime_handoff(options, *root);
         case PipelineStage::publisher_drain:

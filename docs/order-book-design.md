@@ -883,6 +883,10 @@ Publisher stage 必須等待 durable cursor 追上 WAL head 並在 stop/join 後
 latency Pareto frontier，不修改 production default、Publisher cursor semantics 或任何
 batching implementation。
 
+根因分析時，pipeline benchmark 可用 `--pipeline-producer-lanes=N` 掃描 runtime handoff
+的 producer concurrency；metrics stage 同時輸出 separate-registry 與 shared-registry
+雙 worker 對照。兩者都只屬 benchmark 診斷控制，不改變 production runtime 設定。
+
 `engine_durable_single_instrument` 可用 benchmark-only `--engine-group-size` 與
 `--engine-group-delay-us` 執行 matrix；這些選項只覆寫 benchmark 建立的 `RuntimeConfig`，
 不改變 production defaults。component ceiling、WAL durable、Publisher drain 與 Engine

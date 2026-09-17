@@ -62,7 +62,7 @@ jobs:
       - name: WAL ceiling append smoke
         run: ./build/ReleaseBenchmark/benchmarks/order_books_benchmark --workload=wal_write_ceiling --iterations=2 --warmup=1 --wal-group-size=4 --wal-sync=none
       - name: Engine pipeline ceiling smoke
-        run: ./build/ReleaseBenchmark/benchmarks/order_books_benchmark --workload=engine_pipeline_ceiling --pipeline-stage=all --iterations=2 --warmup=1 --pipeline-batch-size=4 --pipeline-active-orders=8
+        run: ./build/ReleaseBenchmark/benchmarks/order_books_benchmark --workload=engine_pipeline_ceiling --pipeline-stage=all --iterations=2 --warmup=1 --pipeline-batch-size=4 --pipeline-active-orders=8 --pipeline-producer-lanes=8
 
   linux-clang:
     name: Linux Clang

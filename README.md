@@ -147,6 +147,23 @@ group-commit matrix, the existing Engine workload accepts benchmark-only overrid
   --data-dir=/mnt/local-nvme/order-books-benchmark/engine-group-512
 ```
 
+For runtime root-cause analysis, `runtime_handoff` accepts
+`--pipeline-producer-lanes=N` (default `1024`) so producer concurrency can be swept without
+changing the production runtime configuration. The metrics stage reports both separate-registry
+and shared-registry two-worker controls; these are diagnostic controls, not production settings.
+
+```bash
+./build/ReleaseBenchmark/benchmarks/order_books_benchmark \
+  --workload=engine_pipeline_ceiling \
+  --pipeline-stage=runtime_handoff \
+  --iterations=1000 \
+  --warmup=100 \
+  --pipeline-batch-size=256 \
+  --pipeline-producer-lanes=64 \
+  --engine-group-size=256 \
+  --engine-group-delay-us=200
+```
+
 Run each filesystem case in a new empty directory and compare at least five Release runs.
 Component ceilings, WAL durable throughput, publisher drain throughput, and Engine completion
 throughput are separate measurements; none can substitute for the end-to-end result.

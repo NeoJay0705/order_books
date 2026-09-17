@@ -25,6 +25,7 @@ struct PipelineBenchmarkOptions {
   std::size_t active_orders{};
   std::size_t engine_group_size{};
   std::chrono::microseconds engine_group_delay{};
+  std::size_t producer_lanes{};
   std::optional<std::filesystem::path> data_directory;
 };
 

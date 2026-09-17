@@ -35,6 +35,8 @@ using namespace order_books;
 constexpr std::uint64_t kIterations = 2'000;
 constexpr std::uint64_t kWarmup = 100;
 constexpr std::size_t kDurableProducerLanes = 1'024;
+constexpr std::size_t kPipelineProducerLanes = 1'024;
+constexpr std::size_t kPipelineIngressQueueCapacity = 65'536;
 constexpr auto kDurablePhaseTimeout = std::chrono::seconds(60);
 
 enum class WorkloadSelection {
@@ -57,6 +59,7 @@ struct BenchmarkOptions {
   benchmark::PipelineStage pipeline_stage{benchmark::PipelineStage::all};
   std::size_t pipeline_batch_size{256};
   std::size_t pipeline_active_orders{};
+  std::size_t pipeline_producer_lanes{kPipelineProducerLanes};
   bool pipeline_options_set{};
   std::optional<std::filesystem::path> data_directory;
 };
@@ -240,6 +243,10 @@ std::optional<BenchmarkOptions> parse_options(const int argc, char** argv) {
     } else if (const auto active_orders =
                    parse_positive_option(argument, "--pipeline-active-orders=")) {
       options.pipeline_active_orders = static_cast<std::size_t>(*active_orders);
+      options.pipeline_options_set = true;
+    } else if (const auto producer_lanes =
+                   parse_positive_option(argument, "--pipeline-producer-lanes=")) {
+      options.pipeline_producer_lanes = static_cast<std::size_t>(*producer_lanes);
       options.pipeline_options_set = true;
     } else if (argument.starts_with("--pipeline-stage=")) {
       const auto stage = benchmark::parse_pipeline_stage(
@@ -1080,7 +1087,8 @@ void print_usage() {
                "engine_pipeline_ceiling] [--data-dir=PATH] [--wal-group-size=N] "
                "[--wal-sync=none|per_group] [--engine-group-size=N] "
                "[--engine-group-delay-us=N] [--pipeline-stage=STAGE] "
-               "[--pipeline-batch-size=N] [--pipeline-active-orders=N]\n";
+               "[--pipeline-batch-size=N] [--pipeline-active-orders=N] "
+               "[--pipeline-producer-lanes=N]\n";
 }
 
 int main(const int argc, char** argv) {
@@ -1113,6 +1121,18 @@ int main(const int argc, char** argv) {
   if (options->pipeline_batch_size == 0) {
     std::cerr << "workload=" << workload_name(options->workload)
               << " phase=cli error_code=pipeline_batch_size_must_be_positive\n";
+    print_usage();
+    return 2;
+  }
+  if (options->pipeline_producer_lanes == 0) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=pipeline_producer_lanes_must_be_positive\n";
+    print_usage();
+    return 2;
+  }
+  if (options->pipeline_producer_lanes > kPipelineIngressQueueCapacity) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=pipeline_producer_lanes_exceed_capacity\n";
     print_usage();
     return 2;
   }
@@ -1169,6 +1189,7 @@ int main(const int argc, char** argv) {
         options->pipeline_active_orders,
         options->engine_group_size,
         options->engine_group_delay,
+        options->pipeline_producer_lanes,
         options->data_directory,
     };
     return benchmark::run_pipeline_ceiling(pipeline_options, options->pipeline_stage) ? 0 : 1;
