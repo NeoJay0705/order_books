@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -147,6 +148,145 @@ TEST(PersistenceTest, WalBytesAfterRebasesPrefixIndexAfterRetention) {
   bytes = wal->bytes_after(4, 5);
   ASSERT_TRUE(std::holds_alternative<std::uint64_t>(bytes));
   EXPECT_EQ(std::get<std::uint64_t>(bytes), fifth_frame_bytes);
+}
+
+TEST(PersistenceTest, WalBatchAppendPreservesDurabilityBoundary) {
+  TemporaryDirectory temporary("order_books_wal_batch_boundary_test");
+  const auto wal_directory = temporary.path() / "wal";
+  constexpr std::size_t segment_size = 1U * 1024U * 1024U;
+  const std::vector<domain::CommittedCommand> commands{command(1), command(2), command(3)};
+
+  auto opened = Wal::open(wal_directory, 1, segment_size);
+  ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Wal>>(opened));
+  auto wal = std::get<std::unique_ptr<Wal>>(std::move(opened));
+  const auto appended = wal->append_batch(commands);
+  ASSERT_TRUE(std::holds_alternative<WalPosition>(appended));
+  EXPECT_EQ(std::get<WalPosition>(appended).engine_seq, 3U);
+  EXPECT_EQ(wal->durable_position().engine_seq, 0U);
+  ASSERT_TRUE(std::holds_alternative<std::monostate>(wal->sync()));
+  EXPECT_EQ(wal->durable_position().engine_seq, 3U);
+
+  auto replayed = wal->replay();
+  ASSERT_TRUE(std::holds_alternative<std::vector<domain::CommittedCommand>>(replayed));
+  const auto& records = std::get<std::vector<domain::CommittedCommand>>(replayed);
+  ASSERT_EQ(records.size(), commands.size());
+  for (std::size_t index = 0; index < commands.size(); ++index) {
+    EXPECT_EQ(records[index].engine_seq, commands[index].engine_seq);
+    EXPECT_EQ(records[index].command, commands[index].command);
+  }
+}
+
+TEST(PersistenceTest, WalBatchAppendRotatesWithoutSplittingFrames) {
+  TemporaryDirectory temporary("order_books_wal_batch_rotation_test");
+  const auto wal_directory = temporary.path() / "wal";
+  const auto first = command(1);
+  const auto frame_bytes = 4U + encode_committed_command(first).size() + 6U;
+  const auto segment_size = std::size_t{22} + frame_bytes + 1U;
+  const std::vector<domain::CommittedCommand> commands{command(1), command(2), command(3)};
+
+  auto opened = Wal::open(wal_directory, 1, segment_size);
+  ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Wal>>(opened));
+  auto wal = std::get<std::unique_ptr<Wal>>(std::move(opened));
+  ASSERT_TRUE(std::holds_alternative<WalPosition>(wal->append_batch(commands)));
+  ASSERT_TRUE(std::holds_alternative<std::monostate>(wal->sync()));
+  EXPECT_EQ(wal_segments(wal_directory).size(), commands.size());
+  for (const auto& segment : wal_segments(wal_directory)) {
+    EXPECT_EQ(std::filesystem::file_size(segment), std::size_t{22} + frame_bytes);
+  }
+
+  auto replayed = wal->replay();
+  ASSERT_TRUE(std::holds_alternative<std::vector<domain::CommittedCommand>>(replayed));
+  const auto& records = std::get<std::vector<domain::CommittedCommand>>(replayed);
+  ASSERT_EQ(records.size(), commands.size());
+  for (std::size_t index = 0; index < commands.size(); ++index) {
+    EXPECT_EQ(records[index].engine_seq, commands[index].engine_seq);
+    EXPECT_EQ(records[index].command, commands[index].command);
+  }
+}
+
+TEST(PersistenceTest, WalSingleAndBatchAppendShareIndexes) {
+  TemporaryDirectory temporary("order_books_wal_batch_index_test");
+  const auto wal_directory = temporary.path() / "wal";
+  constexpr std::size_t segment_size = 1U * 1024U * 1024U;
+  const auto first = command(1);
+  const std::vector<domain::CommittedCommand> batch{command(2), command(3)};
+
+  auto opened = Wal::open(wal_directory, 1, segment_size);
+  ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Wal>>(opened));
+  auto wal = std::get<std::unique_ptr<Wal>>(std::move(opened));
+  ASSERT_TRUE(std::holds_alternative<WalPosition>(wal->append(first)));
+  ASSERT_TRUE(std::holds_alternative<WalPosition>(wal->append_batch(batch)));
+  ASSERT_TRUE(std::holds_alternative<std::monostate>(wal->sync()));
+  ASSERT_TRUE(std::holds_alternative<std::vector<domain::CommittedCommand>>(wal->replay()));
+
+  const auto first_frame_bytes = 4U + encode_committed_command(first).size() + 6U;
+  const auto second_frame_bytes = 4U + encode_committed_command(batch[0]).size() + 6U;
+  const auto third_frame_bytes = 4U + encode_committed_command(batch[1]).size() + 6U;
+  const auto bytes = wal->bytes_after(0, 3);
+  ASSERT_TRUE(std::holds_alternative<std::uint64_t>(bytes));
+  EXPECT_EQ(std::get<std::uint64_t>(bytes),
+            first_frame_bytes + second_frame_bytes + third_frame_bytes);
+  const auto next = wal->next_after(1, 3);
+  ASSERT_TRUE(std::holds_alternative<std::optional<domain::CommittedCommand>>(next));
+  ASSERT_TRUE(std::get<std::optional<domain::CommittedCommand>>(next).has_value());
+  EXPECT_EQ(std::get<std::optional<domain::CommittedCommand>>(next)->engine_seq, 2U);
+
+  ASSERT_TRUE(std::holds_alternative<std::monostate>(wal->retain_through(1)));
+  const auto retained_bytes = wal->bytes_after(1, 3);
+  ASSERT_TRUE(std::holds_alternative<std::uint64_t>(retained_bytes));
+  EXPECT_EQ(std::get<std::uint64_t>(retained_bytes), second_frame_bytes + third_frame_bytes);
+  const auto retained_next = wal->next_after(1, 3);
+  ASSERT_TRUE(std::holds_alternative<std::optional<domain::CommittedCommand>>(retained_next));
+  ASSERT_TRUE(std::get<std::optional<domain::CommittedCommand>>(retained_next).has_value());
+  EXPECT_EQ(std::get<std::optional<domain::CommittedCommand>>(retained_next)->engine_seq, 2U);
+  const auto removed_cursor = wal->bytes_after(0, 3);
+  ASSERT_TRUE(std::holds_alternative<Error>(removed_cursor));
+  EXPECT_EQ(std::get<Error>(removed_cursor).code, ErrorCode::corrupt_wal);
+}
+
+TEST(PersistenceTest, WalReopenKeepsActiveDescriptorForBatchAppend) {
+  TemporaryDirectory temporary("order_books_wal_batch_reopen_test");
+  const auto wal_directory = temporary.path() / "wal";
+  constexpr std::size_t segment_size = 1U * 1024U * 1024U;
+  const std::vector<domain::CommittedCommand> first_batch{command(1), command(2)};
+  const std::vector<domain::CommittedCommand> second_batch{command(3), command(4)};
+
+  {
+    auto opened = Wal::open(wal_directory, 1, segment_size);
+    ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Wal>>(opened));
+    auto wal = std::get<std::unique_ptr<Wal>>(std::move(opened));
+    ASSERT_TRUE(std::holds_alternative<WalPosition>(wal->append_batch(first_batch)));
+    ASSERT_TRUE(std::holds_alternative<std::monostate>(wal->sync()));
+  }
+
+  auto reopened = Wal::open(wal_directory, 1, segment_size);
+  ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Wal>>(reopened));
+  auto wal = std::get<std::unique_ptr<Wal>>(std::move(reopened));
+  ASSERT_TRUE(std::holds_alternative<std::vector<domain::CommittedCommand>>(
+      wal->replay()));
+  ASSERT_TRUE(std::holds_alternative<WalPosition>(wal->append_batch(second_batch)));
+  ASSERT_TRUE(std::holds_alternative<std::monostate>(wal->sync()));
+  auto replayed = wal->replay();
+  ASSERT_TRUE(std::holds_alternative<std::vector<domain::CommittedCommand>>(replayed));
+  ASSERT_EQ(std::get<std::vector<domain::CommittedCommand>>(replayed).size(), 4U);
+  EXPECT_EQ(std::get<std::vector<domain::CommittedCommand>>(replayed).back().engine_seq, 4U);
+}
+
+TEST(PersistenceTest, WalEmptyBatchDoesNotChangeState) {
+  TemporaryDirectory temporary("order_books_wal_empty_batch_test");
+  const auto wal_directory = temporary.path() / "wal";
+  auto opened = Wal::open(wal_directory, 1, 1U * 1024U * 1024U);
+  ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Wal>>(opened));
+  auto wal = std::get<std::unique_ptr<Wal>>(std::move(opened));
+  const auto before_size = wal->size_bytes();
+  const auto before_position = wal->durable_position();
+  const std::span<const domain::CommittedCommand> empty;
+
+  const auto result = wal->append_batch(empty);
+  ASSERT_TRUE(std::holds_alternative<Error>(result));
+  EXPECT_EQ(std::get<Error>(result).code, ErrorCode::wal_failure);
+  EXPECT_EQ(wal->size_bytes(), before_size);
+  EXPECT_EQ(wal->durable_position().engine_seq, before_position.engine_seq);
 }
 
 TEST(PersistenceTest, LastSegmentPartialTailIsTruncated) {

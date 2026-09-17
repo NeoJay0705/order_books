@@ -866,13 +866,11 @@ void ShardRuntime::process_command_batch(std::vector<CommandWork> batch) {
                                static_cast<std::uint64_t>(queue_latency.count()));
   }
   const auto wal_start = std::chrono::steady_clock::now();
-  for (const auto& command : accepted) {
-    auto appended = wal_->append(command);
-    if (std::holds_alternative<Error>(appended)) {
-      reject_batch_pending(ErrorCode::engine_unavailable);
-      fail(std::get<Error>(appended));
-      return;
-    }
+  auto appended = wal_->append_batch(accepted);
+  if (std::holds_alternative<Error>(appended)) {
+    reject_batch_pending(ErrorCode::engine_unavailable);
+    fail(std::get<Error>(appended));
+    return;
   }
   if (const auto status = wal_->sync(); std::holds_alternative<Error>(status)) {
     reject_batch_pending(ErrorCode::engine_unavailable);

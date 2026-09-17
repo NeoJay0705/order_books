@@ -101,6 +101,25 @@ Result<EngineSeq> segment_sequence_checked(const std::filesystem::path& path) {
   return value;
 }
 
+Result<std::vector<std::byte>> encode_frame(
+    const domain::CommittedCommand& command) {
+  const auto payload = encode_committed_command(command);
+  BinaryWriter body_writer;
+  body_writer.u16(kRecordVersion);
+  body_writer.data().insert(body_writer.data().end(), payload.begin(), payload.end());
+  const auto body_crc = crc32c(body_writer.data());
+  body_writer.u32(body_crc);
+  const auto& body = body_writer.data();
+  if (body.size() > kMaxRecordSize) {
+    return wal_error(ErrorCode::wal_failure, "WAL record exceeds maximum size");
+  }
+
+  BinaryWriter frame_writer;
+  frame_writer.u32(static_cast<std::uint32_t>(body.size()));
+  frame_writer.data().insert(frame_writer.data().end(), body.begin(), body.end());
+  return frame_writer.data();
+}
+
 }  // namespace
 
 Result<std::unique_ptr<Wal>> Wal::open(std::filesystem::path directory,
@@ -152,8 +171,19 @@ Result<std::unique_ptr<Wal>> Wal::open(std::filesystem::path directory,
     if (filesystem_error || wal->active_bytes_ < kHeaderSize) {
       return wal_error(ErrorCode::corrupt_wal, "invalid active WAL segment");
     }
+    auto descriptor = FileOps::open_append(wal->active_segment_);
+    if (std::holds_alternative<Error>(descriptor)) {
+      return std::get<Error>(descriptor);
+    }
+    wal->active_descriptor_ = std::get<int>(descriptor);
   }
   return wal;
+}
+
+Wal::~Wal() {
+  if (active_descriptor_ >= 0) {
+    FileOps::close(active_descriptor_);
+  }
 }
 
 std::filesystem::path Wal::segment_path(const EngineSeq first_engine_seq) const {
@@ -188,38 +218,46 @@ Status Wal::validate_segment_header(const std::span<const std::byte> bytes,
 }
 
 Status Wal::create_segment(const EngineSeq first_engine_seq) {
+  if (active_descriptor_ >= 0) {
+    FileOps::close(active_descriptor_);
+    active_descriptor_ = -1;
+  }
   active_segment_ = segment_path(first_engine_seq);
   const auto header = segment_header(first_engine_seq);
   auto descriptor = FileOps::open_append(active_segment_);
   if (std::holds_alternative<Error>(descriptor)) {
     return std::get<Error>(descriptor);
   }
-  const auto status = FileOps::write_all(std::get<int>(descriptor), header);
+  const auto descriptor_value = std::get<int>(descriptor);
+  const auto status = FileOps::write_all(descriptor_value, header);
   if (std::holds_alternative<Error>(status)) {
-    FileOps::close(std::get<int>(descriptor));
+    FileOps::close(descriptor_value);
     return std::get<Error>(status);
   }
-  const auto sync_status = FileOps::sync_file(std::get<int>(descriptor));
-  FileOps::close(std::get<int>(descriptor));
+  const auto sync_status = FileOps::sync_file(descriptor_value);
   if (std::holds_alternative<Error>(sync_status)) {
+    FileOps::close(descriptor_value);
     return std::get<Error>(sync_status);
   }
+  const auto directory_status = FileOps::sync_directory(directory_);
+  if (std::holds_alternative<Error>(directory_status)) {
+    FileOps::close(descriptor_value);
+    return std::get<Error>(directory_status);
+  }
+  active_descriptor_ = descriptor_value;
   active_bytes_ = header.size();
   size_bytes_ += header.size();
   last_appended_position_ = WalPosition{0, active_segment_, active_bytes_};
   active_dirty_ = false;
-  return FileOps::sync_directory(directory_);
+  return std::monostate{};
 }
 
 Status Wal::sync_active_unlocked() {
   const auto was_dirty = active_dirty_;
-  auto descriptor = FileOps::open_append(active_segment_);
-  if (std::holds_alternative<Error>(descriptor)) {
-    return std::get<Error>(descriptor);
+  if (active_descriptor_ < 0) {
+    return wal_error(ErrorCode::wal_failure, "active WAL descriptor is not open");
   }
-  const auto descriptor_value = std::get<int>(descriptor);
-  const auto status = FileOps::sync_file(descriptor_value);
-  FileOps::close(descriptor_value);
+  const auto status = FileOps::sync_file(active_descriptor_);
   if (std::holds_alternative<Error>(status)) {
     return std::get<Error>(status);
   }
@@ -268,77 +306,184 @@ Status Wal::rebuild_record_index_unlocked() {
   return std::monostate{};
 }
 
+Result<std::vector<Wal::PreparedRecord>> Wal::prepare_records_unlocked(
+    const std::span<const domain::CommittedCommand> commands) const {
+  std::vector<PreparedRecord> records;
+  records.reserve(commands.size());
+  for (const auto& command : commands) {
+    auto frame = encode_frame(command);
+    if (std::holds_alternative<Error>(frame)) {
+      return std::get<Error>(frame);
+    }
+    const auto& frame_bytes = std::get<std::vector<std::byte>>(frame);
+    if (frame_bytes.size() + kHeaderSize > segment_size_) {
+      return wal_error(ErrorCode::wal_failure, "WAL record cannot fit in a segment");
+    }
+    records.push_back(PreparedRecord{command,
+                                     std::get<std::vector<std::byte>>(std::move(frame))});
+  }
+  return records;
+}
+
 Result<WalPosition> Wal::append(const domain::CommittedCommand& command) {
   std::lock_guard lock(mutex_);
-  const auto payload = encode_committed_command(command);
-  BinaryWriter body_writer;
-  body_writer.u16(kRecordVersion);
-  body_writer.data().insert(body_writer.data().end(), payload.begin(), payload.end());
-  const auto body_crc = crc32c(body_writer.data());
-  body_writer.u32(body_crc);
-  const auto& body = body_writer.data();
-  if (body.size() > kMaxRecordSize) {
-    return wal_error(ErrorCode::wal_failure, "WAL record exceeds maximum size");
+  const std::span<const domain::CommittedCommand> commands(&command, 1);
+  auto prepared = prepare_records_unlocked(commands);
+  if (std::holds_alternative<Error>(prepared)) {
+    return std::get<Error>(prepared);
+  }
+  return append_prepared_unlocked(
+      std::get<std::vector<PreparedRecord>>(std::move(prepared)));
+}
+
+Result<WalPosition> Wal::append_batch(
+    const std::span<const domain::CommittedCommand> commands) {
+  std::lock_guard lock(mutex_);
+  if (commands.empty()) {
+    return wal_error(ErrorCode::wal_failure, "WAL append batch is empty");
+  }
+  auto prepared = prepare_records_unlocked(commands);
+  if (std::holds_alternative<Error>(prepared)) {
+    return std::get<Error>(prepared);
+  }
+  return append_prepared_unlocked(
+      std::get<std::vector<PreparedRecord>>(std::move(prepared)));
+}
+
+Result<WalPosition> Wal::append_prepared_unlocked(
+    std::vector<PreparedRecord> records) {
+  if (records.empty()) {
+    return wal_error(ErrorCode::wal_failure, "WAL append batch is empty");
+  }
+  if (records.size() > records_.max_size() - records_.size()) {
+    return wal_error(ErrorCode::wal_failure, "WAL record count overflow");
   }
 
-  BinaryWriter frame_writer;
-  frame_writer.u32(static_cast<std::uint32_t>(body.size()));
-  frame_writer.data().insert(frame_writer.data().end(), body.begin(), body.end());
-  const auto frame = frame_writer.data();
-  if (frame.size() + kHeaderSize > segment_size_) {
-    return wal_error(ErrorCode::wal_failure, "WAL record cannot fit in a segment");
-  }
-
-  std::uint64_t cumulative_frame_bytes = frame.size();
-  std::uint64_t continuity_id = 0;
+  std::vector<CachedRecord> cached_records;
+  cached_records.reserve(records.size());
+  std::uint64_t cumulative_frame_bytes = records_.empty()
+                                              ? 0U
+                                              : records_.back().cumulative_frame_bytes;
+  std::uint64_t continuity_id = records_.empty() ? 0U : records_.back().continuity_id;
+  std::optional<EngineSeq> previous_sequence;
   if (!records_.empty()) {
-    const auto& previous = records_.back();
-    if (frame.size() > std::numeric_limits<std::uint64_t>::max() -
-                           previous.cumulative_frame_bytes) {
+    previous_sequence = records_.back().command.engine_seq;
+  }
+  std::uint64_t frame_bytes_total = 0;
+  for (const auto& record : records) {
+    const auto frame_bytes = static_cast<std::uint64_t>(record.frame.size());
+    if (frame_bytes > std::numeric_limits<std::uint64_t>::max() - cumulative_frame_bytes ||
+        frame_bytes > std::numeric_limits<std::uint64_t>::max() - frame_bytes_total) {
       return wal_error(ErrorCode::wal_failure, "WAL frame byte index overflow");
     }
-    cumulative_frame_bytes = previous.cumulative_frame_bytes + frame.size();
-    continuity_id = previous.continuity_id;
-    if (previous.command.engine_seq == std::numeric_limits<EngineSeq>::max() ||
-        command.engine_seq != previous.command.engine_seq + 1U) {
+    cumulative_frame_bytes += frame_bytes;
+    frame_bytes_total += frame_bytes;
+    if (previous_sequence.has_value() &&
+        (*previous_sequence == std::numeric_limits<EngineSeq>::max() ||
+         record.command.engine_seq != *previous_sequence + 1U)) {
       if (continuity_id == std::numeric_limits<std::uint64_t>::max()) {
         return wal_error(ErrorCode::wal_failure, "WAL continuity index overflow");
       }
       ++continuity_id;
     }
+    cached_records.push_back(
+        CachedRecord{record.command, frame_bytes, cumulative_frame_bytes, continuity_id});
+    previous_sequence = record.command.engine_seq;
   }
-  if (active_bytes_ + frame.size() > segment_size_) {
-    if (active_dirty_) {
-      auto status = sync_active_unlocked();
+  if (frame_bytes_total > std::numeric_limits<std::uint64_t>::max() - size_bytes_) {
+    return wal_error(ErrorCode::wal_failure, "WAL size overflow");
+  }
+  const auto required_capacity = records_.size() + records.size();
+  if (required_capacity > records_.capacity()) {
+    const auto current_capacity = records_.capacity();
+    const auto growth = std::max(records.size(), current_capacity / 2U);
+    const auto grown_capacity =
+        growth > records_.max_size() - current_capacity
+            ? records_.max_size()
+            : current_capacity + growth;
+    records_.reserve(std::max(required_capacity, grown_capacity));
+  }
+
+  struct PreparedChunk {
+    std::size_t first_record{};
+    std::size_t record_count{};
+    bool rotate_before{};
+    std::vector<std::byte> bytes;
+  };
+  std::vector<PreparedChunk> chunks;
+  chunks.reserve(records.size());
+  auto simulated_active_bytes = active_bytes_;
+  bool rotate_before = false;
+  std::size_t first_record = 0;
+  while (first_record < records.size()) {
+    if (simulated_active_bytes > segment_size_) {
+      simulated_active_bytes = kHeaderSize;
+      rotate_before = true;
+    }
+    std::size_t end_record = first_record;
+    std::uint64_t chunk_bytes = 0;
+    while (end_record < records.size()) {
+      const auto frame_size = static_cast<std::uint64_t>(records[end_record].frame.size());
+      const auto available = static_cast<std::uint64_t>(segment_size_) - simulated_active_bytes;
+      if (chunk_bytes > available || frame_size > available - chunk_bytes ||
+          frame_size > std::numeric_limits<std::uint64_t>::max() - chunk_bytes) {
+        break;
+      }
+      chunk_bytes += frame_size;
+      ++end_record;
+    }
+    if (end_record == first_record) {
+      simulated_active_bytes = kHeaderSize;
+      rotate_before = true;
+      continue;
+    }
+    std::vector<std::byte> bytes;
+    bytes.reserve(static_cast<std::size_t>(chunk_bytes));
+    for (std::size_t index = first_record; index < end_record; ++index) {
+      const auto& frame = records[index].frame;
+      bytes.insert(bytes.end(), frame.begin(), frame.end());
+    }
+    chunks.push_back(PreparedChunk{first_record, end_record - first_record,
+                                   rotate_before, std::move(bytes)});
+    rotate_before = false;
+    simulated_active_bytes += chunk_bytes;
+    first_record = end_record;
+  }
+
+  WalPosition last_position;
+  for (const auto& chunk : chunks) {
+    if (chunk.rotate_before) {
+      if (active_dirty_) {
+        auto status = sync_active_unlocked();
+        if (std::holds_alternative<Error>(status)) {
+          return std::get<Error>(status);
+        }
+      }
+      auto status = create_segment(records[chunk.first_record].command.engine_seq);
       if (std::holds_alternative<Error>(status)) {
         return std::get<Error>(status);
       }
     }
-    auto status = create_segment(command.engine_seq);
+    if (active_descriptor_ < 0) {
+      return wal_error(ErrorCode::wal_failure, "active WAL descriptor is not open");
+    }
+    const auto status = FileOps::write_all(active_descriptor_, chunk.bytes);
     if (std::holds_alternative<Error>(status)) {
       return std::get<Error>(status);
     }
+    for (std::size_t offset = 0; offset < chunk.record_count; ++offset) {
+      const auto record_index = chunk.first_record + offset;
+      const auto frame_size = static_cast<std::uint64_t>(records[record_index].frame.size());
+      active_bytes_ += frame_size;
+      size_bytes_ += frame_size;
+      last_position = WalPosition{records[record_index].command.engine_seq,
+                                  active_segment_, active_bytes_};
+      last_appended_position_ = last_position;
+      records_.push_back(std::move(cached_records[record_index]));
+    }
+    active_dirty_ = true;
   }
-
-  auto descriptor = FileOps::open_append(active_segment_);
-  if (std::holds_alternative<Error>(descriptor)) {
-    return std::get<Error>(descriptor);
-  }
-  const auto descriptor_value = std::get<int>(descriptor);
-  const auto status = FileOps::write_all(descriptor_value, frame);
-  if (std::holds_alternative<Error>(status)) {
-    FileOps::close(descriptor_value);
-    return std::get<Error>(status);
-  }
-  FileOps::close(descriptor_value);
-  active_bytes_ += frame.size();
-  size_bytes_ += frame.size();
-  WalPosition position{command.engine_seq, active_segment_, active_bytes_};
-  last_appended_position_ = position;
-  active_dirty_ = true;
-  records_.push_back(
-      CachedRecord{command, frame.size(), cumulative_frame_bytes, continuity_id});
-  return position;
+  return last_position;
 }
 
 Status Wal::sync() {

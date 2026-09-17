@@ -574,6 +574,7 @@ bool run_wal_groups(storage::Wal& wal, const std::uint64_t group_count,
                     const std::string_view phase, WalGroupSamples* samples) {
   for (std::uint64_t group = 0; group < group_count; ++group) {
     if (group_size == 0 || remaining_commands < group_size ||
+        group_size > std::numeric_limits<std::size_t>::max() ||
         next_sequence == 0 ||
         group_size > std::numeric_limits<EngineSeq>::max() - next_sequence + 1U) {
       report_wal_error(phase, "sequence_overflow");
@@ -581,13 +582,10 @@ bool run_wal_groups(storage::Wal& wal, const std::uint64_t group_count,
     }
     const auto group_start = std::chrono::steady_clock::now();
     const auto append_start = group_start;
+    std::vector<domain::CommittedCommand> commands;
+    commands.reserve(static_cast<std::size_t>(group_size));
     for (std::uint64_t offset = 0; offset < group_size; ++offset) {
-      const auto appended = wal.append(make_committed(next_sequence));
-      if (std::holds_alternative<Error>(appended)) {
-        report_wal_error(phase, "wal_append_failed",
-                         std::get<Error>(appended).message);
-        return false;
-      }
+      commands.push_back(make_committed(next_sequence));
       --remaining_commands;
       if (remaining_commands > 0) {
         if (next_sequence == std::numeric_limits<EngineSeq>::max()) {
@@ -596,6 +594,12 @@ bool run_wal_groups(storage::Wal& wal, const std::uint64_t group_count,
         }
         ++next_sequence;
       }
+    }
+    const auto appended = wal.append_batch(commands);
+    if (std::holds_alternative<Error>(appended)) {
+      report_wal_error(phase, "wal_append_failed",
+                       std::get<Error>(appended).message);
+      return false;
     }
     const auto append_end = std::chrono::steady_clock::now();
     std::uint64_t sync_duration = 0;

@@ -27,7 +27,11 @@ class Wal {
                                            ShardId shard_id,
                                            std::size_t segment_size);
 
+  ~Wal();
+
   Result<WalPosition> append(const domain::CommittedCommand& command);
+  Result<WalPosition> append_batch(
+      std::span<const domain::CommittedCommand> commands);
   Status sync();
   Result<std::vector<domain::CommittedCommand>> replay();
   Result<std::optional<domain::CommittedCommand>> next_after(EngineSeq sequence,
@@ -59,12 +63,22 @@ class Wal {
     std::uint64_t continuity_id{};
   };
 
+  struct PreparedRecord {
+    domain::CommittedCommand command;
+    std::vector<std::byte> frame;
+  };
+
+  Result<std::vector<PreparedRecord>> prepare_records_unlocked(
+      std::span<const domain::CommittedCommand> commands) const;
+  Result<WalPosition> append_prepared_unlocked(
+      std::vector<PreparedRecord> records);
   Status rebuild_record_index_unlocked();
 
   std::filesystem::path directory_;
   ShardId shard_id_{};
   std::size_t segment_size_{};
   std::filesystem::path active_segment_;
+  int active_descriptor_{-1};
   std::uint64_t active_bytes_{};
   std::uint64_t size_bytes_{};
   WalPosition last_appended_position_;

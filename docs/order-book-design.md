@@ -467,7 +467,7 @@ max 256 commands
 或等待最長 200 microseconds
 ```
 
-同一 producer stream 的下一筆在前一筆完成前屬違反 single-in-flight contract，不納入同批。Writer 為 batch 依序分配 tentative EngineSeq、encode、append，單次 fsync。Durable success 後再依 EngineSeq 逐筆呼叫 state machine 並完成 callback。
+同一 producer stream 的下一筆在前一筆完成前屬違反 single-in-flight contract，不納入同批。Writer 為 batch 依序分配 tentative EngineSeq、encode、batch append，單次 fsync。WAL active segment 保持 descriptor 開啟；未跨 segment 的 batch 合併為一次 data write，跨 segment 時每個 touched segment 各寫一次，且不改變 record framing。Durable success 後再依 EngineSeq 逐筆呼叫 state machine 並完成 callback。
 
 若 append 或 fsync 失敗，整個未確認 batch 不得 apply 或 success；shard 進入 FAILED。Recovery 以可驗證的完整 WAL tail 決定哪些 records committed。
 
@@ -981,3 +981,4 @@ Destructor 不得隱藏可能失敗的完整 shutdown；application 應顯式呼
 8. Completion slot 以原始 batch index 保存 admission 與 accepted result，全部 durable/apply/invariant 工作完成後才按 request 順序 dispatch，並由 fatal guard 補齊尚未完成的 callback。
 9. Runtime configuration reconciliation 只對 active Instrument 的 immutable 欄位變更或任何 mapping removal／change fail-stop；新增 Instrument 與未有 active order 的欄位更新可建立新 manifest，current behavior version 取本次 supplied configuration，而非 persisted history 最大值。
 10. Durable benchmark 將每個 sample 定義為完整 group commit，檢查所有 persistence／recovery 結果並使用每次執行唯一 temporary directory；OrderBook dead helpers、unused guard API、未使用的 WAL durable branch 與過寬 `tmp*` ignore rule 已移除。
+11. WAL append hot path 保留 `append()` 相容介面並新增 internal batch append；兩者共用 frame preparation、rotation 與 metadata path。active descriptor 的 RAII lifecycle 消除逐筆 open／close，但 durability boundary 仍是既有 group `fsync`，不引入新的 on-disk format 或 async writer。
