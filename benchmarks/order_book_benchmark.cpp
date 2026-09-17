@@ -24,6 +24,7 @@
 #include "domain/invariant_checker.hpp"
 #include "domain/state_machine.hpp"
 #include "order_books/engine.hpp"
+#include "pipeline_ceiling_benchmark.hpp"
 #include "persistence/snapshot_store.hpp"
 #include "persistence/wal.hpp"
 
@@ -36,7 +37,12 @@ constexpr std::uint64_t kWarmup = 100;
 constexpr std::size_t kDurableProducerLanes = 1'024;
 constexpr auto kDurablePhaseTimeout = std::chrono::seconds(60);
 
-enum class WorkloadSelection { all, engine_durable_single_instrument, wal_write_ceiling };
+enum class WorkloadSelection {
+  all,
+  engine_durable_single_instrument,
+  wal_write_ceiling,
+  engine_pipeline_ceiling,
+};
 
 enum class WalSyncMode { none, per_group };
 
@@ -46,6 +52,12 @@ struct BenchmarkOptions {
   WorkloadSelection workload{WorkloadSelection::all};
   std::uint64_t wal_group_size{256};
   WalSyncMode wal_sync_mode{WalSyncMode::per_group};
+  std::size_t engine_group_size{256};
+  std::chrono::microseconds engine_group_delay{200};
+  benchmark::PipelineStage pipeline_stage{benchmark::PipelineStage::all};
+  std::size_t pipeline_batch_size{256};
+  std::size_t pipeline_active_orders{};
+  bool pipeline_options_set{};
   std::optional<std::filesystem::path> data_directory;
 };
 
@@ -176,6 +188,9 @@ std::optional<WorkloadSelection> parse_workload(const std::string_view value) {
   if (value == "wal_write_ceiling") {
     return WorkloadSelection::wal_write_ceiling;
   }
+  if (value == "engine_pipeline_ceiling") {
+    return WorkloadSelection::engine_pipeline_ceiling;
+  }
   return std::nullopt;
 }
 
@@ -187,6 +202,8 @@ std::string_view workload_name(const WorkloadSelection workload) {
       return "engine_durable_single_instrument";
     case WorkloadSelection::wal_write_ceiling:
       return "wal_write_ceiling";
+    case WorkloadSelection::engine_pipeline_ceiling:
+      return "engine_pipeline_ceiling";
   }
   return "unknown";
 }
@@ -211,6 +228,27 @@ std::optional<BenchmarkOptions> parse_options(const int argc, char** argv) {
       options.warmup = *warmup;
     } else if (const auto group_size = parse_positive_option(argument, "--wal-group-size=")) {
       options.wal_group_size = *group_size;
+    } else if (const auto group_size = parse_positive_option(argument, "--engine-group-size=")) {
+      options.engine_group_size = static_cast<std::size_t>(*group_size);
+    } else if (const auto delay =
+                   parse_positive_option(argument, "--engine-group-delay-us=")) {
+      options.engine_group_delay = std::chrono::microseconds(*delay);
+    } else if (const auto batch_size =
+                   parse_positive_option(argument, "--pipeline-batch-size=")) {
+      options.pipeline_batch_size = static_cast<std::size_t>(*batch_size);
+      options.pipeline_options_set = true;
+    } else if (const auto active_orders =
+                   parse_positive_option(argument, "--pipeline-active-orders=")) {
+      options.pipeline_active_orders = static_cast<std::size_t>(*active_orders);
+      options.pipeline_options_set = true;
+    } else if (argument.starts_with("--pipeline-stage=")) {
+      const auto stage = benchmark::parse_pipeline_stage(
+          argument.substr(std::string_view("--pipeline-stage=").size()));
+      if (!stage.has_value()) {
+        return std::nullopt;
+      }
+      options.pipeline_stage = *stage;
+      options.pipeline_options_set = true;
     } else if (argument.starts_with("--workload=")) {
       const auto workload = parse_workload(argument.substr(std::string_view("--workload=").size()));
       if (!workload.has_value()) {
@@ -869,8 +907,8 @@ bool run_engine_durable_single_instrument(const BenchmarkOptions& options) {
   config.shard_ids = {1};
   config.instruments = {InstrumentConfig{1, 1, 1, 1}};
   config.runtime.ingress_queue_capacity = 65'536;
-  config.runtime.group_commit_max_commands = 256;
-  config.runtime.group_commit_max_delay = std::chrono::microseconds(200);
+  config.runtime.group_commit_max_commands = options.engine_group_size;
+  config.runtime.group_commit_max_delay = options.engine_group_delay;
   config.runtime.snapshot_interval_commands = std::numeric_limits<std::size_t>::max();
   config.runtime.snapshot_interval = std::chrono::hours(24);
   config.runtime.event_replay_snapshot_interval_commands =
@@ -1038,8 +1076,11 @@ bool run_engine_durable_single_instrument(const BenchmarkOptions& options) {
 
 void print_usage() {
   std::cerr << "usage: order_books_benchmark [--iterations=N] [--warmup=N] "
-               "[--workload=all|engine_durable_single_instrument|wal_write_ceiling] "
-               "[--data-dir=PATH] [--wal-group-size=N] [--wal-sync=none|per_group]\n";
+               "[--workload=all|engine_durable_single_instrument|wal_write_ceiling|"
+               "engine_pipeline_ceiling] [--data-dir=PATH] [--wal-group-size=N] "
+               "[--wal-sync=none|per_group] [--engine-group-size=N] "
+               "[--engine-group-delay-us=N] [--pipeline-stage=STAGE] "
+               "[--pipeline-batch-size=N] [--pipeline-active-orders=N]\n";
 }
 
 int main(const int argc, char** argv) {
@@ -1060,6 +1101,25 @@ int main(const int argc, char** argv) {
   if (options->wal_group_size == 0) {
     std::cerr << "workload=" << workload_name(options->workload)
               << " phase=cli error_code=wal_group_size_must_be_positive\n";
+    print_usage();
+    return 2;
+  }
+  if (options->engine_group_size == 0) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=engine_group_size_must_be_positive\n";
+    print_usage();
+    return 2;
+  }
+  if (options->pipeline_batch_size == 0) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=pipeline_batch_size_must_be_positive\n";
+    print_usage();
+    return 2;
+  }
+  if (options->pipeline_options_set &&
+      options->workload != WorkloadSelection::engine_pipeline_ceiling) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=pipeline_option_requires_pipeline_workload\n";
     print_usage();
     return 2;
   }
@@ -1100,6 +1160,18 @@ int main(const int argc, char** argv) {
   }
   if (options->workload == WorkloadSelection::wal_write_ceiling) {
     return run_wal_write_ceiling(*options) ? 0 : 1;
+  }
+  if (options->workload == WorkloadSelection::engine_pipeline_ceiling) {
+    const benchmark::PipelineBenchmarkOptions pipeline_options{
+        options->iterations,
+        options->warmup,
+        options->pipeline_batch_size,
+        options->pipeline_active_orders,
+        options->engine_group_size,
+        options->engine_group_delay,
+        options->data_directory,
+    };
+    return benchmark::run_pipeline_ceiling(pipeline_options, options->pipeline_stage) ? 0 : 1;
   }
 
   OrderBook resting(1);

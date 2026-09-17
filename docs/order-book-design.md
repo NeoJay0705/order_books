@@ -843,6 +843,7 @@ mixed_single_instrument
 wal_write_ceiling
 recovery_snapshot_plus_wal
 engine_durable_single_instrument
+engine_pipeline_ceiling
 ```
 
 每次報告包含：
@@ -872,6 +873,20 @@ completion dispatch。它使用多個 producer lanes 遵守 single-in-flight con
 Sell／Buy pair 維持單一 order book 的 bounded size。此 workload 不等待 downstream
 EventSink ACK，也延後 Snapshot／replay Snapshot trigger；`wal_write_ceiling` 與此
 Engine workload 不得混為同一個 RPS 數字。
+
+`engine_pipeline_ceiling` 是 benchmark-only 診斷 workload，分別量測正式
+`StateMachine::apply`、完整 `validate_state`、`MetricsRegistry`、公開 Engine 的 ingress／
+admission／Completion handoff，以及 Publisher backlog drain。CPU stage 使用 group-based
+loop；queue、Completion、WAL 與 Publisher 保留正式 worker、同步、I/O 與 backpressure。
+Publisher stage 必須等待 durable cursor 追上 WAL head 並在 stop/join 後 reopen 驗證，不能
+只用 in-memory confirmed cursor 推論可持續吞吐。此 workload 產出 component ceiling 與
+latency Pareto frontier，不修改 production default、Publisher cursor semantics 或任何
+batching implementation。
+
+`engine_durable_single_instrument` 可用 benchmark-only `--engine-group-size` 與
+`--engine-group-delay-us` 執行 matrix；這些選項只覆寫 benchmark 建立的 `RuntimeConfig`，
+不改變 production defaults。component ceiling、WAL durable、Publisher drain 與 Engine
+end-to-end 結果必須分開報告，不能互相替代。
 
 Release 文件必須另外記錄 recovery benchmark 的參考硬體、Snapshot order count、WAL record count／bytes 與實測時間，用來驗證暫定 60 秒 RTO。RTO 不在不穩定的 shared CI runner 上作硬性 gate；若參考環境無法達成，必須先調整 Snapshot／retention 參數或更新需求，不能忽略結果。
 

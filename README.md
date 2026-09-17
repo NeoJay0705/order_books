@@ -119,6 +119,38 @@ The `per_group` result counts a command only after its group `fsync` succeeds. E
 use a new empty directory; the benchmark reopens and replays the WAL before printing a
 successful summary.
 
+To measure the individual Engine pipeline ceilings, use the diagnostic workload. It keeps
+the existing production implementations and does not change runtime defaults:
+
+```bash
+./build/ReleaseBenchmark/benchmarks/order_books_benchmark \
+  --workload=engine_pipeline_ceiling \
+  --pipeline-stage=all \
+  --iterations=20 \
+  --warmup=4 \
+  --pipeline-batch-size=64 \
+  --pipeline-active-orders=1000
+```
+
+`state_machine`, `invariant_validation`, and `metrics` are cache-warm component ceilings;
+`runtime_handoff` and `publisher_drain` use the real Engine/worker paths. The publisher stage
+waits for the durable cursor to reach the WAL head before reporting success. For a durable
+group-commit matrix, the existing Engine workload accepts benchmark-only overrides:
+
+```bash
+./build/ReleaseBenchmark/benchmarks/order_books_benchmark \
+  --workload=engine_durable_single_instrument \
+  --engine-group-size=512 \
+  --engine-group-delay-us=200 \
+  --iterations=10000 \
+  --warmup=1000 \
+  --data-dir=/mnt/local-nvme/order-books-benchmark/engine-group-512
+```
+
+Run each filesystem case in a new empty directory and compare at least five Release runs.
+Component ceilings, WAL durable throughput, publisher drain throughput, and Engine completion
+throughput are separate measurements; none can substitute for the end-to-end result.
+
 ## Quality checks
 
 Run ASan and UBSan using the Debug Conan dependencies:

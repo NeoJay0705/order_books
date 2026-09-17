@@ -6,6 +6,7 @@ add_executable(order_books_tests
   unit/state_machine_test.cpp
   integration/codec_test.cpp
   integration/engine_durable_single_instrument_test.cpp
+  integration/engine_pipeline_ceiling_test.cpp
   integration/engine_test.cpp
   integration/persistence_test.cpp
   integration/wal_write_ceiling_test.cpp

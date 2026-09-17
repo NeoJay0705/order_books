@@ -1,5 +1,6 @@
 add_executable(order_books_benchmark
   order_book_benchmark.cpp
+  pipeline_ceiling_benchmark.cpp
 )
 
 set_target_properties(order_books_benchmark PROPERTIES
