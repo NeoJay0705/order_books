@@ -230,6 +230,44 @@ Status Wal::sync_active_unlocked() {
   return std::monostate{};
 }
 
+Status Wal::rebuild_record_index_unlocked() {
+  std::uint64_t cumulative_frame_bytes = 0;
+  std::uint64_t continuity_id = 0;
+  std::optional<EngineSeq> previous_sequence;
+  for (const auto& record : records_) {
+    if (record.frame_bytes > std::numeric_limits<std::uint64_t>::max() -
+                                 cumulative_frame_bytes) {
+      return wal_error(ErrorCode::wal_failure, "WAL frame byte index overflow");
+    }
+    if (previous_sequence.has_value() &&
+        (*previous_sequence == std::numeric_limits<EngineSeq>::max() ||
+         record.command.engine_seq != *previous_sequence + 1U)) {
+      if (continuity_id == std::numeric_limits<std::uint64_t>::max()) {
+        return wal_error(ErrorCode::wal_failure, "WAL continuity index overflow");
+      }
+      ++continuity_id;
+    }
+    cumulative_frame_bytes += record.frame_bytes;
+    previous_sequence = record.command.engine_seq;
+  }
+
+  cumulative_frame_bytes = 0;
+  continuity_id = 0;
+  previous_sequence.reset();
+  for (auto& record : records_) {
+    if (previous_sequence.has_value() &&
+        (*previous_sequence == std::numeric_limits<EngineSeq>::max() ||
+         record.command.engine_seq != *previous_sequence + 1U)) {
+      ++continuity_id;
+    }
+    cumulative_frame_bytes += record.frame_bytes;
+    record.cumulative_frame_bytes = cumulative_frame_bytes;
+    record.continuity_id = continuity_id;
+    previous_sequence = record.command.engine_seq;
+  }
+  return std::monostate{};
+}
+
 Result<WalPosition> Wal::append(const domain::CommittedCommand& command) {
   std::lock_guard lock(mutex_);
   const auto payload = encode_committed_command(command);
@@ -249,6 +287,25 @@ Result<WalPosition> Wal::append(const domain::CommittedCommand& command) {
   const auto frame = frame_writer.data();
   if (frame.size() + kHeaderSize > segment_size_) {
     return wal_error(ErrorCode::wal_failure, "WAL record cannot fit in a segment");
+  }
+
+  std::uint64_t cumulative_frame_bytes = frame.size();
+  std::uint64_t continuity_id = 0;
+  if (!records_.empty()) {
+    const auto& previous = records_.back();
+    if (frame.size() > std::numeric_limits<std::uint64_t>::max() -
+                           previous.cumulative_frame_bytes) {
+      return wal_error(ErrorCode::wal_failure, "WAL frame byte index overflow");
+    }
+    cumulative_frame_bytes = previous.cumulative_frame_bytes + frame.size();
+    continuity_id = previous.continuity_id;
+    if (previous.command.engine_seq == std::numeric_limits<EngineSeq>::max() ||
+        command.engine_seq != previous.command.engine_seq + 1U) {
+      if (continuity_id == std::numeric_limits<std::uint64_t>::max()) {
+        return wal_error(ErrorCode::wal_failure, "WAL continuity index overflow");
+      }
+      ++continuity_id;
+    }
   }
   if (active_bytes_ + frame.size() > segment_size_) {
     if (active_dirty_) {
@@ -279,7 +336,8 @@ Result<WalPosition> Wal::append(const domain::CommittedCommand& command) {
   WalPosition position{command.engine_seq, active_segment_, active_bytes_};
   last_appended_position_ = position;
   active_dirty_ = true;
-  records_.push_back(CachedRecord{command, frame.size()});
+  records_.push_back(
+      CachedRecord{command, frame.size(), cumulative_frame_bytes, continuity_id});
   return position;
 }
 
@@ -412,8 +470,29 @@ Result<std::vector<domain::CommittedCommand>> Wal::replay() {
       previous = command.engine_seq;
       last_appended_position_ = WalPosition{command.engine_seq, segment,
                                             offset + 4U + length};
+      const auto frame_bytes = static_cast<std::uint64_t>(4U + length);
+      std::uint64_t cumulative_frame_bytes = frame_bytes;
+      std::uint64_t continuity_id = 0;
+      if (!cached_records.empty()) {
+        const auto& previous_record = cached_records.back();
+        if (frame_bytes > std::numeric_limits<std::uint64_t>::max() -
+                              previous_record.cumulative_frame_bytes) {
+          return wal_error(ErrorCode::wal_failure, "WAL frame byte index overflow");
+        }
+        cumulative_frame_bytes =
+            previous_record.cumulative_frame_bytes + frame_bytes;
+        continuity_id = previous_record.continuity_id;
+        if (previous_record.command.engine_seq == std::numeric_limits<EngineSeq>::max() ||
+            command.engine_seq != previous_record.command.engine_seq + 1U) {
+          if (continuity_id == std::numeric_limits<std::uint64_t>::max()) {
+            return wal_error(ErrorCode::wal_failure, "WAL continuity index overflow");
+          }
+          ++continuity_id;
+        }
+      }
       commands.push_back(std::move(command));
-      cached_records.push_back(CachedRecord{commands.back(), 4U + length});
+      cached_records.push_back(
+          CachedRecord{commands.back(), frame_bytes, cumulative_frame_bytes, continuity_id});
       offset += 4U + length;
     }
     if (offset < content.size()) {
@@ -465,33 +544,28 @@ Result<std::uint64_t> Wal::bytes_after(const EngineSeq sequence,
   if (records_.empty()) {
     return Error{ErrorCode::corrupt_wal, "WAL publisher cursor is not retained"};
   }
-  const auto iterator = std::upper_bound(
+  const auto first = std::upper_bound(
       records_.begin(), records_.end(), sequence,
       [](const EngineSeq value, const CachedRecord& record) {
         return value < record.command.engine_seq;
       });
-  if (iterator == records_.end()) {
+  if (first == records_.end() || sequence == std::numeric_limits<EngineSeq>::max() ||
+      first->command.engine_seq != sequence + 1U) {
     return Error{ErrorCode::corrupt_wal, "WAL publisher cursor is not retained"};
   }
-  EngineSeq previous = sequence;
-  std::uint64_t total = 0;
-  for (auto current = iterator;
-       current != records_.end() && current->command.engine_seq <= upper_bound; ++current) {
-    if (previous == std::numeric_limits<EngineSeq>::max() ||
-        current->command.engine_seq != previous + 1U) {
-      return Error{ErrorCode::corrupt_wal, "WAL publisher range is not contiguous"};
-    }
-    previous = current->command.engine_seq;
-    if (total > std::numeric_limits<std::uint64_t>::max() - current->frame_bytes) {
-      total = std::numeric_limits<std::uint64_t>::max();
-    } else {
-      total += current->frame_bytes;
-    }
+  const auto last = std::lower_bound(
+      records_.begin(), records_.end(), upper_bound,
+      [](const CachedRecord& record, const EngineSeq value) {
+        return record.command.engine_seq < value;
+      });
+  if (last == records_.end() || last->command.engine_seq != upper_bound ||
+      first->continuity_id != last->continuity_id ||
+      first->cumulative_frame_bytes < first->frame_bytes ||
+      last->cumulative_frame_bytes < first->cumulative_frame_bytes - first->frame_bytes) {
+    return Error{ErrorCode::corrupt_wal, "WAL publisher range is not contiguous"};
   }
-  if (previous != upper_bound) {
-    return Error{ErrorCode::corrupt_wal, "WAL publisher head is unavailable"};
-  }
-  return total;
+  const auto bytes_before_first = first->cumulative_frame_bytes - first->frame_bytes;
+  return last->cumulative_frame_bytes - bytes_before_first;
 }
 
 Status Wal::retain_through(const EngineSeq watermark) {
@@ -531,6 +605,10 @@ Status Wal::retain_through(const EngineSeq watermark) {
           return record.command.engine_seq > watermark;
         });
     records_.erase(records_.begin(), first_retained);
+    if (const auto status = rebuild_record_index_unlocked();
+        std::holds_alternative<Error>(status)) {
+      return std::get<Error>(status);
+    }
   }
   return FileOps::sync_directory(directory_);
 }

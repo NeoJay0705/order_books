@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <condition_variable>
 #include <filesystem>
 #include <future>
@@ -29,6 +30,37 @@ class RecordingSink final : public EventSink {
   std::vector<std::tuple<ShardId, EngineSeq, std::size_t>> batches;
 };
 
+class BlockingSink final : public EventSink {
+ public:
+  Result<std::monostate> publish(ShardId, EngineSeq, std::span<const Event>,
+                                 std::stop_token stop_token) override {
+    std::unique_lock lock(mutex_);
+    publish_entered_ = true;
+    condition_.notify_all();
+    condition_.wait(lock, stop_token, [this] { return released_; });
+    return std::monostate{};
+  }
+
+  bool wait_until_publish_entered(const std::chrono::milliseconds timeout) {
+    std::unique_lock lock(mutex_);
+    return condition_.wait_for(lock, timeout, [this] { return publish_entered_; });
+  }
+
+  void release() {
+    {
+      std::lock_guard lock(mutex_);
+      released_ = true;
+    }
+    condition_.notify_all();
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable_any condition_;
+  bool publish_entered_{false};
+  bool released_{false};
+};
+
 TEST(EngineTest, RejectsZeroPublishLagAge) {
   const auto data_directory =
       std::filesystem::temp_directory_path() / "order_books_zero_publish_lag_age_test";
@@ -46,6 +78,87 @@ TEST(EngineTest, RejectsZeroPublishLagAge) {
   auto opened = Engine::open(std::move(config), sink, metrics);
   ASSERT_TRUE(std::holds_alternative<Error>(opened));
   EXPECT_EQ(std::get<Error>(opened).code, ErrorCode::invalid_command);
+  std::filesystem::remove_all(data_directory, ignored);
+}
+
+TEST(EngineTest, PublisherPressureRejectsNewMutationButPreservesDuplicate) {
+  const auto data_directory = std::filesystem::temp_directory_path() /
+                              "order_books_publisher_pressure_admission_test";
+  std::error_code ignored;
+  std::filesystem::remove_all(data_directory, ignored);
+
+  BlockingSink sink;
+  NullMetricsSink metrics;
+  EngineConfig config;
+  config.data_directory = data_directory;
+  config.shard_ids = {1};
+  config.instruments = {InstrumentConfig{7, 1, 1, 1}};
+  config.runtime.group_commit_max_commands = 1;
+  config.runtime.group_commit_max_delay = std::chrono::microseconds(0);
+  config.runtime.max_publish_lag_bytes = 1;
+
+  auto opened = Engine::open(config, sink, metrics);
+  ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Engine>>(opened));
+  auto engine = std::get<std::unique_ptr<Engine>>(std::move(opened));
+
+  Command first;
+  first.identity = CommandIdentity{101, 1, 1, 1};
+  first.instrument_id = 7;
+  first.command_type = CommandType::new_order;
+  first.order_id = {101, 1};
+  first.payload = NewOrderPayload{Side::buy, 100, 1};
+  const auto first_copy = first;
+
+  std::promise<CommandResult> first_completion;
+  auto first_result = first_completion.get_future();
+  ASSERT_TRUE(
+      engine->submit(first, [&first_completion](CommandResult result) {
+        first_completion.set_value(std::move(result));
+      }).queued);
+  ASSERT_EQ(first_result.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+  const auto committed = first_result.get();
+  ASSERT_EQ(committed.command_status, CommandStatus::committed);
+  EXPECT_EQ(committed.error_code, ErrorCode::none);
+  ASSERT_TRUE(sink.wait_until_publish_entered(std::chrono::seconds(5)));
+
+  Command pressured;
+  pressured.identity = CommandIdentity{102, 1, 1, 1};
+  pressured.instrument_id = 7;
+  pressured.command_type = CommandType::new_order;
+  pressured.order_id = {102, 1};
+  pressured.payload = NewOrderPayload{Side::buy, 99, 1};
+  std::promise<CommandResult> pressured_completion;
+  auto pressured_result = pressured_completion.get_future();
+  ASSERT_TRUE(
+      engine->submit(std::move(pressured), [&pressured_completion](CommandResult result) {
+        pressured_completion.set_value(std::move(result));
+      }).queued);
+  ASSERT_EQ(pressured_result.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  const auto rejected = pressured_result.get();
+  EXPECT_EQ(rejected.command_status, CommandStatus::admission_error);
+  EXPECT_EQ(rejected.error_code, ErrorCode::engine_storage_pressure);
+
+  std::promise<CommandResult> duplicate_completion;
+  auto duplicate_result = duplicate_completion.get_future();
+  ASSERT_TRUE(
+      engine->submit(first_copy, [&duplicate_completion](CommandResult result) {
+        duplicate_completion.set_value(std::move(result));
+      }).queued);
+  ASSERT_EQ(duplicate_result.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  const auto duplicate = duplicate_result.get();
+  EXPECT_EQ(duplicate.command_status, CommandStatus::committed);
+  EXPECT_EQ(duplicate.error_code, ErrorCode::none);
+  EXPECT_EQ(duplicate.engine_seq, committed.engine_seq);
+
+  const auto snapshot = engine->metrics(1);
+  ASSERT_TRUE(std::holds_alternative<MetricsSnapshot>(snapshot));
+  EXPECT_EQ(std::get<MetricsSnapshot>(snapshot).commands, 1U);
+  EXPECT_EQ(std::get<MetricsSnapshot>(snapshot).duplicate_commands, 1U);
+
+  sink.release();
+  EXPECT_TRUE(std::holds_alternative<std::monostate>(engine->stop()));
   std::filesystem::remove_all(data_directory, ignored);
 }
 

@@ -55,7 +55,11 @@ class Wal {
   struct CachedRecord {
     domain::CommittedCommand command;
     std::uint64_t frame_bytes{};
+    std::uint64_t cumulative_frame_bytes{};
+    std::uint64_t continuity_id{};
   };
+
+  Status rebuild_record_index_unlocked();
 
   std::filesystem::path directory_;
   ShardId shard_id_{};

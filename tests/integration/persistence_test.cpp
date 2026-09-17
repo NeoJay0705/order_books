@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -107,6 +108,45 @@ TEST(PersistenceTest, WalRotationReplaysEveryDurableSegment) {
   bytes = wal->bytes_after(1, 4);
   ASSERT_TRUE(std::holds_alternative<Error>(bytes));
   EXPECT_EQ(std::get<Error>(bytes).code, ErrorCode::corrupt_wal);
+}
+
+TEST(PersistenceTest, WalBytesAfterRebasesPrefixIndexAfterRetention) {
+  TemporaryDirectory temporary("order_books_wal_prefix_index_test");
+  const auto wal_directory = temporary.path() / "wal";
+  constexpr std::size_t segment_size = 1U * 1024U * 1024U;
+  auto opened = Wal::open(wal_directory, 1, segment_size);
+  ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Wal>>(opened));
+  auto wal = std::get<std::unique_ptr<Wal>>(std::move(opened));
+
+  std::vector<std::uint64_t> frame_bytes;
+  for (EngineSeq sequence = 1; sequence <= 4; ++sequence) {
+    const auto record = command(sequence);
+    frame_bytes.push_back(4U + encode_committed_command(record).size() + 6U);
+    ASSERT_TRUE(std::holds_alternative<WalPosition>(wal->append(record)));
+  }
+  ASSERT_TRUE(std::holds_alternative<std::monostate>(wal->sync()));
+  ASSERT_TRUE(std::holds_alternative<std::vector<domain::CommittedCommand>>(wal->replay()));
+
+  auto bytes = wal->bytes_after(0, 4);
+  ASSERT_TRUE(std::holds_alternative<std::uint64_t>(bytes));
+  EXPECT_EQ(std::get<std::uint64_t>(bytes),
+            frame_bytes[0] + frame_bytes[1] + frame_bytes[2] + frame_bytes[3]);
+
+  ASSERT_TRUE(std::holds_alternative<std::monostate>(wal->retain_through(2)));
+  bytes = wal->bytes_after(2, 4);
+  ASSERT_TRUE(std::holds_alternative<std::uint64_t>(bytes));
+  EXPECT_EQ(std::get<std::uint64_t>(bytes), frame_bytes[2] + frame_bytes[3]);
+  bytes = wal->bytes_after(0, 4);
+  ASSERT_TRUE(std::holds_alternative<Error>(bytes));
+  EXPECT_EQ(std::get<Error>(bytes).code, ErrorCode::corrupt_wal);
+
+  const auto fifth = command(5);
+  const auto fifth_frame_bytes = 4U + encode_committed_command(fifth).size() + 6U;
+  ASSERT_TRUE(std::holds_alternative<WalPosition>(wal->append(fifth)));
+  ASSERT_TRUE(std::holds_alternative<std::monostate>(wal->sync()));
+  bytes = wal->bytes_after(4, 5);
+  ASSERT_TRUE(std::holds_alternative<std::uint64_t>(bytes));
+  EXPECT_EQ(std::get<std::uint64_t>(bytes), fifth_frame_bytes);
 }
 
 TEST(PersistenceTest, LastSegmentPartialTailIsTruncated) {

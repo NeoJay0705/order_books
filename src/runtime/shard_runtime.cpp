@@ -713,6 +713,14 @@ void ShardRuntime::process_command_batch(std::vector<CommandWork> batch) {
     batch_finished = true;
     reject_all_pending(code);
   };
+  struct PublisherPressureSample {
+    std::uint64_t lag_bytes{};
+    std::uint64_t lag_age_ns{};
+    bool warning{};
+    bool critical{};
+    bool pressure{};
+  };
+  std::optional<PublisherPressureSample> publisher_pressure;
   auto next_sequence = state_machine_.state().last_committed_engine_seq;
   for (std::size_t batch_index = 0; batch_index < batch.size(); ++batch_index) {
     auto& work = batch[batch_index];
@@ -772,44 +780,51 @@ void ShardRuntime::process_command_batch(std::vector<CommandWork> batch) {
       results[batch_index] = admission_error(command, ErrorCode::engine_storage_pressure);
       continue;
     }
-    const auto publish_lag_age = publisher_->oldest_unconfirmed_received_at();
-    const auto current_time = now_ns();
-    const auto max_lag_age = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        config_.runtime.max_publish_lag_age);
-    const auto lag_bytes = publisher_->lag_bytes();
-    if (publisher_->failed()) {
-      reject_batch_pending(ErrorCode::engine_unavailable);
-      fail(Error{ErrorCode::engine_unavailable, "event publisher failed"});
-      return;
+    if (!publisher_pressure.has_value()) {
+      const auto publish_lag_age = publisher_->oldest_unconfirmed_received_at();
+      const auto current_time = now_ns();
+      const auto max_lag_age = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          config_.runtime.max_publish_lag_age);
+      const auto lag_bytes = publisher_->lag_bytes();
+      if (publisher_->failed()) {
+        reject_batch_pending(ErrorCode::engine_unavailable);
+        fail(Error{ErrorCode::engine_unavailable, "event publisher failed"});
+        return;
+      }
+      const auto lag_age = publish_lag_age.has_value() && *publish_lag_age >= 0 &&
+                                   current_time >= *publish_lag_age
+                               ? static_cast<std::uint64_t>(current_time - *publish_lag_age)
+                               : 0U;
+      const auto max_lag_age_count = max_lag_age.count();
+      const bool bytes_warning = config_.runtime.max_publish_lag_bytes != 0 &&
+                                 lag_bytes >= config_.runtime.max_publish_lag_bytes / 2U;
+      const bool bytes_critical = config_.runtime.max_publish_lag_bytes != 0 &&
+                                  lag_bytes >= config_.runtime.max_publish_lag_bytes -
+                                                   config_.runtime.max_publish_lag_bytes / 5U;
+      const bool age_warning = max_lag_age_count > 0 &&
+                               lag_age >= static_cast<std::uint64_t>(max_lag_age_count / 2);
+      const bool age_critical = max_lag_age_count > 0 &&
+                                lag_age >= static_cast<std::uint64_t>(
+                                    max_lag_age_count - max_lag_age_count / 5);
+      const bool age_pressure = publish_lag_age.has_value() && max_lag_age_count >= 0 &&
+                                lag_age >= static_cast<std::uint64_t>(max_lag_age_count);
+      const bool pressure =
+          (config_.runtime.max_publish_lag_bytes != 0 &&
+           lag_bytes >= config_.runtime.max_publish_lag_bytes) ||
+          age_pressure;
+      metrics_registry_->observe("event_publish_lag_bytes", lag_bytes);
+      metrics_registry_->observe("event_publish_lag_age_ns", lag_age);
+      if (bytes_warning || age_warning) {
+        metrics_registry_->observe("publisher_lag_warning", 1);
+      }
+      if (bytes_critical || age_critical) {
+        metrics_registry_->observe("publisher_lag_critical", 1);
+      }
+      publisher_pressure = PublisherPressureSample{
+          lag_bytes, lag_age, bytes_warning || age_warning, bytes_critical || age_critical,
+          pressure};
     }
-    const auto lag_age = publish_lag_age.has_value() && *publish_lag_age >= 0 &&
-                                 current_time >= *publish_lag_age
-                             ? static_cast<std::uint64_t>(current_time - *publish_lag_age)
-                             : 0U;
-    metrics_registry_->observe("event_publish_lag_bytes", lag_bytes);
-    metrics_registry_->observe("event_publish_lag_age_ns", lag_age);
-    const bool bytes_warning = config_.runtime.max_publish_lag_bytes != 0 &&
-                               lag_bytes >= config_.runtime.max_publish_lag_bytes / 2U;
-    const bool bytes_critical = config_.runtime.max_publish_lag_bytes != 0 &&
-                                lag_bytes >= config_.runtime.max_publish_lag_bytes -
-                                                 config_.runtime.max_publish_lag_bytes / 5U;
-    const auto max_lag_age_count = max_lag_age.count();
-    const bool age_warning = max_lag_age_count > 0 &&
-                             lag_age >= static_cast<std::uint64_t>(max_lag_age_count / 2);
-    const bool age_critical = max_lag_age_count > 0 &&
-                              lag_age >= static_cast<std::uint64_t>(
-                                  max_lag_age_count - max_lag_age_count / 5);
-    if (bytes_warning || age_warning) {
-      metrics_registry_->observe("publisher_lag_warning", 1);
-    }
-    if (bytes_critical || age_critical) {
-      metrics_registry_->observe("publisher_lag_critical", 1);
-    }
-    const bool age_pressure = publish_lag_age.has_value() && max_lag_age_count >= 0 &&
-                              lag_age >= static_cast<std::uint64_t>(max_lag_age_count);
-    if ((config_.runtime.max_publish_lag_bytes != 0 &&
-         lag_bytes >= config_.runtime.max_publish_lag_bytes) ||
-        age_pressure) {
+    if (publisher_pressure->pressure) {
       results[batch_index] = admission_error(command, ErrorCode::engine_storage_pressure);
       continue;
     }
