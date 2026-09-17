@@ -1,17 +1,21 @@
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <variant>
 #include <vector>
 #include <unistd.h>
@@ -19,6 +23,7 @@
 #include "domain/order_book.hpp"
 #include "domain/invariant_checker.hpp"
 #include "domain/state_machine.hpp"
+#include "order_books/engine.hpp"
 #include "persistence/snapshot_store.hpp"
 #include "persistence/wal.hpp"
 
@@ -28,10 +33,16 @@ using namespace order_books;
 
 constexpr std::uint64_t kIterations = 2'000;
 constexpr std::uint64_t kWarmup = 100;
+constexpr std::size_t kDurableProducerLanes = 1'024;
+constexpr auto kDurablePhaseTimeout = std::chrono::seconds(60);
+
+enum class WorkloadSelection { all, engine_durable_single_instrument };
 
 struct BenchmarkOptions {
   std::uint64_t iterations{kIterations};
   std::uint64_t warmup{kWarmup};
+  WorkloadSelection workload{WorkloadSelection::all};
+  std::optional<std::filesystem::path> data_directory;
 };
 
 struct WorkloadDelta {
@@ -151,6 +162,16 @@ std::optional<std::uint64_t> parse_positive_option(const std::string_view argume
   return result;
 }
 
+std::optional<WorkloadSelection> parse_workload(const std::string_view value) {
+  if (value == "all") {
+    return WorkloadSelection::all;
+  }
+  if (value == "engine_durable_single_instrument") {
+    return WorkloadSelection::engine_durable_single_instrument;
+  }
+  return std::nullopt;
+}
+
 std::optional<BenchmarkOptions> parse_options(const int argc, char** argv) {
   BenchmarkOptions options;
   for (int index = 1; index < argc; ++index) {
@@ -159,6 +180,18 @@ std::optional<BenchmarkOptions> parse_options(const int argc, char** argv) {
       options.iterations = *iterations;
     } else if (const auto warmup = parse_positive_option(argument, "--warmup=")) {
       options.warmup = *warmup;
+    } else if (argument.starts_with("--workload=")) {
+      const auto workload = parse_workload(argument.substr(std::string_view("--workload=").size()));
+      if (!workload.has_value()) {
+        return std::nullopt;
+      }
+      options.workload = *workload;
+    } else if (argument.starts_with("--data-dir=")) {
+      const auto path = argument.substr(std::string_view("--data-dir=").size());
+      if (path.empty()) {
+        return std::nullopt;
+      }
+      options.data_directory = std::filesystem::path(path);
     } else {
       return std::nullopt;
     }
@@ -182,6 +215,458 @@ void require_order_book_success(const domain::OrderBookApplyResult& result) {
   }
 }
 
+class AcknowledgingSink final : public EventSink {
+ public:
+  Result<std::monostate> publish(const ShardId, const EngineSeq,
+                                 const std::span<const Event>,
+                                 const std::stop_token) override {
+    return std::monostate{};
+  }
+};
+
+struct ProducerLane {
+  ProducerId producer_id{};
+  ProducerSeq next_sequence{1};
+};
+
+enum class DurablePhase { warmup, measured };
+
+struct DurableFailure {
+  std::string code;
+  std::string detail;
+};
+
+struct DurableRunState {
+  explicit DurableRunState(const std::size_t lane_count)
+      : lanes(lane_count), started_at(lane_count), expected(lane_count), in_flight(lane_count) {
+    for (std::size_t index = 0; index < lane_count; ++index) {
+      lanes[index].producer_id = static_cast<ProducerId>(index + 1U);
+      available_lanes.push_back(index);
+    }
+  }
+
+  std::mutex mutex;
+  std::condition_variable condition;
+  std::vector<ProducerLane> lanes;
+  std::deque<std::size_t> available_lanes;
+  std::vector<std::chrono::steady_clock::time_point> started_at;
+  std::vector<CommandIdentity> expected;
+  std::vector<bool> in_flight;
+  std::vector<std::uint64_t> latency_samples;
+  DurablePhase phase{DurablePhase::warmup};
+  std::size_t outstanding{};
+  std::uint64_t phase_completed{};
+  std::optional<DurableFailure> failure;
+};
+
+struct DurablePhaseResult {
+  std::uint64_t submitted{};
+  std::uint64_t completed{};
+  std::uint64_t elapsed_ns{};
+  std::vector<std::uint64_t> latency_samples;
+};
+
+void set_durable_failure(DurableRunState& state, std::string code, std::string detail) {
+  if (!state.failure.has_value()) {
+    state.failure = DurableFailure{std::move(code), std::move(detail)};
+  }
+  state.condition.notify_all();
+}
+
+std::string_view durable_phase_name(const DurablePhase phase) {
+  return phase == DurablePhase::warmup ? "warmup" : "measured";
+}
+
+void report_durable_error(const std::string_view phase, const std::string_view code,
+                         const std::string_view detail = {}) {
+  std::cerr << "workload=engine_durable_single_instrument phase=" << phase
+            << " error_code=" << code;
+  if (!detail.empty()) {
+    std::cerr << " detail=" << detail;
+  }
+  std::cerr << '\n';
+}
+
+std::string error_code_message(const ErrorCode code) {
+  return "engine_error_code=" + std::to_string(static_cast<unsigned int>(code));
+}
+
+std::string command_identity_message(const CommandIdentity& identity) {
+  return "producer_id=" + std::to_string(identity.producer_id) +
+         " producer_epoch=" + std::to_string(identity.producer_epoch) +
+         " producer_stream_id=" + std::to_string(identity.producer_stream_id) +
+         " producer_seq=" + std::to_string(identity.producer_seq);
+}
+
+Command make_durable_command(const ProducerLane& lane, const Side side,
+                             const std::uint64_t order_id) {
+  Command command;
+  command.identity = CommandIdentity{lane.producer_id, 1, 1, lane.next_sequence};
+  command.instrument_id = 1;
+  command.command_type = CommandType::new_order;
+  command.order_id = OrderId{1, order_id};
+  command.payload = NewOrderPayload{side, 100, 1};
+  return command;
+}
+
+std::optional<std::uint64_t> double_count(const std::uint64_t count) {
+  if (count > std::numeric_limits<std::uint64_t>::max() / 2U) {
+    return std::nullopt;
+  }
+  return count * 2U;
+}
+
+std::optional<std::uint64_t> counter_delta(const std::uint64_t after,
+                                           const std::uint64_t before) {
+  if (after < before) {
+    return std::nullopt;
+  }
+  return after - before;
+}
+
+bool wait_for_durable_phase(DurableRunState& state, const std::uint64_t submitted,
+                            const std::chrono::steady_clock::time_point deadline) {
+  std::unique_lock lock(state.mutex);
+  if (!state.condition.wait_until(lock, deadline, [&state, submitted] {
+        return state.failure.has_value() ||
+               (state.phase_completed == submitted && state.outstanding == 0);
+      })) {
+    set_durable_failure(state, "phase_timeout", "phase completion timeout");
+    return false;
+  }
+  return !state.failure.has_value() && state.phase_completed == submitted &&
+         state.outstanding == 0;
+}
+
+std::optional<DurablePhaseResult> run_durable_phase(
+    Engine& engine, DurableRunState& state, const std::uint64_t command_count,
+    const DurablePhase phase, std::uint64_t& next_order_id) {
+  {
+    std::lock_guard lock(state.mutex);
+    state.phase = phase;
+    state.phase_completed = 0;
+    state.latency_samples.clear();
+    state.failure.reset();
+  }
+
+  const auto phase_start = std::chrono::steady_clock::now();
+  std::uint64_t submitted = 0;
+  while (submitted < command_count) {
+    std::size_t lane_index = 0;
+    Command command;
+    std::chrono::steady_clock::time_point command_start;
+    {
+      std::unique_lock lock(state.mutex);
+      if (!state.condition.wait_for(lock, kDurablePhaseTimeout, [&state] {
+            return state.failure.has_value() || !state.available_lanes.empty();
+          })) {
+        set_durable_failure(state, "producer_lane_timeout",
+                            "producer lane availability timeout");
+        break;
+      }
+      if (state.failure.has_value()) {
+        break;
+      }
+      lane_index = state.available_lanes.front();
+      state.available_lanes.pop_front();
+      auto& lane = state.lanes[lane_index];
+      command_start = std::chrono::steady_clock::now();
+      command = make_durable_command(
+          lane, submitted % 2U == 0U ? Side::sell : Side::buy, next_order_id++);
+      state.started_at[lane_index] = command_start;
+      state.expected[lane_index] = command.identity;
+      state.in_flight[lane_index] = true;
+      ++state.outstanding;
+    }
+
+    const auto submit_result = engine.submit(
+        std::move(command), [&state, lane_index](CommandResult result) {
+          const auto completed_at = std::chrono::steady_clock::now();
+          std::lock_guard lock(state.mutex);
+          if (lane_index >= state.in_flight.size() || !state.in_flight[lane_index]) {
+            set_durable_failure(state, "duplicate_completion",
+                                "duplicate or unknown completion callback");
+            return;
+          }
+          if (state.expected[lane_index] != result.identity) {
+            set_durable_failure(
+                state, "completion_identity_mismatch",
+                "expected " + command_identity_message(state.expected[lane_index]) +
+                    ", actual " + command_identity_message(result.identity));
+          } else if (result.command_status != CommandStatus::committed) {
+            set_durable_failure(state, "command_not_committed",
+                                error_code_message(result.error_code));
+          }
+          if (state.phase == DurablePhase::measured) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                completed_at - state.started_at[lane_index]);
+            state.latency_samples.push_back(static_cast<std::uint64_t>(elapsed.count()));
+          }
+          state.in_flight[lane_index] = false;
+          state.available_lanes.push_back(lane_index);
+          if (state.outstanding > 0) {
+            --state.outstanding;
+          }
+          ++state.phase_completed;
+          state.condition.notify_all();
+        });
+    if (!submit_result.queued) {
+      std::lock_guard lock(state.mutex);
+      state.in_flight[lane_index] = false;
+      state.available_lanes.push_back(lane_index);
+      if (state.outstanding > 0) {
+        --state.outstanding;
+      }
+      if (submit_result.error.has_value()) {
+        set_durable_failure(state, "submit_rejected",
+                            error_code_message(submit_result.error->code) + " " +
+                                submit_result.error->message);
+      } else {
+        set_durable_failure(state, "submit_rejected_without_error", {});
+      }
+      break;
+    }
+    {
+      std::lock_guard lock(state.mutex);
+      ++state.lanes[lane_index].next_sequence;
+    }
+    ++submitted;
+  }
+
+  const auto deadline = std::chrono::steady_clock::now() + kDurablePhaseTimeout;
+  if (!wait_for_durable_phase(state, submitted, deadline)) {
+    return std::nullopt;
+  }
+  const auto phase_end = std::chrono::steady_clock::now();
+  DurablePhaseResult result;
+  result.submitted = submitted;
+  result.completed = state.phase_completed;
+  result.elapsed_ns = static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(phase_end - phase_start).count());
+  result.latency_samples = std::move(state.latency_samples);
+  return result;
+}
+
+std::uint64_t percentile_ns(const std::vector<std::uint64_t>& samples,
+                            const std::size_t numerator, const std::size_t denominator) {
+  const auto index = std::min(
+      samples.size() - 1U,
+      (samples.size() * numerator + denominator - 1U) / denominator - 1U);
+  return samples[index];
+}
+
+bool prepare_data_directory(const std::filesystem::path& path) {
+  std::error_code error;
+  const auto exists = std::filesystem::exists(path, error);
+  if (error) {
+    report_durable_error("setup", "data_directory_inspection_failed", path.string());
+    return false;
+  }
+  if (exists) {
+    if (error || !std::filesystem::is_directory(path, error)) {
+      report_durable_error("setup", "data_directory_not_directory", path.string());
+      return false;
+    }
+    if (!std::filesystem::is_empty(path, error) || error) {
+      report_durable_error("setup", "data_directory_not_empty", path.string());
+      return false;
+    }
+    return true;
+  }
+  if (!std::filesystem::create_directories(path, error) && error) {
+    report_durable_error("setup", "data_directory_create_failed", path.string());
+    return false;
+  }
+  return true;
+}
+
+bool run_engine_durable_single_instrument(const BenchmarkOptions& options) {
+  const auto run_id = std::to_string(
+                          std::chrono::steady_clock::now().time_since_epoch().count()) +
+                      "-" + std::to_string(static_cast<unsigned long long>(::getpid()));
+  const bool owned_data_directory = !options.data_directory.has_value();
+  const auto data_directory = options.data_directory.value_or(
+      std::filesystem::temp_directory_path() / ("order_books_benchmark_engine-" + run_id));
+  if (!prepare_data_directory(data_directory)) {
+    return false;
+  }
+  const auto cleanup = [&] {
+    if (owned_data_directory) {
+      std::error_code ignored;
+      std::filesystem::remove_all(data_directory, ignored);
+    }
+  };
+
+  EngineConfig config;
+  config.data_directory = data_directory;
+  config.shard_ids = {1};
+  config.instruments = {InstrumentConfig{1, 1, 1, 1}};
+  config.runtime.ingress_queue_capacity = 65'536;
+  config.runtime.group_commit_max_commands = 256;
+  config.runtime.group_commit_max_delay = std::chrono::microseconds(200);
+  config.runtime.snapshot_interval_commands = std::numeric_limits<std::size_t>::max();
+  config.runtime.snapshot_interval = std::chrono::hours(24);
+  config.runtime.event_replay_snapshot_interval_commands =
+      std::numeric_limits<std::size_t>::max();
+  config.runtime.event_replay_snapshot_interval = std::chrono::hours(24);
+
+  AcknowledgingSink event_sink;
+  NullMetricsSink metrics_sink;
+  auto opened = Engine::open(config, event_sink, metrics_sink);
+  if (std::holds_alternative<Error>(opened)) {
+    const auto& error = std::get<Error>(opened);
+    report_durable_error("open", "engine_open_failed",
+                         error_code_message(error.code) + " message=" + error.message);
+    cleanup();
+    return false;
+  }
+  auto engine = std::get<std::unique_ptr<Engine>>(std::move(opened));
+  DurableRunState state(kDurableProducerLanes);
+  std::uint64_t next_order_id = 1;
+  const auto command_count = double_count(options.iterations);
+  const auto warmup_command_count = double_count(options.warmup);
+  if (!command_count.has_value() || !warmup_command_count.has_value()) {
+    report_durable_error("setup", "iteration_count_overflow");
+    (void)engine->stop();
+    cleanup();
+    return false;
+  }
+
+  const auto initial_metrics = engine->metrics(1);
+  if (std::holds_alternative<Error>(initial_metrics)) {
+    const auto& error = std::get<Error>(initial_metrics);
+    report_durable_error("initial_metrics", "metrics_failed",
+                         error_code_message(error.code) + " message=" + error.message);
+    (void)engine->stop();
+    cleanup();
+    return false;
+  }
+  const auto warmup = run_durable_phase(*engine, state, *warmup_command_count,
+                                        DurablePhase::warmup, next_order_id);
+  if (!warmup.has_value()) {
+    if (state.failure.has_value()) {
+      report_durable_error(durable_phase_name(DurablePhase::warmup), state.failure->code,
+                           state.failure->detail);
+    }
+    (void)engine->stop();
+    cleanup();
+    return false;
+  }
+  const auto warmup_metrics = engine->metrics(1);
+  if (std::holds_alternative<Error>(warmup_metrics)) {
+    const auto& error = std::get<Error>(warmup_metrics);
+    report_durable_error("warmup_metrics", "metrics_failed",
+                         error_code_message(error.code) + " message=" + error.message);
+    (void)engine->stop();
+    cleanup();
+    return false;
+  }
+  const auto measured = run_durable_phase(*engine, state, *command_count,
+                                          DurablePhase::measured, next_order_id);
+  if (!measured.has_value()) {
+    if (state.failure.has_value()) {
+      report_durable_error(durable_phase_name(DurablePhase::measured), state.failure->code,
+                           state.failure->detail);
+    }
+    (void)engine->stop();
+    cleanup();
+    return false;
+  }
+  const auto final_metrics = engine->metrics(1);
+  const auto stop_status = engine->stop();
+  if (std::holds_alternative<Error>(final_metrics) ||
+      std::holds_alternative<Error>(stop_status)) {
+    if (std::holds_alternative<Error>(final_metrics)) {
+      const auto& error = std::get<Error>(final_metrics);
+      report_durable_error("final_metrics", "metrics_failed",
+                           error_code_message(error.code) + " message=" + error.message);
+    }
+    if (std::holds_alternative<Error>(stop_status)) {
+      const auto& error = std::get<Error>(stop_status);
+      report_durable_error("stop", "engine_stop_failed",
+                           error_code_message(error.code) + " message=" + error.message);
+    }
+    cleanup();
+    return false;
+  }
+
+  const auto& initial = std::get<MetricsSnapshot>(initial_metrics);
+  const auto& after_warmup = std::get<MetricsSnapshot>(warmup_metrics);
+  const auto& after_measured = std::get<MetricsSnapshot>(final_metrics);
+  const auto expected_warmup = *warmup_command_count;
+  const auto expected_measured = *command_count;
+  const auto warmup_commands = counter_delta(after_warmup.commands, initial.commands);
+  const auto measured_commands = counter_delta(after_measured.commands, after_warmup.commands);
+  const auto measured_trades = counter_delta(after_measured.trades, after_warmup.trades);
+  if (!warmup_commands.has_value() || !measured_commands.has_value() ||
+      !measured_trades.has_value()) {
+    report_durable_error("validation", "counter_delta_invalid");
+    cleanup();
+    return false;
+  }
+  if (*warmup_commands != expected_warmup || *measured_commands != expected_measured) {
+    report_durable_error("validation", "unexpected_command_count");
+    cleanup();
+    return false;
+  }
+  if (*measured_trades != options.iterations) {
+    report_durable_error("validation", "unexpected_trade_count");
+    cleanup();
+    return false;
+  }
+  if (measured->submitted != expected_measured || measured->completed != expected_measured ||
+      measured->latency_samples.size() != expected_measured) {
+    report_durable_error("validation", "completion_count_mismatch");
+    cleanup();
+    return false;
+  }
+  if (after_measured.active_orders != 0 || after_measured.active_price_levels != 0) {
+    report_durable_error("validation", "book_not_empty");
+    cleanup();
+    return false;
+  }
+
+  std::error_code wal_path_error;
+  const auto wal_path = std::filesystem::weakly_canonical(
+      data_directory / "shard-1" / "wal", wal_path_error);
+  if (wal_path_error) {
+    report_durable_error("report", "wal_path_resolution_failed", data_directory.string());
+    cleanup();
+    return false;
+  }
+
+  auto samples = std::move(measured->latency_samples);
+  std::sort(samples.begin(), samples.end());
+  const auto elapsed_ns = measured->elapsed_ns;
+  const auto commands_per_second = elapsed_ns == 0
+                                       ? 0.0
+                                       : static_cast<double>(expected_measured) *
+                                             1'000'000'000.0 / static_cast<double>(elapsed_ns);
+  const auto trades = *measured_trades;
+  const auto trades_per_second = elapsed_ns == 0
+                                     ? 0.0
+                                     : static_cast<double>(trades) * 1'000'000'000.0 /
+                                           static_cast<double>(elapsed_ns);
+  std::cout << "engine_durable_single_instrument iterations=" << options.iterations
+            << " commands=" << expected_measured << " trades=" << trades
+            << " commands_per_second=" << commands_per_second
+            << " trades_per_second=" << trades_per_second << " p50_us="
+            << percentile_ns(samples, 50, 100) / 1'000.0 << " p99_us="
+            << percentile_ns(samples, 99, 100) / 1'000.0 << " p99.9_us="
+            << percentile_ns(samples, 999, 1000) / 1'000.0 << " max_us="
+            << samples.back() / 1'000.0 << " elapsed_ms=" << elapsed_ns / 1'000'000.0
+            << " active_orders=" << after_measured.active_orders
+            << " active_levels=" << after_measured.active_price_levels
+            << " group_size=" << config.runtime.group_commit_max_commands
+            << " group_delay_us=" << config.runtime.group_commit_max_delay.count()
+            << " fsync_mode=per_group completion_boundary=durable_callback"
+            << " instrument_count=1 shard_count=1 producer_lanes=" << kDurableProducerLanes
+            << " wal_path=" << wal_path << " wal_bytes=" << after_measured.wal_size_bytes
+            << '\n';
+  cleanup();
+  return true;
+}
+
 }  // namespace
 
 int main(const int argc, char** argv) {
@@ -189,7 +674,8 @@ int main(const int argc, char** argv) {
 
   const auto options = parse_options(argc, argv);
   if (!options.has_value() || options->iterations == 0) {
-    std::cerr << "usage: order_books_benchmark [--iterations=N] [--warmup=N]\n";
+    std::cerr << "usage: order_books_benchmark [--iterations=N] [--warmup=N] "
+                 "[--workload=all|engine_durable_single_instrument] [--data-dir=PATH]\n";
     return 2;
   }
 
@@ -217,6 +703,16 @@ int main(const int argc, char** argv) {
       std::cerr << name << ": unexpected setup result\n";
     }
   };
+
+  if (options->workload == WorkloadSelection::all ||
+      options->workload == WorkloadSelection::engine_durable_single_instrument) {
+    if (!run_engine_durable_single_instrument(*options)) {
+      return 1;
+    }
+  }
+  if (options->workload == WorkloadSelection::engine_durable_single_instrument) {
+    return 0;
+  }
 
   OrderBook resting(1);
   if (!run_workload("resting_new", *options, [&resting](const std::uint64_t index) {
@@ -436,8 +932,11 @@ int main(const int argc, char** argv) {
   }
   const auto recovery_wal_bytes = recovery_wal->size_bytes();
   const auto recovery_iterations = std::max<std::uint64_t>(1U, options->iterations / 10U);
+  BenchmarkOptions recovery_options;
+  recovery_options.iterations = recovery_iterations;
+  recovery_options.warmup = options->warmup;
   if (!run_workload(
-          "recovery_snapshot_plus_wal", BenchmarkOptions{recovery_iterations, options->warmup},
+          "recovery_snapshot_plus_wal", recovery_options,
           [&recovery_directory, recovery_records](const std::uint64_t) {
             auto opened_wal = storage::Wal::open(recovery_directory / "wal", 1,
                                                  1U * 1024U * 1024U);

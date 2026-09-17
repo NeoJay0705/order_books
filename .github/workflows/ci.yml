@@ -58,7 +58,7 @@ jobs:
       - name: Build
         run: cmake --build --preset release-benchmark
       - name: Benchmark smoke
-        run: ./build/ReleaseBenchmark/benchmarks/order_books_benchmark --iterations=20 --warmup=5
+        run: ./build/ReleaseBenchmark/benchmarks/order_books_benchmark --workload=all --iterations=20 --warmup=4
 
   linux-clang:
     name: Linux Clang

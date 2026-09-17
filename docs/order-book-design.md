@@ -842,6 +842,7 @@ multiple_match
 mixed_single_instrument
 durable_group_commit
 recovery_snapshot_plus_wal
+engine_durable_single_instrument
 ```
 
 每次報告包含：
@@ -857,6 +858,15 @@ recovery_snapshot_plus_wal
 CI 只執行小型 benchmark smoke，驗證 harness 可運作，不以 shared runner 數字作 regression gate。取得專用硬體 baseline 後才新增 threshold。
 
 `durable_group_commit` 的每個 warmup 與 measured sample 都 append 固定 256 筆 command，並在同一計時區間完成一次 WAL sync；輸出會標記 `group_size` 與 `fsync_mode`。Recovery workload 的 open、write、append、sync、replay、apply 與 invariant failure 都使 benchmark 以 non-zero 結束。
+
+`engine_durable_single_instrument` 是單一 instrument、單一 shard 的 Engine durable
+end-to-end workload。每個 measured command 由公開 `Engine::submit()` 進入 bounded
+ingress queue，並以 `CompletionHandler` 收到 committed result 作為完成邊界；因此計時包含
+queue wait、group commit、WAL append、`fsync`、state apply、invariant validation 與
+completion dispatch。它使用多個 producer lanes 遵守 single-in-flight contract，並以
+Sell／Buy pair 維持單一 order book 的 bounded size。此 workload 不等待 downstream
+EventSink ACK，也延後 Snapshot／replay Snapshot trigger；`durable_group_commit` 仍保留
+作為只測 storage WAL path 的 microbenchmark，兩者不得混為同一個 RPS 數字。
 
 Release 文件必須另外記錄 recovery benchmark 的參考硬體、Snapshot order count、WAL record count／bytes 與實測時間，用來驗證暫定 60 秒 RTO。RTO 不在不穩定的 shared CI runner 上作硬性 gate；若參考環境無法達成，必須先調整 Snapshot／retention 參數或更新需求，不能忽略結果。
 

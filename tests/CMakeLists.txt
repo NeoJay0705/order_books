@@ -5,6 +5,7 @@ add_executable(order_books_tests
   unit/order_book_test.cpp
   unit/state_machine_test.cpp
   integration/codec_test.cpp
+  integration/engine_durable_single_instrument_test.cpp
   integration/engine_test.cpp
   integration/persistence_test.cpp
   unit/metrics_registry_test.cpp

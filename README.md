@@ -85,6 +85,22 @@ cmake --build --preset release-benchmark
 ./build/ReleaseBenchmark/benchmarks/order_books_benchmark --iterations=20 --warmup=5
 ```
 
+To measure a single instrument through the durable Engine path (queue, group commit, WAL
+append, `fsync`, matching, invariant validation, and completion callback), run the dedicated
+workload on a real Linux WAL device:
+
+```bash
+./build/ReleaseBenchmark/benchmarks/order_books_benchmark \
+  --workload=engine_durable_single_instrument \
+  --iterations=1000000 \
+  --warmup=10000 \
+  --data-dir=/mnt/local-nvme/order-books-benchmark/run-001
+```
+
+`commands_per_second` is calculated from committed completion callbacks, not from
+`submit()` calls that only report `queued=true`. Use a new empty data directory for each
+run; do not use `tmpfs` or an overlay filesystem for a Linux production baseline.
+
 ## Quality checks
 
 Run ASan and UBSan using the Debug Conan dependencies:

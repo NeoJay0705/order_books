@@ -12,7 +12,6 @@ target_include_directories(order_books_benchmark
 )
 target_link_libraries(order_books_benchmark
   PRIVATE
-    order_books::core
-    order_books::storage
+    order_books::runtime
     order_books::project_options
 )
