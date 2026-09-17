@@ -36,12 +36,16 @@ constexpr std::uint64_t kWarmup = 100;
 constexpr std::size_t kDurableProducerLanes = 1'024;
 constexpr auto kDurablePhaseTimeout = std::chrono::seconds(60);
 
-enum class WorkloadSelection { all, engine_durable_single_instrument };
+enum class WorkloadSelection { all, engine_durable_single_instrument, wal_write_ceiling };
+
+enum class WalSyncMode { none, per_group };
 
 struct BenchmarkOptions {
   std::uint64_t iterations{kIterations};
   std::uint64_t warmup{kWarmup};
   WorkloadSelection workload{WorkloadSelection::all};
+  std::uint64_t wal_group_size{256};
+  WalSyncMode wal_sync_mode{WalSyncMode::per_group};
   std::optional<std::filesystem::path> data_directory;
 };
 
@@ -169,6 +173,31 @@ std::optional<WorkloadSelection> parse_workload(const std::string_view value) {
   if (value == "engine_durable_single_instrument") {
     return WorkloadSelection::engine_durable_single_instrument;
   }
+  if (value == "wal_write_ceiling") {
+    return WorkloadSelection::wal_write_ceiling;
+  }
+  return std::nullopt;
+}
+
+std::string_view workload_name(const WorkloadSelection workload) {
+  switch (workload) {
+    case WorkloadSelection::all:
+      return "all";
+    case WorkloadSelection::engine_durable_single_instrument:
+      return "engine_durable_single_instrument";
+    case WorkloadSelection::wal_write_ceiling:
+      return "wal_write_ceiling";
+  }
+  return "unknown";
+}
+
+std::optional<WalSyncMode> parse_wal_sync_mode(const std::string_view value) {
+  if (value == "none") {
+    return WalSyncMode::none;
+  }
+  if (value == "per_group") {
+    return WalSyncMode::per_group;
+  }
   return std::nullopt;
 }
 
@@ -180,12 +209,21 @@ std::optional<BenchmarkOptions> parse_options(const int argc, char** argv) {
       options.iterations = *iterations;
     } else if (const auto warmup = parse_positive_option(argument, "--warmup=")) {
       options.warmup = *warmup;
+    } else if (const auto group_size = parse_positive_option(argument, "--wal-group-size=")) {
+      options.wal_group_size = *group_size;
     } else if (argument.starts_with("--workload=")) {
       const auto workload = parse_workload(argument.substr(std::string_view("--workload=").size()));
       if (!workload.has_value()) {
         return std::nullopt;
       }
       options.workload = *workload;
+    } else if (argument.starts_with("--wal-sync=")) {
+      const auto sync_mode = parse_wal_sync_mode(
+          argument.substr(std::string_view("--wal-sync=").size()));
+      if (!sync_mode.has_value()) {
+        return std::nullopt;
+      }
+      options.wal_sync_mode = *sync_mode;
     } else if (argument.starts_with("--data-dir=")) {
       const auto path = argument.substr(std::string_view("--data-dir=").size());
       if (path.empty()) {
@@ -285,6 +323,41 @@ void report_durable_error(const std::string_view phase, const std::string_view c
     std::cerr << " detail=" << detail;
   }
   std::cerr << '\n';
+}
+
+void report_wal_error(const std::string_view phase, const std::string_view code,
+                      const std::string_view detail = {}) {
+  std::cerr << "workload=wal_write_ceiling phase=" << phase << " error_code=" << code;
+  if (!detail.empty()) {
+    std::cerr << " detail=" << detail;
+  }
+  std::cerr << '\n';
+}
+
+std::optional<std::uint64_t> count_wal_segments(const std::filesystem::path& directory) {
+  std::error_code error;
+  std::filesystem::directory_iterator iterator(directory, error);
+  if (error) {
+    return std::nullopt;
+  }
+  std::uint64_t count = 0;
+  const std::filesystem::directory_iterator end;
+  for (; iterator != end; iterator.increment(error)) {
+    if (error) {
+      return std::nullopt;
+    }
+    std::error_code entry_error;
+    if (iterator->is_regular_file(entry_error) && !entry_error &&
+        iterator->path().extension() == ".wal") {
+      if (count == std::numeric_limits<std::uint64_t>::max()) {
+        return std::nullopt;
+      }
+      ++count;
+    } else if (entry_error) {
+      return std::nullopt;
+    }
+  }
+  return count;
 }
 
 std::string error_code_message(const ErrorCode code) {
@@ -455,28 +528,317 @@ std::uint64_t percentile_ns(const std::vector<std::uint64_t>& samples,
   return samples[index];
 }
 
-bool prepare_data_directory(const std::filesystem::path& path) {
+std::optional<std::string_view> prepare_data_directory(
+    const std::filesystem::path& path) {
   std::error_code error;
   const auto exists = std::filesystem::exists(path, error);
   if (error) {
-    report_durable_error("setup", "data_directory_inspection_failed", path.string());
-    return false;
+    return "data_directory_inspection_failed";
   }
   if (exists) {
-    if (error || !std::filesystem::is_directory(path, error)) {
-      report_durable_error("setup", "data_directory_not_directory", path.string());
-      return false;
+    if (!std::filesystem::is_directory(path, error) || error) {
+      return "data_directory_not_directory";
     }
     if (!std::filesystem::is_empty(path, error) || error) {
-      report_durable_error("setup", "data_directory_not_empty", path.string());
-      return false;
+      return "data_directory_not_empty";
     }
-    return true;
+    return std::nullopt;
   }
   if (!std::filesystem::create_directories(path, error) && error) {
-    report_durable_error("setup", "data_directory_create_failed", path.string());
+    return "data_directory_create_failed";
+  }
+  return std::nullopt;
+}
+
+constexpr std::size_t kWalCeilingSegmentSize = 256U * 1024U * 1024U;
+
+struct WalGroupSamples {
+  std::vector<std::uint64_t> append_ns;
+  std::vector<std::uint64_t> sync_ns;
+  std::vector<std::uint64_t> total_ns;
+};
+
+std::uint64_t elapsed_ns(const std::chrono::steady_clock::time_point start,
+                         const std::chrono::steady_clock::time_point end) {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+}
+
+std::string_view wal_sync_mode_name(const WalSyncMode mode) {
+  return mode == WalSyncMode::none ? "none" : "per_group";
+}
+
+bool run_wal_groups(storage::Wal& wal, const std::uint64_t group_count,
+                    const std::uint64_t group_size, const WalSyncMode sync_mode,
+                    EngineSeq& next_sequence, std::uint64_t& remaining_commands,
+                    const std::string_view phase, WalGroupSamples* samples) {
+  for (std::uint64_t group = 0; group < group_count; ++group) {
+    if (group_size == 0 || remaining_commands < group_size ||
+        next_sequence == 0 ||
+        group_size > std::numeric_limits<EngineSeq>::max() - next_sequence + 1U) {
+      report_wal_error(phase, "sequence_overflow");
+      return false;
+    }
+    const auto group_start = std::chrono::steady_clock::now();
+    const auto append_start = group_start;
+    for (std::uint64_t offset = 0; offset < group_size; ++offset) {
+      const auto appended = wal.append(make_committed(next_sequence));
+      if (std::holds_alternative<Error>(appended)) {
+        report_wal_error(phase, "wal_append_failed",
+                         std::get<Error>(appended).message);
+        return false;
+      }
+      --remaining_commands;
+      if (remaining_commands > 0) {
+        if (next_sequence == std::numeric_limits<EngineSeq>::max()) {
+          report_wal_error(phase, "sequence_overflow");
+          return false;
+        }
+        ++next_sequence;
+      }
+    }
+    const auto append_end = std::chrono::steady_clock::now();
+    std::uint64_t sync_duration = 0;
+    if (sync_mode == WalSyncMode::per_group) {
+      const auto sync_start = std::chrono::steady_clock::now();
+      const auto synced = wal.sync();
+      const auto sync_end = std::chrono::steady_clock::now();
+      sync_duration = elapsed_ns(sync_start, sync_end);
+      if (std::holds_alternative<Error>(synced)) {
+        report_wal_error(phase, "wal_sync_failed", std::get<Error>(synced).message);
+        return false;
+      }
+    }
+    const auto group_end = std::chrono::steady_clock::now();
+    if (samples != nullptr) {
+      samples->append_ns.push_back(elapsed_ns(append_start, append_end));
+      if (sync_mode == WalSyncMode::per_group) {
+        samples->sync_ns.push_back(sync_duration);
+      }
+      samples->total_ns.push_back(elapsed_ns(group_start, group_end));
+    }
+  }
+  return true;
+}
+
+bool validate_wal_replay(const std::vector<domain::CommittedCommand>& records,
+                         const std::uint64_t expected_count) {
+  if (records.size() != expected_count) {
+    report_wal_error("replay", "record_count_mismatch");
     return false;
   }
+  for (std::size_t index = 0; index < records.size(); ++index) {
+    const auto expected_sequence = static_cast<EngineSeq>(index + 1U);
+    const auto& record = records[index];
+    if (record.engine_seq != expected_sequence || record.command.instrument_id != 1 ||
+        record.command.command_type != CommandType::new_order ||
+        record.command != make_committed(expected_sequence).command) {
+      report_wal_error("replay", "record_content_mismatch");
+      return false;
+    }
+  }
+  return true;
+}
+
+bool run_wal_write_ceiling(const BenchmarkOptions& options) {
+  if (options.wal_group_size == 0 ||
+      options.wal_group_size > std::numeric_limits<std::size_t>::max()) {
+    report_wal_error("setup", "invalid_group_size");
+    return false;
+  }
+  if (options.warmup > std::numeric_limits<std::uint64_t>::max() - options.iterations) {
+    report_wal_error("setup", "group_count_overflow");
+    return false;
+  }
+  const auto total_groups = options.warmup + options.iterations;
+  if (total_groups != 0 &&
+      options.wal_group_size > std::numeric_limits<std::uint64_t>::max() / total_groups) {
+    report_wal_error("setup", "command_count_overflow");
+    return false;
+  }
+  const auto total_commands = total_groups * options.wal_group_size;
+  const auto run_id = std::to_string(
+                          std::chrono::steady_clock::now().time_since_epoch().count()) +
+                      "-" + std::to_string(static_cast<unsigned long long>(::getpid()));
+  const bool owned_data_directory = !options.data_directory.has_value();
+  const auto data_directory = options.data_directory.value_or(
+      std::filesystem::temp_directory_path() / ("order_books_benchmark_wal-" + run_id));
+  if (const auto error = prepare_data_directory(data_directory); error.has_value()) {
+    report_wal_error("setup", *error, data_directory.string());
+    return false;
+  }
+  const auto cleanup = [&] {
+    if (owned_data_directory) {
+      std::error_code ignored;
+      std::filesystem::remove_all(data_directory, ignored);
+    }
+  };
+
+  auto wal_result = storage::Wal::open(data_directory, 1, kWalCeilingSegmentSize);
+  if (!std::holds_alternative<std::unique_ptr<storage::Wal>>(wal_result)) {
+    report_wal_error("open", "wal_open_failed",
+                     std::get<Error>(wal_result).message);
+    cleanup();
+    return false;
+  }
+  auto wal = std::get<std::unique_ptr<storage::Wal>>(std::move(wal_result));
+  std::uint64_t remaining_commands = total_commands;
+  EngineSeq next_sequence = 1;
+  if (!run_wal_groups(*wal, options.warmup, options.wal_group_size,
+                      options.wal_sync_mode, next_sequence, remaining_commands, "warmup",
+                      nullptr)) {
+    cleanup();
+    return false;
+  }
+  if (const auto status = wal->sync(); std::holds_alternative<Error>(status)) {
+    report_wal_error("warmup", "final_sync_failed", std::get<Error>(status).message);
+    cleanup();
+    return false;
+  }
+  const auto starting_wal_bytes = wal->size_bytes();
+  const auto starting_segment_count = count_wal_segments(data_directory);
+  if (!starting_segment_count.has_value()) {
+    report_wal_error("warmup", "segment_count_failed", data_directory.string());
+    cleanup();
+    return false;
+  }
+
+  WalGroupSamples samples;
+  if (options.iterations <= std::numeric_limits<std::size_t>::max()) {
+    const auto sample_count = static_cast<std::size_t>(options.iterations);
+    samples.append_ns.reserve(sample_count);
+    samples.total_ns.reserve(sample_count);
+    if (options.wal_sync_mode == WalSyncMode::per_group) {
+      samples.sync_ns.reserve(sample_count);
+    }
+  }
+  const auto measured_start = std::chrono::steady_clock::now();
+  if (!run_wal_groups(*wal, options.iterations, options.wal_group_size,
+                      options.wal_sync_mode, next_sequence, remaining_commands, "measured",
+                      &samples)) {
+    cleanup();
+    return false;
+  }
+  const auto measured_end = std::chrono::steady_clock::now();
+  const auto ending_wal_bytes = wal->size_bytes();
+  const auto ending_segment_count = count_wal_segments(data_directory);
+  if (!ending_segment_count.has_value() || *ending_segment_count < *starting_segment_count ||
+      ending_wal_bytes < starting_wal_bytes) {
+    report_wal_error("measured", "wal_observation_failed", data_directory.string());
+    cleanup();
+    return false;
+  }
+  if (remaining_commands != 0) {
+    report_wal_error("measured", "command_count_mismatch");
+    cleanup();
+    return false;
+  }
+  if (const auto status = wal->sync(); std::holds_alternative<Error>(status)) {
+    report_wal_error("finalize", "final_sync_failed", std::get<Error>(status).message);
+    cleanup();
+    return false;
+  }
+
+  wal.reset();
+  auto reopened_result = storage::Wal::open(data_directory, 1, kWalCeilingSegmentSize);
+  if (!std::holds_alternative<std::unique_ptr<storage::Wal>>(reopened_result)) {
+    report_wal_error("reopen", "wal_reopen_failed",
+                     std::get<Error>(reopened_result).message);
+    cleanup();
+    return false;
+  }
+  auto reopened = std::get<std::unique_ptr<storage::Wal>>(std::move(reopened_result));
+  auto replayed_result = reopened->replay();
+  if (!std::holds_alternative<std::vector<domain::CommittedCommand>>(replayed_result)) {
+    report_wal_error("replay", "wal_replay_failed",
+                     std::get<Error>(replayed_result).message);
+    cleanup();
+    return false;
+  }
+  const auto replayed = std::get<std::vector<domain::CommittedCommand>>(
+      std::move(replayed_result));
+  if (!validate_wal_replay(replayed, total_commands)) {
+    cleanup();
+    return false;
+  }
+
+  std::error_code path_error;
+  const auto resolved_path = std::filesystem::weakly_canonical(data_directory, path_error);
+  if (path_error) {
+    report_wal_error("report", "wal_path_resolution_failed", data_directory.string());
+    cleanup();
+    return false;
+  }
+  const auto measured_elapsed = elapsed_ns(measured_start, measured_end);
+  const auto wal_bytes_delta = ending_wal_bytes - starting_wal_bytes;
+  const auto commands_per_second = measured_elapsed == 0
+                                       ? 0.0
+                                       : static_cast<double>(options.iterations) *
+                                             static_cast<double>(options.wal_group_size) *
+                                             1'000'000'000.0 /
+                                             static_cast<double>(measured_elapsed);
+  const auto wal_mib_per_second = measured_elapsed == 0
+                                      ? 0.0
+                                      : static_cast<double>(wal_bytes_delta) *
+                                            1'000'000'000.0 /
+                                            static_cast<double>(measured_elapsed) /
+                                            (1024.0 * 1024.0);
+  const auto target_attainment = commands_per_second / 1'000'000.0 * 100.0;
+  const auto average_wal_bytes = options.iterations == 0 || options.wal_group_size == 0
+                                     ? 0.0
+                                     : static_cast<double>(wal_bytes_delta) /
+                                           (static_cast<double>(options.iterations) *
+                                            static_cast<double>(options.wal_group_size));
+  const auto measured_rotations = *ending_segment_count - *starting_segment_count;
+  std::sort(samples.append_ns.begin(), samples.append_ns.end());
+  std::sort(samples.sync_ns.begin(), samples.sync_ns.end());
+  std::sort(samples.total_ns.begin(), samples.total_ns.end());
+  const auto print_percentile = [](const std::vector<std::uint64_t>& values,
+                                   const std::size_t numerator,
+                                   const std::size_t denominator) {
+    return values.empty() ? std::string("na")
+                           : std::to_string(percentile_ns(values, numerator, denominator) /
+                                            1'000.0);
+  };
+  std::cout << "wal_write_ceiling sync_mode=" << wal_sync_mode_name(options.wal_sync_mode)
+            << " completion_boundary="
+            << (options.wal_sync_mode == WalSyncMode::none ? "append_return" : "group_fsync")
+            << " warmup_groups=" << options.warmup << " groups=" << options.iterations
+            << " group_size=" << options.wal_group_size
+            << " commands=" << options.iterations * options.wal_group_size
+            << " commands_per_second=" << commands_per_second
+            << " target_commands_per_second=1000000"
+            << " target_attainment_percent=" << target_attainment
+            << " wal_mib_per_second=" << wal_mib_per_second
+            << " average_wal_bytes_per_command=" << average_wal_bytes
+            << " append_group_p50_us="
+            << print_percentile(samples.append_ns, 50, 100)
+            << " append_group_p99_us=" << print_percentile(samples.append_ns, 99, 100)
+            << " append_group_p99.9_us=" << print_percentile(samples.append_ns, 999, 1000)
+            << " append_group_max_us="
+            << (samples.append_ns.empty() ? std::string("na")
+                                           : std::to_string(samples.append_ns.back() / 1'000.0))
+            << " sync_samples=" << samples.sync_ns.size()
+            << " sync_p50_us=" << print_percentile(samples.sync_ns, 50, 100)
+            << " sync_p99_us=" << print_percentile(samples.sync_ns, 99, 100)
+            << " sync_p99.9_us=" << print_percentile(samples.sync_ns, 999, 1000)
+            << " sync_max_us="
+            << (samples.sync_ns.empty() ? std::string("na")
+                                         : std::to_string(samples.sync_ns.back() / 1'000.0))
+            << " group_total_p50_us=" << print_percentile(samples.total_ns, 50, 100)
+            << " group_total_p99_us=" << print_percentile(samples.total_ns, 99, 100)
+            << " group_total_p99.9_us=" << print_percentile(samples.total_ns, 999, 1000)
+            << " group_total_max_us="
+            << (samples.total_ns.empty() ? std::string("na")
+                                         : std::to_string(samples.total_ns.back() / 1'000.0))
+            << " elapsed_ms=" << measured_elapsed / 1'000'000.0
+            << " wal_bytes_delta=" << wal_bytes_delta
+            << " wal_bytes=" << ending_wal_bytes
+            << " segment_size_bytes=" << kWalCeilingSegmentSize
+            << " segment_count=" << *ending_segment_count
+            << " measured_segment_rotations=" << measured_rotations
+            << " wal_path=" << resolved_path << " replay_verified=true\n";
+  cleanup();
   return true;
 }
 
@@ -487,7 +849,8 @@ bool run_engine_durable_single_instrument(const BenchmarkOptions& options) {
   const bool owned_data_directory = !options.data_directory.has_value();
   const auto data_directory = options.data_directory.value_or(
       std::filesystem::temp_directory_path() / ("order_books_benchmark_engine-" + run_id));
-  if (!prepare_data_directory(data_directory)) {
+  if (const auto error = prepare_data_directory(data_directory); error.has_value()) {
+    report_durable_error("setup", *error, data_directory.string());
     return false;
   }
   const auto cleanup = [&] {
@@ -669,13 +1032,31 @@ bool run_engine_durable_single_instrument(const BenchmarkOptions& options) {
 
 }  // namespace
 
+void print_usage() {
+  std::cerr << "usage: order_books_benchmark [--iterations=N] [--warmup=N] "
+               "[--workload=all|engine_durable_single_instrument|wal_write_ceiling] "
+               "[--data-dir=PATH] [--wal-group-size=N] [--wal-sync=none|per_group]\n";
+}
+
 int main(const int argc, char** argv) {
   using domain::OrderBook;
 
   const auto options = parse_options(argc, argv);
-  if (!options.has_value() || options->iterations == 0) {
-    std::cerr << "usage: order_books_benchmark [--iterations=N] [--warmup=N] "
-                 "[--workload=all|engine_durable_single_instrument] [--data-dir=PATH]\n";
+  if (!options.has_value()) {
+    std::cerr << "workload=unknown phase=cli error_code=invalid_arguments\n";
+    print_usage();
+    return 2;
+  }
+  if (options->iterations == 0) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=iterations_must_be_positive\n";
+    print_usage();
+    return 2;
+  }
+  if (options->wal_group_size == 0) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=wal_group_size_must_be_positive\n";
+    print_usage();
     return 2;
   }
 
@@ -712,6 +1093,9 @@ int main(const int argc, char** argv) {
   }
   if (options->workload == WorkloadSelection::engine_durable_single_instrument) {
     return 0;
+  }
+  if (options->workload == WorkloadSelection::wal_write_ceiling) {
+    return run_wal_write_ceiling(*options) ? 0 : 1;
   }
 
   OrderBook resting(1);
@@ -839,50 +1223,16 @@ int main(const int argc, char** argv) {
     return 1;
   }
 
+  auto wal_options = *options;
+  wal_options.data_directory.reset();
+  if (!run_wal_write_ceiling(wal_options)) {
+    return 1;
+  }
+
   const auto run_id = std::to_string(
                           std::chrono::steady_clock::now().time_since_epoch().count()) +
                       "-" + std::to_string(static_cast<unsigned long long>(::getpid()));
-  const auto data_directory =
-      std::filesystem::temp_directory_path() / ("order_books_benchmark_wal-" + run_id);
   std::error_code ignored;
-  std::filesystem::remove_all(data_directory, ignored);
-  auto wal_result = storage::Wal::open(data_directory, 1, 1U * 1024U * 1024U);
-  if (!std::holds_alternative<std::unique_ptr<storage::Wal>>(wal_result)) {
-    report_setup_failure(wal_result, "durable_group_commit setup failed");
-    std::filesystem::remove_all(data_directory, ignored);
-    return 1;
-  }
-  auto wal = std::get<std::unique_ptr<storage::Wal>>(std::move(wal_result));
-  constexpr std::uint64_t durable_group_size = 256;
-  if (!run_workload(
-          "durable_group_commit", *options,
-          [&wal](const std::uint64_t index) {
-            if (index > std::numeric_limits<std::uint64_t>::max() / durable_group_size) {
-              throw std::runtime_error("durable group sequence overflow");
-            }
-            const auto first_sequence = index * durable_group_size + 1U;
-            for (std::uint64_t offset = 0; offset < durable_group_size; ++offset) {
-              const auto appended = wal->append(make_committed(first_sequence + offset));
-              if (std::holds_alternative<Error>(appended)) {
-                throw std::runtime_error("WAL append failed: " +
-                                         std::get<Error>(appended).message);
-              }
-            }
-            const auto synced = wal->sync();
-            if (std::holds_alternative<Error>(synced)) {
-              throw std::runtime_error("WAL sync failed: " +
-                                       std::get<Error>(synced).message);
-            }
-            return WorkloadDelta{durable_group_size, 0};
-          },
-          [] { return std::pair<std::uint64_t, std::uint64_t>{0, 0}; },
-          "wal_path=" + data_directory.string() + " group_size=" +
-              std::to_string(durable_group_size) + " fsync_mode=per_group")) {
-    std::filesystem::remove_all(data_directory, ignored);
-    return 1;
-  }
-  std::filesystem::remove_all(data_directory, ignored);
-
   const auto recovery_directory =
       std::filesystem::temp_directory_path() / ("order_books_benchmark_recovery-" + run_id);
   std::filesystem::remove_all(recovery_directory, ignored);

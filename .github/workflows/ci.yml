@@ -59,6 +59,8 @@ jobs:
         run: cmake --build --preset release-benchmark
       - name: Benchmark smoke
         run: ./build/ReleaseBenchmark/benchmarks/order_books_benchmark --workload=all --iterations=20 --warmup=4
+      - name: WAL ceiling append smoke
+        run: ./build/ReleaseBenchmark/benchmarks/order_books_benchmark --workload=wal_write_ceiling --iterations=2 --warmup=1 --wal-group-size=4 --wal-sync=none
 
   linux-clang:
     name: Linux Clang

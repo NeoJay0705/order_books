@@ -8,6 +8,7 @@ add_executable(order_books_tests
   integration/engine_durable_single_instrument_test.cpp
   integration/engine_test.cpp
   integration/persistence_test.cpp
+  integration/wal_write_ceiling_test.cpp
   unit/metrics_registry_test.cpp
 )
 

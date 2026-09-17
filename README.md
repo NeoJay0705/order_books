@@ -101,6 +101,24 @@ workload on a real Linux WAL device:
 `submit()` calls that only report `queued=true`. Use a new empty data directory for each
 run; do not use `tmpfs` or an overlay filesystem for a Linux production baseline.
 
+To measure the WAL write ceiling independently from Engine, run the dedicated workload on
+the same Linux filesystem used for deployment:
+
+```bash
+./build/ReleaseBenchmark/benchmarks/order_books_benchmark \
+  --workload=wal_write_ceiling \
+  --iterations=10000 \
+  --warmup=1000 \
+  --wal-group-size=256 \
+  --wal-sync=per_group \
+  --data-dir=/mnt/local-nvme/order-books-benchmark/wal-run-001
+```
+
+Use `--wal-sync=none` only to isolate the append-return path; it is not durable throughput.
+The `per_group` result counts a command only after its group `fsync` succeeds. Each run must
+use a new empty directory; the benchmark reopens and replays the WAL before printing a
+successful summary.
+
 ## Quality checks
 
 Run ASan and UBSan using the Debug Conan dependencies:
