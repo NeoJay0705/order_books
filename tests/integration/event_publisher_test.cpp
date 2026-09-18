@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -23,6 +24,21 @@
 #include "runtime/event_publisher.hpp"
 
 namespace order_books::runtime {
+
+struct EventPublisherTestPeer {
+  static void add_invalid_inactive_configuration(EventPublisher& publisher) {
+    auto& state = publisher.state_machine_.state();
+    state.instrument_configurations.emplace(
+        99, std::unordered_map<InstrumentId, InstrumentConfig>{
+                {99, InstrumentConfig{99, 0, 1, publisher.state_machine_.state().shard_id}}});
+  }
+
+  static Result<std::optional<domain::ShardState>> load_snapshot(
+      const EventPublisher& publisher) {
+    return publisher.replay_snapshots_.load_latest();
+  }
+};
+
 namespace {
 
 using namespace std::chrono_literals;
@@ -416,6 +432,30 @@ TEST(EventPublisherTest, SnapshotSequenceNeverExceedsDurableCursor) {
   ASSERT_TRUE(std::holds_alternative<std::monostate>(publisher->stop()));
   EXPECT_LE(publisher->replay_snapshot_seq(), publisher->durable_cursor());
   EXPECT_EQ(publisher->replay_snapshot_seq(), 2U);
+}
+
+TEST(EventPublisherTest, SnapshotValidationFailureDoesNotWriteSnapshot) {
+  TemporaryDirectory temporary;
+  const auto commands = std::vector<domain::CommittedCommand>{new_order(1)};
+  auto fixture = make_fixture(temporary.path(), commands);
+  TestSink sink;
+  NullMetricsSink metrics;
+  auto opened = open_publisher_with_metrics(temporary.path(), *fixture.wal,
+                                             fixture.live_state, sink, metrics, 100, 10s, 1);
+  ASSERT_TRUE(std::holds_alternative<std::unique_ptr<EventPublisher>>(opened));
+  auto publisher = std::get<std::unique_ptr<EventPublisher>>(std::move(opened));
+  EventPublisherTestPeer::add_invalid_inactive_configuration(*publisher);
+
+  publisher->start();
+  publisher->notify_publishable(fixture.wal->durable_position());
+  ASSERT_TRUE(wait_for([&] { return publisher->failed(); }));
+  EXPECT_EQ(publisher->replay_snapshot_seq(), 0U);
+  EXPECT_EQ(sink.calls(), 1U);
+
+  auto snapshot = EventPublisherTestPeer::load_snapshot(*publisher);
+  ASSERT_TRUE(std::holds_alternative<std::optional<domain::ShardState>>(snapshot));
+  EXPECT_FALSE(std::get<std::optional<domain::ShardState>>(snapshot).has_value());
+  (void)publisher->stop();
 }
 
 TEST(EventPublisherTest, CrashImageReplaysOnlyTheNonDurableWindow) {

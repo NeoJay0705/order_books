@@ -461,6 +461,12 @@ void EventPublisher::run(const std::stop_token stop_token) {
         failed_.store(true, std::memory_order_release);
         return;
       }
+      if (const auto status = domain::validate_state(state_machine_.state());
+          std::holds_alternative<Error>(status)) {
+        metrics_.observe("publisher_state_error", 1);
+        failed_.store(true, std::memory_order_release);
+        return;
+      }
       if (const auto status = replay_snapshots_.write(state_machine_.state());
           std::holds_alternative<Error>(status)) {
         metrics_.observe("publisher_snapshot_error", 1);

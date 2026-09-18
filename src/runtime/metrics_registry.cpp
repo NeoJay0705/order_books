@@ -12,7 +12,7 @@ constexpr std::array<std::uint64_t, 22U> kLatencyUpperBounds{
     500U,     1'000U,   2'500U,   5'000U,   10'000U,  25'000U,  50'000U,  100'000U,
     250'000U, 500'000U, 1'000'000U, 5'000'000U, 10'000'000U, std::numeric_limits<std::uint64_t>::max()};
 
-constexpr std::array<std::string_view, 28U> kMetricNames{
+constexpr std::array<std::string_view, 30U> kMetricNames{
     "active_instruments",
     "active_orders",
     "active_price_levels",
@@ -39,6 +39,8 @@ constexpr std::array<std::string_view, 28U> kMetricNames{
     "stale_epochs",
     "trades",
     "wal_commit_latency_us",
+    "wal_group_commits",
+    "wal_group_commands",
     "wal_size_bytes",
     "execution_latency_us",
 };
@@ -164,6 +166,8 @@ MetricsSnapshot MetricsRegistry::snapshot() const {
   result.active_instruments = read_counter("active_instruments");
   result.queue_depth = read_counter("queue_depth");
   result.wal_size_bytes = read_counter("wal_size_bytes");
+  result.wal_group_commits = read_counter("wal_group_commits");
+  result.wal_group_commands = read_counter("wal_group_commands");
   result.replayed_records = read_counter("replayed_records");
   result.event_publish_lag_events = read_counter("event_publish_lag_events");
   result.event_publish_lag_bytes = read_counter("event_publish_lag_bytes");

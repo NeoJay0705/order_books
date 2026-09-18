@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <span>
 #include <unordered_map>
 #include <vector>
 
@@ -84,7 +85,16 @@ class StateMachine {
   [[nodiscard]] bool expected_version_matches(const Command& command,
                                               const OrderView& order) const noexcept;
   [[nodiscard]] bool is_known_tombstone(OrderId order_id) const noexcept;
-  void evict_tombstones();
+  [[nodiscard]] Status validate_location_entry(OrderId order_id,
+                                                InstrumentId indexed_instrument) const;
+  [[nodiscard]] Status validate_transition(
+      const CommittedCommand& command, const ExecutionOutput& output,
+      const OrderBookApplyResult* outcome, std::size_t active_orders_before,
+      const std::optional<OrderView>& target_before,
+      std::span<const OrderId> evicted_tombstones) const;
+  [[nodiscard]] Status validate_tombstone_suffix(
+      std::span<const OrderView> terminal_orders) const;
+  [[nodiscard]] Result<std::vector<OrderId>> evict_tombstones();
   void record_terminal(const OrderView& order, EngineSeq engine_seq,
                        Timestamp timestamp);
   void update_locations(const OrderBookApplyResult& outcome);

@@ -359,6 +359,7 @@ Result<std::unique_ptr<ShardRuntime>> ShardRuntime::open(
   auto replay_snapshots = std::get<storage::SnapshotStore>(
       std::move(replay_snapshots_result));
   auto metrics_registry = std::make_unique<MetricsRegistry>(metrics_sink);
+  auto publisher_metrics = std::make_unique<MetricsRegistry>(metrics_sink);
   metrics_registry->observe("active_instruments", state_machine.state().instruments.size());
   metrics_registry->observe("active_orders", state_machine.state().active_order_count);
   metrics_registry->observe("wal_size_bytes", wal->size_bytes());
@@ -369,7 +370,7 @@ Result<std::unique_ptr<ShardRuntime>> ShardRuntime::open(
   }
   auto publisher_result = EventPublisher::open(
       std::get<domain::ShardState>(std::move(publisher_state_result)), *wal,
-      std::move(replay_snapshots), event_sink, *metrics_registry,
+      std::move(replay_snapshots), event_sink, *publisher_metrics,
       config.runtime.event_replay_snapshot_interval_commands,
       config.runtime.event_replay_snapshot_interval,
       config.runtime.publisher_cursor_persist_max_commands,
@@ -384,12 +385,13 @@ Result<std::unique_ptr<ShardRuntime>> ShardRuntime::open(
   publisher->notify_publishable(wal->durable_position());
 
   return std::unique_ptr<ShardRuntime>(new ShardRuntime(
-      shard_id, config, std::move(metrics_registry), std::move(wal), std::move(snapshots),
-      std::move(state_machine), std::move(publisher)));
+      shard_id, config, std::move(metrics_registry), std::move(publisher_metrics),
+      std::move(wal), std::move(snapshots), std::move(state_machine), std::move(publisher)));
 }
 
 ShardRuntime::ShardRuntime(ShardId shard_id, EngineConfig config,
                            std::unique_ptr<MetricsRegistry> metrics_registry,
+                           std::unique_ptr<MetricsRegistry> publisher_metrics,
                            std::unique_ptr<storage::Wal> wal,
                            storage::SnapshotStore snapshots,
                            domain::StateMachine state_machine,
@@ -397,6 +399,7 @@ ShardRuntime::ShardRuntime(ShardId shard_id, EngineConfig config,
     : shard_id_(shard_id),
       config_(std::move(config)),
       metrics_registry_(std::move(metrics_registry)),
+      publisher_metrics_(std::move(publisher_metrics)),
       wal_(std::move(wal)),
       snapshots_(std::move(snapshots)),
       state_machine_(std::move(state_machine)),
@@ -527,7 +530,17 @@ std::future<Result<std::optional<BookLevel>>> ShardRuntime::best(
   return future;
 }
 
-MetricsSnapshot ShardRuntime::metrics() const { return metrics_registry_->snapshot(); }
+MetricsSnapshot ShardRuntime::metrics() const {
+  const auto command = metrics_registry_->snapshot();
+  const auto publisher = publisher_metrics_->snapshot();
+  auto result = command;
+  result.event_publish_lag_events = publisher.event_publish_lag_events;
+  result.event_publish_lag_bytes = publisher.event_publish_lag_bytes;
+  result.event_publish_lag_age_ns = publisher.event_publish_lag_age_ns;
+  result.replayed_records = publisher.replayed_records;
+  result.publish_latency = publisher.publish_latency;
+  return result;
+}
 
 Status ShardRuntime::stop() {
   {
@@ -818,8 +831,6 @@ void ShardRuntime::process_command_batch(std::vector<CommandWork> batch) {
           (config_.runtime.max_publish_lag_bytes != 0 &&
            lag_bytes >= config_.runtime.max_publish_lag_bytes) ||
           age_pressure;
-      metrics_registry_->observe("event_publish_lag_bytes", lag_bytes);
-      metrics_registry_->observe("event_publish_lag_age_ns", lag_age);
       if (bytes_warning || age_warning) {
         metrics_registry_->observe("publisher_lag_warning", 1);
       }
@@ -885,6 +896,9 @@ void ShardRuntime::process_command_batch(std::vector<CommandWork> batch) {
   }
   const auto wal_latency = std::chrono::duration_cast<std::chrono::microseconds>(
       std::chrono::steady_clock::now() - wal_start);
+  metrics_registry_->observe("wal_group_commits", 1);
+  metrics_registry_->observe("wal_group_commands",
+                             static_cast<std::uint64_t>(accepted.size()));
   for (std::size_t index = 0; index < accepted.size(); ++index) {
     metrics_registry_->observe("wal_commit_latency_us",
                                static_cast<std::uint64_t>(wal_latency.count()));
@@ -903,15 +917,6 @@ void ShardRuntime::process_command_batch(std::vector<CommandWork> batch) {
     outputs.push_back(std::get<domain::ExecutionOutput>(std::move(execution)));
   }
 
-  // Validate the complete transition before exposing any committed result to
-  // callers.  A core/invariant failure is fail-stop and must not be reported
-  // as a successful completion for only part of the batch.
-  if (const auto status = domain::validate_state(state_machine_.state());
-      std::holds_alternative<Error>(status)) {
-    reject_batch_pending(ErrorCode::engine_unavailable);
-    fail(std::get<Error>(status));
-    return;
-  }
   if (publisher_->failed()) {
     reject_batch_pending(ErrorCode::engine_unavailable);
     fail(Error{ErrorCode::engine_unavailable, "event publisher failed"});
@@ -962,6 +967,11 @@ void ShardRuntime::process_command_batch(std::vector<CommandWork> batch) {
   const auto elapsed = std::chrono::steady_clock::now() - last_snapshot_time_;
   if (commands_since_snapshot_ >= config_.runtime.snapshot_interval_commands ||
       elapsed >= config_.runtime.snapshot_interval) {
+    if (const auto status = domain::validate_state(state_machine_.state());
+        std::holds_alternative<Error>(status)) {
+      fail(std::get<Error>(status));
+      return;
+    }
     if (const auto status = snapshots_.write(state_machine_.state());
         std::holds_alternative<Error>(status)) {
       fail(std::get<Error>(status));

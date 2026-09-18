@@ -24,6 +24,8 @@
 
 namespace order_books::runtime {
 
+struct ShardRuntimeTestPeer;
+
 class ShardRuntime {
  public:
   static Result<std::unique_ptr<ShardRuntime>> open(
@@ -48,6 +50,8 @@ class ShardRuntime {
   [[nodiscard]] ShardId shard_id() const noexcept { return shard_id_; }
 
  private:
+  friend struct ShardRuntimeTestPeer;
+
   struct CommandWork {
     Command command;
     CompletionHandler completion;
@@ -61,6 +65,7 @@ class ShardRuntime {
 
   ShardRuntime(ShardId shard_id, EngineConfig config,
                std::unique_ptr<MetricsRegistry> metrics_registry,
+               std::unique_ptr<MetricsRegistry> publisher_metrics,
                std::unique_ptr<storage::Wal> wal,
                storage::SnapshotStore snapshots,
                domain::StateMachine state_machine,
@@ -84,6 +89,7 @@ class ShardRuntime {
   ShardId shard_id_{};
   EngineConfig config_;
   std::unique_ptr<MetricsRegistry> metrics_registry_;
+  std::unique_ptr<MetricsRegistry> publisher_metrics_;
   std::unique_ptr<storage::Wal> wal_;
   storage::SnapshotStore snapshots_;
   domain::StateMachine state_machine_;

@@ -35,6 +35,7 @@ using namespace order_books;
 constexpr std::uint64_t kIterations = 2'000;
 constexpr std::uint64_t kWarmup = 100;
 constexpr std::size_t kDurableProducerLanes = 1'024;
+constexpr std::size_t kDurableIngressQueueCapacity = 65'536;
 constexpr std::size_t kPipelineProducerLanes = 1'024;
 constexpr std::size_t kPipelineIngressQueueCapacity = 65'536;
 constexpr auto kDurablePhaseTimeout = std::chrono::seconds(60);
@@ -56,6 +57,7 @@ struct BenchmarkOptions {
   WalSyncMode wal_sync_mode{WalSyncMode::per_group};
   std::size_t engine_group_size{256};
   std::chrono::microseconds engine_group_delay{200};
+  std::size_t engine_producer_lanes{kDurableProducerLanes};
   benchmark::PipelineStage pipeline_stage{benchmark::PipelineStage::all};
   std::size_t pipeline_batch_size{256};
   std::size_t pipeline_active_orders{};
@@ -63,6 +65,7 @@ struct BenchmarkOptions {
   std::size_t publisher_cursor_persist_max_commands{256};
   std::chrono::microseconds publisher_cursor_persist_max_delay{1000};
   bool pipeline_options_set{};
+  bool engine_producer_lanes_parse_error{};
   std::optional<std::filesystem::path> data_directory;
 };
 
@@ -238,6 +241,15 @@ std::optional<BenchmarkOptions> parse_options(const int argc, char** argv) {
     } else if (const auto delay =
                    parse_positive_option(argument, "--engine-group-delay-us=")) {
       options.engine_group_delay = std::chrono::microseconds(*delay);
+    } else if (argument.starts_with("--engine-producer-lanes=")) {
+      const auto producer_lanes = parse_positive_option(argument, "--engine-producer-lanes=");
+      if (!producer_lanes.has_value()) {
+        options.engine_producer_lanes_parse_error = true;
+      } else if (*producer_lanes > std::numeric_limits<std::size_t>::max()) {
+        options.engine_producer_lanes_parse_error = true;
+      } else {
+        options.engine_producer_lanes = static_cast<std::size_t>(*producer_lanes);
+      }
     } else if (const auto batch_size =
                    parse_positive_option(argument, "--pipeline-batch-size=")) {
       options.pipeline_batch_size = static_cast<std::size_t>(*batch_size);
@@ -923,7 +935,7 @@ bool run_engine_durable_single_instrument(const BenchmarkOptions& options) {
   config.data_directory = data_directory;
   config.shard_ids = {1};
   config.instruments = {InstrumentConfig{1, 1, 1, 1}};
-  config.runtime.ingress_queue_capacity = 65'536;
+  config.runtime.ingress_queue_capacity = kDurableIngressQueueCapacity;
   config.runtime.group_commit_max_commands = options.engine_group_size;
   config.runtime.group_commit_max_delay = options.engine_group_delay;
   config.runtime.snapshot_interval_commands = std::numeric_limits<std::size_t>::max();
@@ -943,7 +955,7 @@ bool run_engine_durable_single_instrument(const BenchmarkOptions& options) {
     return false;
   }
   auto engine = std::get<std::unique_ptr<Engine>>(std::move(opened));
-  DurableRunState state(kDurableProducerLanes);
+  DurableRunState state(options.engine_producer_lanes);
   std::uint64_t next_order_id = 1;
   const auto command_count = double_count(options.iterations);
   const auto warmup_command_count = double_count(options.warmup);
@@ -983,6 +995,14 @@ bool run_engine_durable_single_instrument(const BenchmarkOptions& options) {
     cleanup();
     return false;
   }
+  const auto wal_directory = data_directory / "shard-1" / "wal";
+  const auto starting_segment_count = count_wal_segments(wal_directory);
+  if (!starting_segment_count.has_value()) {
+    report_durable_error("warmup_metrics", "segment_count_failed", wal_directory.string());
+    (void)engine->stop();
+    cleanup();
+    return false;
+  }
   const auto measured = run_durable_phase(*engine, state, *command_count,
                                           DurablePhase::measured, next_order_id);
   if (!measured.has_value()) {
@@ -1011,22 +1031,63 @@ bool run_engine_durable_single_instrument(const BenchmarkOptions& options) {
     cleanup();
     return false;
   }
+  engine.reset();
 
   const auto& initial = std::get<MetricsSnapshot>(initial_metrics);
   const auto& after_warmup = std::get<MetricsSnapshot>(warmup_metrics);
   const auto& after_measured = std::get<MetricsSnapshot>(final_metrics);
   const auto expected_warmup = *warmup_command_count;
   const auto expected_measured = *command_count;
+  if (expected_warmup > std::numeric_limits<std::uint64_t>::max() - expected_measured) {
+    report_durable_error("recovery", "command_count_overflow");
+    cleanup();
+    return false;
+  }
+  const auto expected_total = expected_warmup + expected_measured;
+  auto reopened_wal_result = storage::Wal::open(wal_directory, 1, config.runtime.wal_segment_size);
+  if (std::holds_alternative<Error>(reopened_wal_result)) {
+    report_durable_error("recovery", "wal_reopen_failed",
+                         std::get<Error>(reopened_wal_result).message);
+    cleanup();
+    return false;
+  }
+  auto reopened_wal = std::get<std::unique_ptr<storage::Wal>>(
+      std::move(reopened_wal_result));
+  auto replayed_result = reopened_wal->replay();
+  if (std::holds_alternative<Error>(replayed_result)) {
+    report_durable_error("recovery", "wal_replay_failed",
+                         std::get<Error>(replayed_result).message);
+    cleanup();
+    return false;
+  }
+  const auto& replayed = std::get<std::vector<domain::CommittedCommand>>(replayed_result);
+  if (replayed.size() != expected_total || reopened_wal->last_engine_seq() != expected_total) {
+    report_durable_error("recovery", "durable_head_mismatch");
+    cleanup();
+    return false;
+  }
   const auto warmup_commands = counter_delta(after_warmup.commands, initial.commands);
   const auto measured_commands = counter_delta(after_measured.commands, after_warmup.commands);
   const auto measured_trades = counter_delta(after_measured.trades, after_warmup.trades);
+  const auto warmup_group_commits = counter_delta(after_warmup.wal_group_commits,
+                                                  initial.wal_group_commits);
+  const auto warmup_group_commands = counter_delta(after_warmup.wal_group_commands,
+                                                   initial.wal_group_commands);
+  const auto measured_group_commits = counter_delta(after_measured.wal_group_commits,
+                                                    after_warmup.wal_group_commits);
+  const auto measured_group_commands = counter_delta(after_measured.wal_group_commands,
+                                                     after_warmup.wal_group_commands);
   if (!warmup_commands.has_value() || !measured_commands.has_value() ||
-      !measured_trades.has_value()) {
+      !measured_trades.has_value() || !warmup_group_commits.has_value() ||
+      !warmup_group_commands.has_value() || !measured_group_commits.has_value() ||
+      !measured_group_commands.has_value()) {
     report_durable_error("validation", "counter_delta_invalid");
     cleanup();
     return false;
   }
-  if (*warmup_commands != expected_warmup || *measured_commands != expected_measured) {
+  if (*warmup_commands != expected_warmup || *measured_commands != expected_measured ||
+      *warmup_group_commands != expected_warmup ||
+      *measured_group_commands != expected_measured || *measured_group_commits == 0) {
     report_durable_error("validation", "unexpected_command_count");
     cleanup();
     return false;
@@ -1039,6 +1100,17 @@ bool run_engine_durable_single_instrument(const BenchmarkOptions& options) {
   if (measured->submitted != expected_measured || measured->completed != expected_measured ||
       measured->latency_samples.size() != expected_measured) {
     report_durable_error("validation", "completion_count_mismatch");
+    cleanup();
+    return false;
+  }
+  if (after_measured.wal_size_bytes < after_warmup.wal_size_bytes) {
+    report_durable_error("validation", "wal_size_decreased");
+    cleanup();
+    return false;
+  }
+  const auto ending_segment_count = count_wal_segments(wal_directory);
+  if (!ending_segment_count.has_value() || *ending_segment_count < *starting_segment_count) {
+    report_durable_error("validation", "segment_count_invalid", wal_directory.string());
     cleanup();
     return false;
   }
@@ -1069,6 +1141,16 @@ bool run_engine_durable_single_instrument(const BenchmarkOptions& options) {
                                      ? 0.0
                                      : static_cast<double>(trades) * 1'000'000'000.0 /
                                            static_cast<double>(elapsed_ns);
+  const auto actual_commands_per_group =
+      static_cast<double>(*measured_group_commands) /
+      static_cast<double>(*measured_group_commits);
+  const auto wal_bytes_delta = after_measured.wal_size_bytes - after_warmup.wal_size_bytes;
+  const auto wal_mib_per_second = elapsed_ns == 0
+                                      ? 0.0
+                                      : static_cast<double>(wal_bytes_delta) * 1'000'000'000.0 /
+                                            static_cast<double>(elapsed_ns) /
+                                            (1024.0 * 1024.0);
+  const auto measured_rotations = *ending_segment_count - *starting_segment_count;
   std::cout << "engine_durable_single_instrument iterations=" << options.iterations
             << " commands=" << expected_measured << " trades=" << trades
             << " commands_per_second=" << commands_per_second
@@ -1081,8 +1163,16 @@ bool run_engine_durable_single_instrument(const BenchmarkOptions& options) {
             << " active_levels=" << after_measured.active_price_levels
             << " group_size=" << config.runtime.group_commit_max_commands
             << " group_delay_us=" << config.runtime.group_commit_max_delay.count()
+            << " wal_group_commits=" << *measured_group_commits
+            << " wal_group_commands=" << *measured_group_commands
+            << " actual_commands_per_group=" << actual_commands_per_group
+            << " wal_mib_per_second=" << wal_mib_per_second
+            << " wal_bytes_delta=" << wal_bytes_delta
+            << " segment_count=" << *ending_segment_count
+            << " measured_segment_rotations=" << measured_rotations
             << " fsync_mode=per_group completion_boundary=durable_callback"
-            << " instrument_count=1 shard_count=1 producer_lanes=" << kDurableProducerLanes
+            << " instrument_count=1 shard_count=1 producer_lanes="
+            << options.engine_producer_lanes
             << " wal_path=" << wal_path << " wal_bytes=" << after_measured.wal_size_bytes
             << '\n';
   cleanup();
@@ -1096,7 +1186,8 @@ void print_usage() {
                "[--workload=all|engine_durable_single_instrument|wal_write_ceiling|"
                "engine_pipeline_ceiling] [--data-dir=PATH] [--wal-group-size=N] "
                "[--wal-sync=none|per_group] [--engine-group-size=N] "
-               "[--engine-group-delay-us=N] [--pipeline-stage=STAGE] "
+               "[--engine-group-delay-us=N] [--engine-producer-lanes=N] "
+               "[--pipeline-stage=STAGE] "
                "[--pipeline-batch-size=N] [--pipeline-active-orders=N] "
                "[--pipeline-producer-lanes=N] "
                "[--publisher-cursor-persist-max-commands=N] "
@@ -1109,6 +1200,12 @@ int main(const int argc, char** argv) {
   const auto options = parse_options(argc, argv);
   if (!options.has_value()) {
     std::cerr << "workload=unknown phase=cli error_code=invalid_arguments\n";
+    print_usage();
+    return 2;
+  }
+  if (options->engine_producer_lanes_parse_error) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=engine_producer_lanes_invalid\n";
     print_usage();
     return 2;
   }
@@ -1127,6 +1224,18 @@ int main(const int argc, char** argv) {
   if (options->engine_group_size == 0) {
     std::cerr << "workload=" << workload_name(options->workload)
               << " phase=cli error_code=engine_group_size_must_be_positive\n";
+    print_usage();
+    return 2;
+  }
+  if (options->engine_producer_lanes == 0) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=engine_producer_lanes_must_be_positive\n";
+    print_usage();
+    return 2;
+  }
+  if (options->engine_producer_lanes > kDurableIngressQueueCapacity) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=engine_producer_lanes_exceed_capacity\n";
     print_usage();
     return 2;
   }

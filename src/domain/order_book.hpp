@@ -88,6 +88,9 @@ class OrderBook {
   using AskLevels = std::map<Price, PriceLevel, std::less<Price>>;
 
   [[nodiscard]] PriceLevel& get_or_create_level(Side side, Price price);
+  [[nodiscard]] Quantity level_total(Side side, Price price) const noexcept;
+  [[nodiscard]] bool level_delta_is_valid(Side side, Price price, Quantity total_before,
+                                           Quantity quantity_delta) const noexcept;
   [[nodiscard]] bool append_to_level(OrderNode& node, PriceLevel& level);
   void unlink_node(OrderNode& node);
   [[nodiscard]] OrderView erase_node(OrderNode& node);

@@ -26,6 +26,8 @@ struct MetricsSnapshot {
   std::uint64_t active_instruments{};
   std::uint64_t queue_depth{};
   std::uint64_t wal_size_bytes{};
+  std::uint64_t wal_group_commits{};
+  std::uint64_t wal_group_commands{};
   std::uint64_t replayed_records{};
   std::uint64_t event_publish_lag_events{};
   std::uint64_t event_publish_lag_bytes{};

@@ -126,6 +126,23 @@ const OrderBook::OrderNode* OrderBook::find_node(const OrderId order_id) const n
   return iterator == orders_.end() ? nullptr : iterator->second.get();
 }
 
+Quantity OrderBook::level_total(const Side side, const Price price) const noexcept {
+  if (side == Side::buy) {
+    const auto iterator = bids_.find(price);
+    return iterator == bids_.end() ? Quantity{0} : iterator->second.total_quantity;
+  }
+  const auto iterator = asks_.find(price);
+  return iterator == asks_.end() ? Quantity{0} : iterator->second.total_quantity;
+}
+
+bool OrderBook::level_delta_is_valid(const Side side, const Price price,
+                                     const Quantity total_before,
+                                     const Quantity quantity_delta) const noexcept {
+  Quantity expected_after = 0;
+  return checked_add(total_before, quantity_delta, expected_after) &&
+         level_total(side, price) == expected_after;
+}
+
 OrderBookApplyResult OrderBook::add_new(OrderView incoming) {
   if (contains(incoming.order_id)) {
     return failure(ErrorCode::duplicate_order_id);
@@ -239,15 +256,35 @@ OrderBookApplyResult OrderBook::apply_match_plan(const MatchPlan& plan) {
   auto working = plan.initial_order;
   for (const auto& step : plan.steps) {
     auto* maker = find_node(step.maker_order_id);
-    if (maker == nullptr) {
+    if (maker == nullptr || maker->level == nullptr) {
       return failure(ErrorCode::corrupt_snapshot);
     }
     const auto quantity = step.quantity;
+    const auto maker_side = maker->view.side;
+    const auto maker_price = maker->view.price;
+    const auto level_before = maker->level->total_quantity;
+    const auto maker_before = maker->view;
+    OrderVersion expected_maker_version = 0;
+    if (!checked_increment(maker_before.version, expected_maker_version) ||
+        expected_maker_version != step.maker_version) {
+      return failure(ErrorCode::corrupt_snapshot);
+    }
+    if (quantity <= 0 || quantity > level_before ||
+        quantity > maker->view.remaining_quantity ||
+        quantity > working.remaining_quantity) {
+      return failure(ErrorCode::corrupt_snapshot);
+    }
+    Quantity maker_filled = 0;
+    Quantity taker_filled = 0;
+    if (!checked_add(maker->view.filled_quantity, quantity, maker_filled) ||
+        !checked_add(working.filled_quantity, quantity, taker_filled)) {
+      return failure(ErrorCode::corrupt_snapshot);
+    }
     maker->level->total_quantity -= quantity;
     maker->view.remaining_quantity -= quantity;
-    maker->view.filled_quantity += quantity;
+    maker->view.filled_quantity = maker_filled;
     working.remaining_quantity -= quantity;
-    working.filled_quantity += quantity;
+    working.filled_quantity = taker_filled;
     maker->view.status = maker->view.remaining_quantity == 0
                              ? OrderStatus::filled
                              : OrderStatus::partially_filled;
@@ -260,6 +297,20 @@ OrderBookApplyResult OrderBook::apply_match_plan(const MatchPlan& plan) {
                              .maker_remaining_quantity = maker->view.remaining_quantity,
                              .taker_remaining_quantity = working.remaining_quantity});
     result.maker_updates.push_back(maker->view);
+    if (!level_delta_is_valid(maker_side, maker_price, level_before, -quantity) ||
+        maker->view.order_id != maker_before.order_id ||
+        maker->view.instrument_id != maker_before.instrument_id ||
+        maker->view.side != maker_before.side || maker->view.price != maker_before.price ||
+        maker->view.total_quantity != maker_before.total_quantity ||
+        maker->view.version != expected_maker_version ||
+        maker->view.filled_quantity != maker_filled ||
+        maker->view.remaining_quantity != maker_before.remaining_quantity - quantity ||
+        maker->view.priority_seq != maker_before.priority_seq ||
+        maker->view.status != (maker->view.remaining_quantity == 0
+                                   ? OrderStatus::filled
+                                   : OrderStatus::partially_filled)) {
+      return failure(ErrorCode::corrupt_snapshot);
+    }
     if (maker->view.remaining_quantity == 0) {
       result.terminal_orders.push_back(maker->view);
       --result.active_delta;
@@ -274,9 +325,14 @@ OrderBookApplyResult OrderBook::apply_match_plan(const MatchPlan& plan) {
     node->view = working;
     auto& level = get_or_create_level(working.side, working.price);
     auto* node_pointer = node.get();
+    const auto level_before = level.total_quantity;
     orders_.emplace(working.order_id, std::move(node));
     if (!append_to_level(*node_pointer, level)) {
       return failure(ErrorCode::numeric_overflow);
+    }
+    if (!level_delta_is_valid(working.side, working.price, level_before,
+                              working.remaining_quantity)) {
+      return failure(ErrorCode::corrupt_snapshot);
     }
     ++result.active_delta;
   } else {
@@ -313,6 +369,7 @@ OrderBookApplyResult OrderBook::amend_quantity(const OrderId order_id,
   const auto original = node->view;
   if (new_total < original.total_quantity) {
     const auto new_remaining = new_total - original.filled_quantity;
+    const auto level_before = node->level->total_quantity;
     OrderVersion new_version = 0;
     if (!checked_increment(original.version, new_version)) {
       return failure(ErrorCode::numeric_overflow);
@@ -336,6 +393,10 @@ OrderBookApplyResult OrderBook::amend_quantity(const OrderId order_id,
       result.changed = true;
       result.active_delta = -1;
       result.target = terminal;
+      if (!level_delta_is_valid(original.side, original.price, level_before,
+                                -original.remaining_quantity + new_remaining)) {
+        return failure(ErrorCode::corrupt_snapshot);
+      }
       result.terminal_orders.push_back(terminal);
       return result;
     }
@@ -345,6 +406,10 @@ OrderBookApplyResult OrderBook::amend_quantity(const OrderId order_id,
     OrderBookApplyResult result;
     result.changed = true;
     result.target = node->view;
+    if (!level_delta_is_valid(original.side, original.price, level_before,
+                              new_remaining - original.remaining_quantity)) {
+      return failure(ErrorCode::corrupt_snapshot);
+    }
     return result;
   }
 
@@ -354,6 +419,7 @@ OrderBookApplyResult OrderBook::amend_quantity(const OrderId order_id,
     return failure(ErrorCode::numeric_overflow);
   }
   const auto new_remaining = new_total - filled;
+  const auto original_level_before = node->level->total_quantity;
   Quantity level_after_remove = 0;
   Quantity level_after_update = 0;
   if (!checked_add(node->level->total_quantity, -original.remaining_quantity,
@@ -361,8 +427,11 @@ OrderBookApplyResult OrderBook::amend_quantity(const OrderId order_id,
       !checked_add(level_after_remove, new_remaining, level_after_update)) {
     return failure(ErrorCode::numeric_overflow);
   }
-  (void)level_after_update;
   (void)erase_node(*node);
+  if (!level_delta_is_valid(original.side, original.price, original_level_before,
+                            -original.remaining_quantity)) {
+    return failure(ErrorCode::corrupt_snapshot);
+  }
   OrderView replacement = original;
   replacement.total_quantity = new_total;
   replacement.remaining_quantity = new_remaining;
@@ -374,9 +443,14 @@ OrderBookApplyResult OrderBook::amend_quantity(const OrderId order_id,
   replacement_node->view = replacement;
   auto& level = get_or_create_level(replacement.side, replacement.price);
   auto* replacement_pointer = replacement_node.get();
+  const auto replacement_level_before = level.total_quantity;
   orders_.emplace(replacement.order_id, std::move(replacement_node));
   if (!append_to_level(*replacement_pointer, level)) {
     return failure(ErrorCode::numeric_overflow);
+  }
+  if (!level_delta_is_valid(replacement.side, replacement.price, replacement_level_before,
+                            replacement.remaining_quantity)) {
+    return failure(ErrorCode::corrupt_snapshot);
   }
 
   OrderBookApplyResult result;
@@ -414,7 +488,14 @@ OrderBookApplyResult OrderBook::replace(const OrderId order_id, const Price new_
   if (std::holds_alternative<Error>(plan)) {
     return failure(std::get<Error>(plan).code);
   }
+  const auto level_before = node->level->total_quantity;
+  const auto original_side = original.side;
+  const auto original_price = original.price;
   (void)erase_node(*node);
+  if (!level_delta_is_valid(original_side, original_price, level_before,
+                            -original.remaining_quantity)) {
+    return failure(ErrorCode::corrupt_snapshot);
+  }
   auto result = apply_match_plan(std::get<MatchPlan>(std::move(plan)));
   --result.active_delta;
   return result;
@@ -429,6 +510,10 @@ OrderBookApplyResult OrderBook::cancel(const OrderId order_id) {
   if (!checked_increment(node->view.version, next_version)) {
     return failure(ErrorCode::numeric_overflow);
   }
+  const auto level_before = node->level->total_quantity;
+  const auto original_side = node->view.side;
+  const auto original_price = node->view.price;
+  const auto original_remaining = node->view.remaining_quantity;
   auto cancelled = erase_node(*node);
   cancelled.status = OrderStatus::cancelled;
   cancelled.remaining_quantity = 0;
@@ -438,6 +523,9 @@ OrderBookApplyResult OrderBook::cancel(const OrderId order_id) {
   result.active_delta = -1;
   result.target = cancelled;
   result.terminal_orders.push_back(cancelled);
+  if (!level_delta_is_valid(original_side, original_price, level_before, -original_remaining)) {
+    return failure(ErrorCode::corrupt_snapshot);
+  }
   return result;
 }
 

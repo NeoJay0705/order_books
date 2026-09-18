@@ -6,14 +6,40 @@
 #include <future>
 #include <mutex>
 #include <stop_token>
+#include <thread>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "order_books/engine.hpp"
 #include "persistence/snapshot_store.hpp"
+#include "runtime/shard_runtime.hpp"
 
 namespace order_books {
+namespace runtime {
+
+struct ShardRuntimeTestPeer {
+  static void add_invalid_inactive_configuration(ShardRuntime& runtime) {
+    auto& state = runtime.state_machine_.state();
+    state.instrument_configurations.emplace(
+        99, std::unordered_map<InstrumentId, InstrumentConfig>{
+                {99, InstrumentConfig{99, 0, 1, runtime.shard_id()}}});
+  }
+
+  static bool failed(ShardRuntime& runtime) {
+    std::lock_guard lock(runtime.queue_mutex_);
+    return runtime.failed_;
+  }
+
+  static Result<std::optional<domain::ShardState>> load_snapshot(
+      const ShardRuntime& runtime) {
+    return runtime.snapshots_.load_latest();
+  }
+};
+
+}  // namespace runtime
+
 namespace {
 
 class RecordingSink final : public EventSink {
@@ -664,6 +690,71 @@ TEST(EngineTest, InvalidPublisherSnapshotIsRejectedBeforeStart) {
   auto reopened = Engine::open(std::move(config), sink, metrics);
   ASSERT_TRUE(std::holds_alternative<Error>(reopened));
   EXPECT_EQ(std::get<Error>(reopened).code, ErrorCode::corrupt_snapshot);
+  std::filesystem::remove_all(data_directory, ignored);
+}
+
+TEST(EngineTest, LiveSnapshotValidationFailureDoesNotWriteSnapshot) {
+  const auto data_directory =
+      std::filesystem::temp_directory_path() / "order_books_live_snapshot_boundary_test";
+  std::error_code ignored;
+  std::filesystem::remove_all(data_directory, ignored);
+
+  RecordingSink sink;
+  NullMetricsSink metrics;
+  EngineConfig config;
+  config.data_directory = data_directory;
+  config.shard_ids = {1};
+  config.instruments = {InstrumentConfig{7, 1, 1, 1}};
+  config.runtime.group_commit_max_commands = 1;
+  config.runtime.group_commit_max_delay = std::chrono::microseconds(0);
+  config.runtime.snapshot_interval_commands = 1;
+
+  auto opened = runtime::ShardRuntime::open(1, config, sink, metrics);
+  ASSERT_TRUE(std::holds_alternative<std::unique_ptr<runtime::ShardRuntime>>(opened));
+  auto shard = std::get<std::unique_ptr<runtime::ShardRuntime>>(std::move(opened));
+  runtime::ShardRuntimeTestPeer::add_invalid_inactive_configuration(*shard);
+  shard->start();
+
+  Command command;
+  command.identity = CommandIdentity{21, 1, 1, 1};
+  command.instrument_id = 7;
+  command.command_type = CommandType::new_order;
+  command.order_id = {21, 1};
+  command.payload = NewOrderPayload{Side::buy, 100, 1};
+  std::promise<CommandResult> completion;
+  auto result = completion.get_future();
+  ASSERT_TRUE(shard->submit(std::move(command), [&completion](CommandResult value) {
+                              completion.set_value(std::move(value));
+                            })
+                  .queued);
+  ASSERT_EQ(result.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+  EXPECT_EQ(result.get().command_status, CommandStatus::committed);
+
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!runtime::ShardRuntimeTestPeer::failed(*shard) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(runtime::ShardRuntimeTestPeer::failed(*shard));
+
+  auto snapshot = runtime::ShardRuntimeTestPeer::load_snapshot(*shard);
+  ASSERT_TRUE(std::holds_alternative<std::optional<domain::ShardState>>(snapshot));
+  EXPECT_FALSE(std::get<std::optional<domain::ShardState>>(snapshot).has_value());
+
+  Command after_failure;
+  after_failure.identity = CommandIdentity{21, 1, 1, 2};
+  after_failure.instrument_id = 7;
+  after_failure.command_type = CommandType::new_order;
+  after_failure.order_id = {21, 2};
+  after_failure.payload = NewOrderPayload{Side::buy, 100, 1};
+  EXPECT_FALSE(shard->submit(std::move(after_failure), {}).queued);
+
+  auto query = shard->get_order(7, {21, 1});
+  ASSERT_EQ(query.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+  const auto query_result = query.get();
+  ASSERT_TRUE(std::holds_alternative<Error>(query_result));
+  EXPECT_EQ(std::get<Error>(query_result).code, ErrorCode::engine_unavailable);
+  (void)shard->stop();
   std::filesystem::remove_all(data_directory, ignored);
 }
 

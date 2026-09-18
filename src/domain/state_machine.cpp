@@ -61,6 +61,35 @@ Error make_error(const ErrorCode code, const char* message) {
   return Error{code, message};
 }
 
+bool is_active_order(const OrderStatus status) noexcept {
+  return status == OrderStatus::active || status == OrderStatus::partially_filled;
+}
+
+bool valid_order_view(const OrderView& order) noexcept {
+  if (order.order_id == OrderId{} || order.instrument_id == 0 ||
+      (order.side != Side::buy && order.side != Side::sell) || order.price <= 0 ||
+      order.total_quantity <= 0 || order.remaining_quantity < 0 || order.version == 0 ||
+      order.priority_seq == 0 || order.filled_quantity < 0 ||
+      order.filled_quantity > order.total_quantity) {
+    return false;
+  }
+  const auto quantity_sum_valid =
+      order.remaining_quantity <=
+          std::numeric_limits<Quantity>::max() - order.filled_quantity;
+  if (order.status == OrderStatus::active) {
+    return quantity_sum_valid && order.filled_quantity == 0 && order.remaining_quantity > 0 &&
+           order.total_quantity == order.remaining_quantity + order.filled_quantity;
+  }
+  if (order.status == OrderStatus::partially_filled) {
+    return quantity_sum_valid && order.filled_quantity > 0 && order.remaining_quantity > 0 &&
+           order.total_quantity == order.remaining_quantity + order.filled_quantity;
+  }
+  if (order.status == OrderStatus::filled) {
+    return order.remaining_quantity == 0 && order.filled_quantity == order.total_quantity;
+  }
+  return order.status == OrderStatus::cancelled && order.remaining_quantity == 0;
+}
+
 }  // namespace
 
 StateMachine::StateMachine(ShardState state) : state_(std::move(state)) {}
@@ -108,17 +137,511 @@ bool StateMachine::is_known_tombstone(const OrderId order_id) const noexcept {
   return state_.tombstones.find(order_id) != state_.tombstones.end();
 }
 
-void StateMachine::evict_tombstones() {
+Status StateMachine::validate_location_entry(const OrderId order_id,
+                                             const InstrumentId indexed_instrument) const {
+  const auto book = state_.books.find(indexed_instrument);
+  if (book == state_.books.end()) {
+    return make_error(ErrorCode::corrupt_snapshot,
+                      "order location points to a missing book");
+  }
+  const auto order = book->second.find(order_id);
+  if (!order.has_value() || order->instrument_id != indexed_instrument) {
+    return make_error(ErrorCode::corrupt_snapshot,
+                      "order location points to a missing order");
+  }
+  return std::monostate{};
+}
+
+Status StateMachine::validate_transition(const CommittedCommand& command,
+                                          const ExecutionOutput& output,
+                                          const OrderBookApplyResult* outcome,
+                                          const std::size_t active_orders_before,
+                                          const std::optional<OrderView>& target_before,
+                                          const std::span<const OrderId> evicted_tombstones) const {
+  const auto invalid = [](const char* message) -> Status {
+    return make_error(ErrorCode::corrupt_snapshot, message);
+  };
+  const auto checked_quantity_add = [](const Quantity lhs, const Quantity rhs,
+                                       Quantity& result) noexcept {
+    if ((rhs > 0 && lhs > std::numeric_limits<Quantity>::max() - rhs) ||
+        (rhs < 0 && lhs < std::numeric_limits<Quantity>::min() - rhs)) {
+      return false;
+    }
+    result = lhs + rhs;
+    return true;
+  };
+  const auto validate_event_header = [this, &command](const Event& event,
+                                                       const std::size_t index) {
+    return event.id.shard_id == state_.shard_id && event.id.engine_seq == command.engine_seq &&
+           event.id.event_index == index && event.command_identity == command.command.identity &&
+           event.instrument_id == command.command.instrument_id &&
+           event.occurred_at == command.received_at;
+  };
+
+  if (state_.last_committed_engine_seq != command.engine_seq ||
+      state_.logical_retention_time < command.received_at ||
+      output.result.identity != command.command.identity ||
+      !output.result.engine_seq.has_value() ||
+      *output.result.engine_seq != command.engine_seq) {
+    return invalid("state transition result metadata mismatch");
+  }
+
+  const ProducerKey producer_key{command.command.identity.producer_id,
+                                 command.command.identity.producer_stream_id};
+  const auto producer = state_.producer_states.find(producer_key);
+  if (producer == state_.producer_states.end() ||
+      producer->second.current_epoch != command.command.identity.producer_epoch ||
+      producer->second.last_processed_seq != command.command.identity.producer_seq ||
+      producer->second.last_result != output.result) {
+    return invalid("state transition producer result mismatch");
+  }
+
+  if (state_.order_locations.size() != state_.active_order_count ||
+      state_.tombstone_order.size() != state_.tombstones.size()) {
+    return invalid("state transition aggregate mismatch");
+  }
+
+  if (outcome == nullptr) {
+    if (state_.active_order_count != active_orders_before || output.events.size() != 1U ||
+        output.result.command_status != CommandStatus::rejected ||
+        output.result.error_code == ErrorCode::none) {
+      return invalid("rejected transition changed active order count");
+    }
+    if (!validate_event_header(output.events.front(), 0U) ||
+        output.events.front().event_type != EventType::command_rejected) {
+      return invalid("rejected transition event mismatch");
+    }
+    const auto* payload = std::get_if<CommandRejectedEventPayload>(
+        &output.events.front().payload);
+    if (payload == nullptr || payload->command_type != command.command.command_type ||
+        payload->order_id != output.result.order_id ||
+        payload->error_code != output.result.error_code) {
+      return invalid("rejected transition payload mismatch");
+    }
+    return std::monostate{};
+  } else {
+    if (state_.current_behavior_configuration_version !=
+            command.behavior_configuration_version ||
+        state_.current_instrument_configuration_version !=
+            command.instrument_configuration_version ||
+        behavior_config(command.behavior_configuration_version) == nullptr ||
+        instrument_config(command.instrument_configuration_version,
+                          command.command.instrument_id) == nullptr) {
+      return invalid("state transition configuration mismatch");
+    }
+
+    const auto delta = outcome->active_delta;
+    if (delta >= 0) {
+      const auto increase = static_cast<std::size_t>(delta);
+      if (active_orders_before > std::numeric_limits<std::size_t>::max() - increase ||
+          state_.active_order_count != active_orders_before + increase) {
+        return invalid("state transition active order delta mismatch");
+      }
+    } else {
+      const auto decrease = static_cast<std::size_t>(-(delta + 1)) + 1U;
+      if (decrease > active_orders_before ||
+          state_.active_order_count != active_orders_before - decrease) {
+        return invalid("state transition active order delta mismatch");
+      }
+    }
+
+    if (outcome->maker_updates.size() != outcome->trades.size()) {
+      return invalid("maker update and trade count mismatch");
+    }
+    if (outcome->target.has_value() != outcome->changed) {
+      return invalid("transition target and status mismatch");
+    }
+
+    std::size_t terminal_cursor = 0;
+    std::size_t evicted_terminal_count = 0;
+    bool retained_terminal_seen = false;
+    const auto validate_terminal_reference =
+        [this, &invalid, &terminal_cursor, &evicted_terminal_count,
+         &retained_terminal_seen, &outcome,
+         &command](const OrderView& expected) -> Status {
+      if (terminal_cursor >= outcome->terminal_orders.size() ||
+          outcome->terminal_orders[terminal_cursor] != expected ||
+          !valid_order_view(expected) || is_active_order(expected.status) ||
+          expected.instrument_id != command.command.instrument_id) {
+        return invalid("touched terminal order mismatch");
+      }
+      if (state_.order_locations.contains(expected.order_id)) {
+        return invalid("terminal order location was not removed");
+      }
+      const auto book = state_.books.find(expected.instrument_id);
+      if (book != state_.books.end() && book->second.contains(expected.order_id)) {
+        return invalid("terminal order was not removed from book");
+      }
+      const auto tombstone = state_.tombstones.find(expected.order_id);
+      if (tombstone == state_.tombstones.end()) {
+        if (retained_terminal_seen) {
+          return invalid("terminal eviction is not a prefix");
+        }
+        ++evicted_terminal_count;
+      } else if (tombstone->second.order_id != expected.order_id ||
+                 tombstone->second.final_status != expected.status ||
+                 tombstone->second.final_version != expected.version ||
+                 tombstone->second.terminal_engine_seq != command.engine_seq ||
+                 tombstone->second.terminal_time != command.received_at) {
+        return invalid("touched terminal tombstone mismatch");
+      } else {
+        retained_terminal_seen = true;
+      }
+      ++terminal_cursor;
+      return std::monostate{};
+    };
+
+    std::size_t terminal_maker_count = 0;
+
+    const auto validate_active_order =
+        [this, &invalid, instrument_id = command.command.instrument_id](
+            const OrderView& expected) -> Status {
+      if (!valid_order_view(expected) || !is_active_order(expected.status) ||
+          expected.instrument_id != instrument_id) {
+        return invalid("invalid touched active order");
+      }
+      if (state_.tombstones.contains(expected.order_id)) {
+        return invalid("active order has terminal tombstone");
+      }
+      const auto location = state_.order_locations.find(expected.order_id);
+      if (location == state_.order_locations.end() || location->second != expected.instrument_id) {
+        return invalid("touched order location mismatch");
+      }
+      const auto book = state_.books.find(expected.instrument_id);
+      if (book == state_.books.end()) {
+        return invalid("touched order book missing");
+      }
+      const auto actual = book->second.find(expected.order_id);
+      if (!actual.has_value() || *actual != expected) {
+        return invalid("touched order view mismatch");
+      }
+      return std::monostate{};
+    };
+    Quantity taker_quantity = 0;
+    Quantity taker_remaining = 0;
+    Quantity taker_filled = 0;
+    Quantity target_total = 0;
+    if (target_before.has_value()) {
+      if (!valid_order_view(*target_before) || !is_active_order(target_before->status) ||
+          target_before->instrument_id != command.command.instrument_id ||
+          target_before->order_id != command.command.order_id) {
+        return invalid("invalid transition target before state");
+      }
+      target_total = target_before->total_quantity;
+      taker_filled = target_before->filled_quantity;
+      switch (command.command.command_type) {
+        case CommandType::amend_quantity: {
+          const auto* payload = std::get_if<AmendQuantityPayload>(&command.command.payload);
+          if (payload == nullptr) {
+            return invalid("invalid amend transition payload");
+          }
+          target_total = payload->new_total_quantity;
+          break;
+        }
+        case CommandType::replace_order: {
+          const auto* payload = std::get_if<ReplaceOrderPayload>(&command.command.payload);
+          if (payload == nullptr) {
+            return invalid("invalid replace transition payload");
+          }
+          target_total = payload->new_total_quantity.value_or(target_total);
+          break;
+        }
+        case CommandType::cancel_order:
+        case CommandType::new_order:
+          break;
+      }
+      if (target_total <= 0 || target_total < taker_filled) {
+        return invalid("invalid transition target quantity");
+      }
+      taker_remaining = target_total - taker_filled;
+    } else {
+      const auto* payload = std::get_if<NewOrderPayload>(&command.command.payload);
+      if (command.command.command_type != CommandType::new_order || payload == nullptr ||
+          payload->quantity <= 0) {
+        return invalid("missing transition target before state");
+      }
+      target_total = payload->quantity;
+      taker_remaining = payload->quantity;
+    }
+
+    for (std::size_t index = 0; index < outcome->maker_updates.size(); ++index) {
+      const auto& maker = outcome->maker_updates[index];
+      const auto& trade = outcome->trades[index];
+      if (!valid_order_view(maker) || maker.instrument_id != command.command.instrument_id ||
+          trade.quantity <= 0 || trade.maker_order_id != maker.order_id ||
+          trade.price != maker.price || trade.maker_side != maker.side ||
+          trade.maker_remaining_quantity != maker.remaining_quantity ||
+          trade.taker_order_id != command.command.order_id ||
+          trade.maker_remaining_quantity < 0 || trade.taker_remaining_quantity < 0) {
+        return invalid("maker transition or trade mismatch");
+      }
+      const auto status = is_active_order(maker.status)
+                              ? validate_active_order(maker)
+                              : validate_terminal_reference(maker);
+      if (std::holds_alternative<Error>(status)) {
+        return status;
+      }
+
+      Quantity maker_before_remaining = 0;
+      if (!checked_quantity_add(maker.remaining_quantity, trade.quantity,
+                                maker_before_remaining) ||
+          maker.filled_quantity < trade.quantity) {
+        return invalid("maker quantity conservation mismatch");
+      }
+      const auto maker_before_filled = maker.filled_quantity - trade.quantity;
+      Quantity maker_before_total = 0;
+      if (maker_before_remaining <= 0 ||
+          maker_before_filled > maker.total_quantity ||
+          !checked_quantity_add(maker_before_filled, maker_before_remaining,
+                                maker_before_total) ||
+          maker_before_total != maker.total_quantity) {
+        return invalid("maker quantity conservation mismatch");
+      }
+      if (maker.version <= 1U) {
+        return invalid("maker version transition mismatch");
+      }
+      const auto expected_maker_status = maker.remaining_quantity == 0
+                                             ? OrderStatus::filled
+                                             : OrderStatus::partially_filled;
+      if (maker.status != expected_maker_status) {
+        return invalid("maker status transition mismatch");
+      }
+      if (!is_active_order(maker.status)) {
+        ++terminal_maker_count;
+      }
+      if (!checked_quantity_add(taker_quantity, trade.quantity, taker_quantity) ||
+          taker_quantity > taker_remaining ||
+          taker_remaining - taker_quantity != trade.taker_remaining_quantity) {
+        return invalid("taker quantity conservation mismatch");
+      }
+    }
+
+    if (outcome->target.has_value()) {
+      const auto& target = *outcome->target;
+      if (!valid_order_view(target) || target.order_id != command.command.order_id ||
+          target.instrument_id != command.command.instrument_id ||
+          target.total_quantity != target_total) {
+        return invalid("transition target mismatch");
+      }
+      const auto expected_remaining = command.command.command_type == CommandType::cancel_order
+                                          ? Quantity{0}
+                                          : taker_remaining - taker_quantity;
+      Quantity expected_filled = 0;
+      if (!checked_quantity_add(taker_filled, taker_quantity, expected_filled) ||
+          target.remaining_quantity != expected_remaining ||
+          target.filled_quantity != expected_filled) {
+        return invalid("transition target quantity mismatch");
+      }
+      const auto status = is_active_order(target.status)
+                              ? validate_active_order(target)
+                              : validate_terminal_reference(target);
+      if (std::holds_alternative<Error>(status)) {
+        return status;
+      }
+      if (target_before.has_value()) {
+        if (target_before->version == std::numeric_limits<OrderVersion>::max() ||
+            target.version != target_before->version + 1U ||
+            target.side != target_before->side) {
+          return invalid("target version or side transition mismatch");
+        }
+        switch (command.command.command_type) {
+          case CommandType::amend_quantity: {
+            const auto* payload = std::get_if<AmendQuantityPayload>(&command.command.payload);
+            if (payload == nullptr || target.price != target_before->price ||
+                target.priority_seq != (payload->new_total_quantity > target_before->total_quantity
+                                            ? command.engine_seq
+                                            : target_before->priority_seq)) {
+              return invalid("amend target transition mismatch");
+            }
+            break;
+          }
+          case CommandType::replace_order: {
+            const auto* payload = std::get_if<ReplaceOrderPayload>(&command.command.payload);
+            if (payload == nullptr || target.price != payload->new_price ||
+                target.priority_seq != command.engine_seq) {
+              return invalid("replace target transition mismatch");
+            }
+            break;
+          }
+          case CommandType::cancel_order:
+            if (target.price != target_before->price ||
+                target.priority_seq != target_before->priority_seq) {
+              return invalid("cancel target transition mismatch");
+            }
+            break;
+          case CommandType::new_order:
+            return invalid("new order reached existing target transition path");
+        }
+      } else {
+        const auto* payload = std::get_if<NewOrderPayload>(&command.command.payload);
+        if (command.command.command_type != CommandType::new_order || payload == nullptr ||
+            target.version != 1U || target.priority_seq != command.engine_seq ||
+            target.side != payload->side || target.price != payload->price) {
+          return invalid("new target transition mismatch");
+        }
+      }
+      if (output.result.order_status != target.status ||
+          output.result.order_version != target.version ||
+          output.result.remaining_quantity != target.remaining_quantity ||
+          output.result.filled_quantity != target.filled_quantity) {
+        return invalid("transition result target mismatch");
+      }
+    } else if (!target_before.has_value()) {
+      return invalid("new transition target missing");
+    } else if (taker_quantity != 0) {
+      return invalid("trade transition has no target");
+    } else if (target_before.has_value() &&
+               (output.result.order_status != target_before->status ||
+                output.result.order_version != target_before->version ||
+                output.result.remaining_quantity != target_before->remaining_quantity ||
+                output.result.filled_quantity != target_before->filled_quantity)) {
+      return invalid("no-change result target mismatch");
+    }
+    const auto expected_status = outcome->changed ? CommandStatus::committed
+                                                  : CommandStatus::no_change;
+    if (output.result.command_status != expected_status ||
+        output.result.error_code != ErrorCode::none ||
+        output.result.order_id != command.command.order_id) {
+      return invalid("transition result status mismatch");
+    }
+
+    const auto target_was_active = target_before.has_value() && is_active_order(target_before->status);
+    const auto target_is_active = outcome->target.has_value()
+                                      ? is_active_order(outcome->target->status)
+                                      : (!outcome->changed && target_was_active);
+    const auto expected_active_delta = (target_is_active ? 1 : 0) -
+                                       (target_was_active ? 1 : 0) -
+                                       static_cast<int>(terminal_maker_count);
+    if (outcome->active_delta != expected_active_delta) {
+      return invalid("transition active delta mismatch");
+    }
+
+    if (terminal_cursor != outcome->terminal_orders.size()) {
+      return invalid("terminal transition set mismatch");
+    }
+    if (evicted_terminal_count != 0U) {
+      if (evicted_terminal_count > evicted_tombstones.size()) {
+        return invalid("terminal tombstone eviction mismatch");
+      }
+      const auto eviction_offset = evicted_tombstones.size() - evicted_terminal_count;
+      for (std::size_t index = 0; index < evicted_terminal_count; ++index) {
+        if (evicted_tombstones[eviction_offset + index] !=
+            outcome->terminal_orders[index].order_id) {
+          return invalid("terminal tombstone eviction mismatch");
+        }
+      }
+    }
+
+    std::size_t event_index = 0;
+    for (std::size_t index = 0; index < outcome->trades.size(); ++index) {
+      if (event_index >= output.events.size() ||
+          !validate_event_header(output.events[event_index], event_index) ||
+          output.events[event_index].event_type != EventType::trade) {
+        return invalid("trade event header mismatch");
+      }
+      const auto* payload = std::get_if<TradeEventPayload>(&output.events[event_index].payload);
+      const auto& trade = outcome->trades[index];
+      if (payload == nullptr || *payload != TradeEventPayload{
+          TradeId{state_.shard_id, command.engine_seq, static_cast<std::uint32_t>(index)},
+          trade.price, trade.quantity, trade.maker_order_id, trade.taker_order_id,
+          trade.maker_side, trade.maker_remaining_quantity, trade.taker_remaining_quantity}) {
+        return invalid("trade event payload mismatch");
+      }
+      ++event_index;
+    }
+    for (const auto& maker : outcome->maker_updates) {
+      if (event_index >= output.events.size() ||
+          !validate_event_header(output.events[event_index], event_index) ||
+          output.events[event_index].event_type != EventType::order_updated) {
+        return invalid("maker event header mismatch");
+      }
+      const auto* payload =
+          std::get_if<OrderUpdatedEventPayload>(&output.events[event_index].payload);
+      if (payload == nullptr || payload->order != maker || payload->update_reason != ErrorCode::none) {
+        return invalid("maker event payload mismatch");
+      }
+      ++event_index;
+    }
+    if (outcome->target.has_value() && outcome->changed) {
+      if (event_index >= output.events.size() ||
+          !validate_event_header(output.events[event_index], event_index) ||
+          output.events[event_index].event_type != EventType::order_updated) {
+        return invalid("target event header mismatch");
+      }
+      const auto* payload =
+          std::get_if<OrderUpdatedEventPayload>(&output.events[event_index].payload);
+      if (payload == nullptr || payload->order != *outcome->target ||
+          payload->update_reason != ErrorCode::none) {
+        return invalid("target event payload mismatch");
+      }
+      ++event_index;
+    }
+    if (event_index != output.events.size()) {
+      return invalid("unexpected transition event");
+    }
+  }
+  if (output.events.size() > std::numeric_limits<std::uint32_t>::max()) {
+    return invalid("state transition event index overflow");
+  }
+  return std::monostate{};
+}
+
+Status StateMachine::validate_tombstone_suffix(
+    const std::span<const OrderView> terminal_orders) const {
+  if (terminal_orders.empty()) {
+    return std::monostate{};
+  }
+  if (state_.tombstone_order.size() < terminal_orders.size()) {
+    return make_error(ErrorCode::corrupt_snapshot, "terminal tombstone index is truncated");
+  }
+  const auto offset = state_.tombstone_order.size() - terminal_orders.size();
+  const auto first_tombstone = state_.tombstones.find(terminal_orders.front().order_id);
+  if (first_tombstone == state_.tombstones.end()) {
+    return make_error(ErrorCode::corrupt_snapshot, "terminal tombstone suffix is missing");
+  }
+  if (offset > 0 && state_.tombstone_order[offset - 1U].first >
+                        first_tombstone->second.terminal_engine_seq) {
+    return make_error(ErrorCode::corrupt_snapshot, "terminal tombstone index is out of order");
+  }
+  for (std::size_t index = 0; index < terminal_orders.size(); ++index) {
+    const auto [sequence, order_id] = state_.tombstone_order[offset + index];
+    const auto& terminal = terminal_orders[index];
+    const auto iterator = state_.tombstones.find(order_id);
+    if ((index > 0 &&
+         sequence < state_.tombstone_order[offset + index - 1U].first) ||
+        order_id != terminal.order_id || iterator == state_.tombstones.end() ||
+        iterator->second.order_id != terminal.order_id ||
+        iterator->second.final_status != terminal.status ||
+        iterator->second.final_version != terminal.version ||
+        iterator->second.terminal_engine_seq != sequence) {
+      return make_error(ErrorCode::corrupt_snapshot, "terminal tombstone suffix mismatch");
+    }
+  }
+  return std::monostate{};
+}
+
+Result<std::vector<OrderId>> StateMachine::evict_tombstones() {
+  std::vector<OrderId> evicted;
   const auto* behavior = behavior_config(state_.current_behavior_configuration_version);
   if (behavior == nullptr) {
-    return;
+    return evicted;
   }
   while (!state_.tombstone_order.empty()) {
     const auto [sequence, order_id] = state_.tombstone_order.front();
     const auto iterator = state_.tombstones.find(order_id);
     if (iterator == state_.tombstones.end()) {
-      state_.tombstone_order.pop_front();
-      continue;
+      return make_error(ErrorCode::corrupt_snapshot,
+                        "terminal tombstone index points to missing entry");
+    }
+    if (order_id == OrderId{} || sequence == 0 ||
+        sequence > state_.last_committed_engine_seq ||
+        iterator->second.order_id != order_id ||
+        iterator->second.terminal_engine_seq != sequence ||
+        (iterator->second.final_status != OrderStatus::filled &&
+         iterator->second.final_status != OrderStatus::cancelled) ||
+        iterator->second.final_version == 0 ||
+        iterator->second.terminal_time > state_.logical_retention_time) {
+      return make_error(ErrorCode::corrupt_snapshot, "invalid terminal tombstone prefix");
     }
     const auto age = state_.logical_retention_time - iterator->second.terminal_time;
     const bool expired = age >= behavior->terminal_tombstone_max_age_ns;
@@ -128,8 +651,9 @@ void StateMachine::evict_tombstones() {
     }
     state_.tombstones.erase(iterator);
     state_.tombstone_order.pop_front();
-    (void)sequence;
+    evicted.push_back(order_id);
   }
+  return evicted;
 }
 
 void StateMachine::record_terminal(const OrderView& order, const EngineSeq engine_seq,
@@ -245,7 +769,18 @@ Result<ExecutionOutput> StateMachine::reject(const CommittedCommand& command,
   state_.logical_retention_time =
       std::max(state_.logical_retention_time, command.received_at);
   save_producer_result(command, output.result);
-  evict_tombstones();
+  auto evicted_result = evict_tombstones();
+  if (std::holds_alternative<Error>(evicted_result)) {
+    return std::get<Error>(std::move(evicted_result));
+  }
+  const auto& evicted_tombstones = std::get<std::vector<OrderId>>(evicted_result);
+  if (const auto status = validate_transition(command, output, nullptr,
+                                               state_.active_order_count,
+                                               std::nullopt,
+                                               evicted_tombstones);
+      std::holds_alternative<Error>(status)) {
+    return std::get<Error>(status);
+  }
   return output;
 }
 
@@ -280,7 +815,10 @@ Result<ExecutionOutput> StateMachine::apply(const CommittedCommand& command) {
       command.behavior_configuration_version;
   state_.logical_retention_time =
       std::max(state_.logical_retention_time, command.received_at);
-  evict_tombstones();
+  auto pre_eviction = evict_tombstones();
+  if (std::holds_alternative<Error>(pre_eviction)) {
+    return std::get<Error>(std::move(pre_eviction));
+  }
 
   const auto& request = command.command;
   if (request.payload.valueless_by_exception()) {
@@ -313,11 +851,18 @@ Result<ExecutionOutput> StateMachine::apply(const CommittedCommand& command) {
     if (payload->quantity <= 0 || payload->quantity % instrument->lot_size != 0) {
       return reject(command, ErrorCode::invalid_quantity);
     }
+    if (const auto location = state_.order_locations.find(request.order_id);
+        location != state_.order_locations.end()) {
+      if (const auto status = validate_location_entry(request.order_id, location->second);
+          std::holds_alternative<Error>(status)) {
+        return std::get<Error>(status);
+      }
+      return reject(command, ErrorCode::duplicate_order_id);
+    }
     const auto existing_book = state_.books.find(request.instrument_id);
     if (request.order_id == OrderId{} ||
         (existing_book != state_.books.end() &&
          existing_book->second.contains(request.order_id)) ||
-        state_.order_locations.find(request.order_id) != state_.order_locations.end() ||
         is_known_tombstone(request.order_id)) {
       return reject(command, ErrorCode::duplicate_order_id);
     }
@@ -325,6 +870,7 @@ Result<ExecutionOutput> StateMachine::apply(const CommittedCommand& command) {
     if (state_.active_order_count >= behavior->max_active_orders) {
       return reject(command, ErrorCode::shard_capacity_exceeded);
     }
+    const auto active_orders_before = state_.active_order_count;
     bool inserted_book = false;
     auto book_iterator = state_.books.find(request.instrument_id);
     if (book_iterator == state_.books.end()) {
@@ -348,6 +894,10 @@ Result<ExecutionOutput> StateMachine::apply(const CommittedCommand& command) {
       if (inserted_book) {
         state_.books.erase(request.instrument_id);
       }
+      if (outcome.error == ErrorCode::corrupt_snapshot ||
+          outcome.error == ErrorCode::corrupt_wal) {
+        return make_error(outcome.error, "order book transition invariant failed");
+      }
       return reject(command, outcome.error);
     }
     ExecutionOutput output;
@@ -366,15 +916,36 @@ Result<ExecutionOutput> StateMachine::apply(const CommittedCommand& command) {
     state_.last_committed_engine_seq = command.engine_seq;
     append_events(command, outcome, output);
     save_producer_result(command, output.result);
-    evict_tombstones();
+    if (const auto status = validate_tombstone_suffix(outcome.terminal_orders);
+        std::holds_alternative<Error>(status)) {
+      return std::get<Error>(status);
+    }
+    auto evicted_result = evict_tombstones();
+    if (std::holds_alternative<Error>(evicted_result)) {
+      return std::get<Error>(std::move(evicted_result));
+    }
+    const auto& evicted_tombstones = std::get<std::vector<OrderId>>(evicted_result);
+    if (const auto status = validate_transition(command, output, &outcome,
+                                                 active_orders_before,
+                                                 std::nullopt,
+                                                 evicted_tombstones);
+        std::holds_alternative<Error>(status)) {
+      return std::get<Error>(status);
+    }
     return output;
   }
 
   const auto location = state_.order_locations.find(request.order_id);
-  if (location == state_.order_locations.end() ||
-      location->second != request.instrument_id) {
+  if (location == state_.order_locations.end()) {
     if (is_known_tombstone(request.order_id)) {
       return reject(command, ErrorCode::order_already_terminal);
+    }
+    return reject(command, ErrorCode::order_not_found);
+  }
+  if (location->second != request.instrument_id) {
+    if (const auto status = validate_location_entry(request.order_id, location->second);
+        std::holds_alternative<Error>(status)) {
+      return std::get<Error>(status);
     }
     return reject(command, ErrorCode::order_not_found);
   }
@@ -391,6 +962,7 @@ Result<ExecutionOutput> StateMachine::apply(const CommittedCommand& command) {
     return reject(command, ErrorCode::version_conflict);
   }
 
+  const auto active_orders_before = state_.active_order_count;
   OrderBookApplyResult outcome;
   switch (request.command_type) {
     case CommandType::amend_quantity: {
@@ -426,6 +998,10 @@ Result<ExecutionOutput> StateMachine::apply(const CommittedCommand& command) {
       return make_error(ErrorCode::corrupt_wal, "new order reached existing-order path");
   }
   if (outcome.error != ErrorCode::none) {
+    if (outcome.error == ErrorCode::corrupt_snapshot ||
+        outcome.error == ErrorCode::corrupt_wal) {
+      return make_error(outcome.error, "order book transition invariant failed");
+    }
     return reject(command, outcome.error);
   }
 
@@ -453,7 +1029,22 @@ Result<ExecutionOutput> StateMachine::apply(const CommittedCommand& command) {
   state_.last_committed_engine_seq = command.engine_seq;
   append_events(command, outcome, output);
   save_producer_result(command, output.result);
-  evict_tombstones();
+  if (const auto status = validate_tombstone_suffix(outcome.terminal_orders);
+      std::holds_alternative<Error>(status)) {
+    return std::get<Error>(status);
+  }
+  auto evicted_result = evict_tombstones();
+  if (std::holds_alternative<Error>(evicted_result)) {
+    return std::get<Error>(std::move(evicted_result));
+  }
+  const auto& evicted_tombstones = std::get<std::vector<OrderId>>(evicted_result);
+  if (const auto status = validate_transition(command, output, &outcome,
+                                               active_orders_before,
+                                               current,
+                                               evicted_tombstones);
+      std::holds_alternative<Error>(status)) {
+    return std::get<Error>(status);
+  }
   return output;
 }
 

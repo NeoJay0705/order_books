@@ -21,5 +21,18 @@ TEST(MetricsRegistryTest, ExposesFixedBucketLatencyQuantiles) {
   EXPECT_EQ(snapshot.queue_latency.count, 1U);
 }
 
+TEST(MetricsRegistryTest, ExposesWalGroupTotalsAsCounters) {
+  NullMetricsSink downstream;
+  MetricsRegistry registry(downstream);
+
+  registry.observe("wal_group_commits", 2);
+  registry.observe("wal_group_commands", 256);
+  registry.observe("wal_group_commands", 128);
+
+  const auto snapshot = registry.snapshot();
+  EXPECT_EQ(snapshot.wal_group_commits, 2U);
+  EXPECT_EQ(snapshot.wal_group_commands, 384U);
+}
+
 }  // namespace
 }  // namespace order_books::runtime

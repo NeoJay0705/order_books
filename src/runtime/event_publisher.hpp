@@ -19,6 +19,8 @@
 
 namespace order_books::runtime {
 
+struct EventPublisherTestPeer;
+
 class EventPublisher {
  public:
   static Result<std::unique_ptr<EventPublisher>> open(
@@ -57,6 +59,8 @@ class EventPublisher {
   [[nodiscard]] std::optional<Timestamp> oldest_unconfirmed_received_at();
 
  private:
+  friend struct EventPublisherTestPeer;
+
   EventPublisher(domain::ShardState state, storage::Wal& wal,
                  storage::SnapshotStore replay_snapshots, EventSink& sink,
                  MetricsSink& metrics, std::size_t snapshot_interval_commands,
