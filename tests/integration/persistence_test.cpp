@@ -289,6 +289,134 @@ TEST(PersistenceTest, WalEmptyBatchDoesNotChangeState) {
   EXPECT_EQ(wal->durable_position().engine_seq, before_position.engine_seq);
 }
 
+TEST(PersistenceTest, WalProfiledBatchPreservesRecordAndPhaseBoundaries) {
+  TemporaryDirectory temporary("order_books_wal_profile_test");
+  const auto normal_directory = temporary.path() / "normal";
+  const auto profiled_directory = temporary.path() / "profiled";
+  constexpr std::size_t segment_size = 1U * 1024U * 1024U;
+  const std::vector<domain::CommittedCommand> commands{command(1), command(2), command(3)};
+  const auto expected_frame_bytes = [&commands] {
+    std::uint64_t total = 0;
+    for (const auto& record : commands) {
+      total += 4U + encode_committed_command(record).size() + 6U;
+    }
+    return total;
+  }();
+
+  auto normal_opened = Wal::open(normal_directory, 1, segment_size);
+  auto profiled_opened = Wal::open(profiled_directory, 1, segment_size);
+  ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Wal>>(normal_opened));
+  ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Wal>>(profiled_opened));
+  auto normal_wal = std::get<std::unique_ptr<Wal>>(std::move(normal_opened));
+  auto profiled_wal = std::get<std::unique_ptr<Wal>>(std::move(profiled_opened));
+  WalAppendProfile profile;
+  const auto normal_appended = normal_wal->append_batch(commands);
+  const auto profiled_appended = profiled_wal->append_batch_profiled(commands, profile);
+  ASSERT_TRUE(std::holds_alternative<WalPosition>(normal_appended));
+  ASSERT_TRUE(std::holds_alternative<WalPosition>(profiled_appended));
+  const auto& normal_position = std::get<WalPosition>(normal_appended);
+  const auto& profiled_position = std::get<WalPosition>(profiled_appended);
+  EXPECT_EQ(normal_position.engine_seq, profiled_position.engine_seq);
+  EXPECT_EQ(normal_position.segment.filename(), profiled_position.segment.filename());
+  EXPECT_EQ(normal_position.end_offset, profiled_position.end_offset);
+  EXPECT_EQ(normal_wal->size_bytes(), profiled_wal->size_bytes());
+  EXPECT_EQ(profile.frame_bytes, expected_frame_bytes);
+  EXPECT_EQ(profile.data_write_calls, 1U);
+  EXPECT_EQ(profile.rotations, 0U);
+  EXPECT_EQ(profiled_wal->durable_position().engine_seq, 0U);
+
+  ASSERT_TRUE(std::holds_alternative<std::monostate>(normal_wal->sync()));
+  ASSERT_TRUE(std::holds_alternative<std::monostate>(profiled_wal->sync()));
+  normal_wal.reset();
+  profiled_wal.reset();
+  auto normal_reopened = Wal::open(normal_directory, 1, segment_size);
+  auto profiled_reopened = Wal::open(profiled_directory, 1, segment_size);
+  ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Wal>>(normal_reopened));
+  ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Wal>>(profiled_reopened));
+  auto normal_replayed = std::get<std::unique_ptr<Wal>>(std::move(normal_reopened))->replay();
+  auto profiled_replayed = std::get<std::unique_ptr<Wal>>(std::move(profiled_reopened))->replay();
+  ASSERT_TRUE(std::holds_alternative<std::vector<domain::CommittedCommand>>(normal_replayed));
+  ASSERT_TRUE(std::holds_alternative<std::vector<domain::CommittedCommand>>(profiled_replayed));
+  const auto& normal_records = std::get<std::vector<domain::CommittedCommand>>(normal_replayed);
+  const auto& profiled_records =
+      std::get<std::vector<domain::CommittedCommand>>(profiled_replayed);
+  ASSERT_EQ(normal_records.size(), commands.size());
+  ASSERT_EQ(profiled_records.size(), commands.size());
+  for (std::size_t index = 0; index < commands.size(); ++index) {
+    EXPECT_EQ(normal_records[index].engine_seq, commands[index].engine_seq);
+    EXPECT_EQ(normal_records[index].command, commands[index].command);
+    EXPECT_EQ(profiled_records[index].engine_seq, normal_records[index].engine_seq);
+    EXPECT_EQ(profiled_records[index].command, normal_records[index].command);
+  }
+}
+
+TEST(PersistenceTest, WalProfiledBatchCountsRotationSeparatelyFromDataWrites) {
+  TemporaryDirectory temporary("order_books_wal_profile_rotation_test");
+  const auto wal_directory = temporary.path() / "wal";
+  const auto first = command(1);
+  const auto frame_bytes = 4U + encode_committed_command(first).size() + 6U;
+  const auto segment_size = std::size_t{22} + frame_bytes + 1U;
+  const std::vector<domain::CommittedCommand> commands{command(1), command(2), command(3)};
+
+  auto opened = Wal::open(wal_directory, 1, segment_size);
+  ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Wal>>(opened));
+  auto wal = std::get<std::unique_ptr<Wal>>(std::move(opened));
+  WalAppendProfile profile;
+  ASSERT_TRUE(std::holds_alternative<WalPosition>(
+      wal->append_batch_profiled(commands, profile)));
+  EXPECT_EQ(profile.rotations, 2U);
+  EXPECT_EQ(profile.data_write_calls, commands.size());
+  EXPECT_EQ(wal_segments(wal_directory).size(), commands.size());
+  ASSERT_TRUE(std::holds_alternative<std::monostate>(wal->sync()));
+
+  auto replayed = wal->replay();
+  ASSERT_TRUE(std::holds_alternative<std::vector<domain::CommittedCommand>>(replayed));
+  const auto& records = std::get<std::vector<domain::CommittedCommand>>(replayed);
+  ASSERT_EQ(records.size(), commands.size());
+  for (std::size_t index = 0; index < commands.size(); ++index) {
+    EXPECT_EQ(records[index].engine_seq, commands[index].engine_seq);
+    EXPECT_EQ(records[index].command, commands[index].command);
+  }
+}
+
+TEST(PersistenceTest, WalProfiledEmptyBatchClearsProfileAndChangesNothing) {
+  TemporaryDirectory temporary("order_books_wal_profile_empty_test");
+  auto opened = Wal::open(temporary.path() / "wal", 1, 1U * 1024U * 1024U);
+  ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Wal>>(opened));
+  auto wal = std::get<std::unique_ptr<Wal>>(std::move(opened));
+  const auto before_size = wal->size_bytes();
+  const auto before_durable_position = wal->durable_position();
+  WalAppendProfile profile;
+  profile.lock_wait_ns = 99U;
+  profile.prepare_ns = 99U;
+  profile.plan_copy_ns = 99U;
+  profile.rotation_ns = 99U;
+  profile.write_ns = 99U;
+  profile.publish_ns = 99U;
+  profile.frame_bytes = 99U;
+  profile.data_write_calls = 99U;
+  profile.rotations = 99U;
+  const std::span<const domain::CommittedCommand> empty;
+
+  const auto result = wal->append_batch_profiled(empty, profile);
+  ASSERT_TRUE(std::holds_alternative<Error>(result));
+  EXPECT_EQ(std::get<Error>(result).code, ErrorCode::wal_failure);
+  EXPECT_EQ(profile.lock_wait_ns, 0U);
+  EXPECT_EQ(profile.prepare_ns, 0U);
+  EXPECT_EQ(profile.plan_copy_ns, 0U);
+  EXPECT_EQ(profile.rotation_ns, 0U);
+  EXPECT_EQ(profile.write_ns, 0U);
+  EXPECT_EQ(profile.publish_ns, 0U);
+  EXPECT_EQ(profile.frame_bytes, 0U);
+  EXPECT_EQ(profile.data_write_calls, 0U);
+  EXPECT_EQ(profile.rotations, 0U);
+  EXPECT_EQ(wal->size_bytes(), before_size);
+  const auto after_durable_position = wal->durable_position();
+  EXPECT_EQ(after_durable_position.engine_seq, before_durable_position.engine_seq);
+  EXPECT_EQ(after_durable_position.segment, before_durable_position.segment);
+  EXPECT_EQ(after_durable_position.end_offset, before_durable_position.end_offset);
+}
+
 TEST(PersistenceTest, LastSegmentPartialTailIsTruncated) {
   TemporaryDirectory temporary("order_books_wal_tail_test");
   const auto wal_directory = temporary.path() / "wal";

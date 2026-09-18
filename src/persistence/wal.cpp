@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -15,6 +16,14 @@
 
 namespace order_books::storage {
 namespace {
+
+using ProfileClock = std::chrono::steady_clock;
+
+std::uint64_t profile_elapsed_ns(const ProfileClock::time_point start,
+                                 const ProfileClock::time_point end) {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+}
 
 constexpr std::uint16_t kRecordVersion = 1;
 constexpr std::size_t kHeaderSize = 22;
@@ -333,31 +342,58 @@ Result<WalPosition> Wal::append(const domain::CommittedCommand& command) {
     return std::get<Error>(prepared);
   }
   return append_prepared_unlocked(
-      std::get<std::vector<PreparedRecord>>(std::move(prepared)));
+      std::get<std::vector<PreparedRecord>>(std::move(prepared)), nullptr);
 }
 
 Result<WalPosition> Wal::append_batch(
     const std::span<const domain::CommittedCommand> commands) {
   std::lock_guard lock(mutex_);
+  return append_batch_unlocked(commands, nullptr);
+}
+
+Result<WalPosition> Wal::append_batch_profiled(
+    const std::span<const domain::CommittedCommand> commands,
+    WalAppendProfile& profile) {
+  profile = {};
+  const auto lock_start = ProfileClock::now();
+  std::unique_lock lock(mutex_);
+  if (commands.empty()) {
+    return append_batch_unlocked(commands, nullptr);
+  }
+  profile.lock_wait_ns = profile_elapsed_ns(lock_start, ProfileClock::now());
+  return append_batch_unlocked(commands, &profile);
+}
+
+Result<WalPosition> Wal::append_batch_unlocked(
+    const std::span<const domain::CommittedCommand> commands,
+    WalAppendProfile* profile) {
   if (commands.empty()) {
     return wal_error(ErrorCode::wal_failure, "WAL append batch is empty");
   }
+  const auto prepare_start = profile == nullptr ? ProfileClock::time_point{}
+                                                : ProfileClock::now();
   auto prepared = prepare_records_unlocked(commands);
   if (std::holds_alternative<Error>(prepared)) {
     return std::get<Error>(prepared);
   }
+  if (profile != nullptr) {
+    profile->prepare_ns = profile_elapsed_ns(prepare_start, ProfileClock::now());
+  }
   return append_prepared_unlocked(
-      std::get<std::vector<PreparedRecord>>(std::move(prepared)));
+      std::get<std::vector<PreparedRecord>>(std::move(prepared)), profile);
 }
 
 Result<WalPosition> Wal::append_prepared_unlocked(
-    std::vector<PreparedRecord> records) {
+    std::vector<PreparedRecord> records, WalAppendProfile* profile) {
   if (records.empty()) {
     return wal_error(ErrorCode::wal_failure, "WAL append batch is empty");
   }
   if (records.size() > records_.max_size() - records_.size()) {
     return wal_error(ErrorCode::wal_failure, "WAL record count overflow");
   }
+
+  const auto plan_start = profile == nullptr ? ProfileClock::time_point{}
+                                             : ProfileClock::now();
 
   std::vector<CachedRecord> cached_records;
   cached_records.reserve(records.size());
@@ -450,8 +486,16 @@ Result<WalPosition> Wal::append_prepared_unlocked(
     first_record = end_record;
   }
 
+  if (profile != nullptr) {
+    profile->plan_copy_ns = profile_elapsed_ns(plan_start, ProfileClock::now());
+    profile->frame_bytes = frame_bytes_total;
+  }
+
   WalPosition last_position;
   for (const auto& chunk : chunks) {
+    const auto rotation_start = profile != nullptr && chunk.rotate_before
+                                    ? ProfileClock::now()
+                                    : ProfileClock::time_point{};
     if (chunk.rotate_before) {
       if (active_dirty_) {
         auto status = sync_active_unlocked();
@@ -463,14 +507,28 @@ Result<WalPosition> Wal::append_prepared_unlocked(
       if (std::holds_alternative<Error>(status)) {
         return std::get<Error>(status);
       }
+      if (profile != nullptr) {
+        ++profile->rotations;
+      }
+    }
+    if (profile != nullptr && chunk.rotate_before) {
+      profile->rotation_ns += profile_elapsed_ns(rotation_start, ProfileClock::now());
     }
     if (active_descriptor_ < 0) {
       return wal_error(ErrorCode::wal_failure, "active WAL descriptor is not open");
     }
+    const auto write_start = profile == nullptr ? ProfileClock::time_point{}
+                                                : ProfileClock::now();
     const auto status = FileOps::write_all(active_descriptor_, chunk.bytes);
     if (std::holds_alternative<Error>(status)) {
       return std::get<Error>(status);
     }
+    if (profile != nullptr) {
+      profile->write_ns += profile_elapsed_ns(write_start, ProfileClock::now());
+      ++profile->data_write_calls;
+    }
+    const auto publish_start = profile == nullptr ? ProfileClock::time_point{}
+                                                  : ProfileClock::now();
     for (std::size_t offset = 0; offset < chunk.record_count; ++offset) {
       const auto record_index = chunk.first_record + offset;
       const auto frame_size = static_cast<std::uint64_t>(records[record_index].frame.size());
@@ -482,6 +540,9 @@ Result<WalPosition> Wal::append_prepared_unlocked(
       records_.push_back(std::move(cached_records[record_index]));
     }
     active_dirty_ = true;
+    if (profile != nullptr) {
+      profile->publish_ns += profile_elapsed_ns(publish_start, ProfileClock::now());
+    }
   }
   return last_position;
 }

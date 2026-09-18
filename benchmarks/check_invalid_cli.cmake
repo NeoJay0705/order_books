@@ -2,8 +2,12 @@ if(NOT DEFINED PROGRAM OR NOT DEFINED CLI_ARGUMENT OR NOT DEFINED EXPECTED_ERROR
   message(FATAL_ERROR "PROGRAM, CLI_ARGUMENT and EXPECTED_ERROR are required")
 endif()
 
+set(command "${PROGRAM}" --workload=engine_durable_single_instrument "${CLI_ARGUMENT}")
+if(DEFINED CLI_ARGUMENT_2)
+  list(APPEND command "${CLI_ARGUMENT_2}")
+endif()
 execute_process(
-  COMMAND "${PROGRAM}" --workload=engine_durable_single_instrument "${CLI_ARGUMENT}"
+  COMMAND ${command}
   RESULT_VARIABLE result
   OUTPUT_VARIABLE stdout
   ERROR_VARIABLE stderr

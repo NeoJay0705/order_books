@@ -21,6 +21,21 @@ struct WalPosition {
   std::uint64_t end_offset{};
 };
 
+// Populated only by the benchmark-only diagnostic append path.  This type is
+// intentionally kept in the internal storage header and is not part of the
+// installed library API.
+struct WalAppendProfile {
+  std::uint64_t lock_wait_ns{};
+  std::uint64_t prepare_ns{};
+  std::uint64_t plan_copy_ns{};
+  std::uint64_t rotation_ns{};
+  std::uint64_t write_ns{};
+  std::uint64_t publish_ns{};
+  std::uint64_t frame_bytes{};
+  std::uint64_t data_write_calls{};
+  std::uint64_t rotations{};
+};
+
 class Wal {
  public:
   static Result<std::unique_ptr<Wal>> open(std::filesystem::path directory,
@@ -32,6 +47,9 @@ class Wal {
   Result<WalPosition> append(const domain::CommittedCommand& command);
   Result<WalPosition> append_batch(
       std::span<const domain::CommittedCommand> commands);
+  Result<WalPosition> append_batch_profiled(
+      std::span<const domain::CommittedCommand> commands,
+      WalAppendProfile& profile);
   Status sync();
   Result<std::vector<domain::CommittedCommand>> replay();
   Result<std::optional<domain::CommittedCommand>> next_after(EngineSeq sequence,
@@ -70,8 +88,11 @@ class Wal {
 
   Result<std::vector<PreparedRecord>> prepare_records_unlocked(
       std::span<const domain::CommittedCommand> commands) const;
+  Result<WalPosition> append_batch_unlocked(
+      std::span<const domain::CommittedCommand> commands,
+      WalAppendProfile* profile);
   Result<WalPosition> append_prepared_unlocked(
-      std::vector<PreparedRecord> records);
+      std::vector<PreparedRecord> records, WalAppendProfile* profile);
   Status rebuild_record_index_unlocked();
 
   std::filesystem::path directory_;

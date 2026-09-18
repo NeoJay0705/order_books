@@ -48,6 +48,7 @@ enum class WorkloadSelection {
 };
 
 enum class WalSyncMode { none, per_group };
+enum class WalPhaseProfileMode { off, on };
 
 struct BenchmarkOptions {
   std::uint64_t iterations{kIterations};
@@ -55,6 +56,7 @@ struct BenchmarkOptions {
   WorkloadSelection workload{WorkloadSelection::all};
   std::uint64_t wal_group_size{256};
   WalSyncMode wal_sync_mode{WalSyncMode::per_group};
+  WalPhaseProfileMode wal_phase_profile{WalPhaseProfileMode::off};
   std::size_t engine_group_size{256};
   std::chrono::microseconds engine_group_delay{200};
   std::size_t engine_producer_lanes{kDurableProducerLanes};
@@ -66,6 +68,8 @@ struct BenchmarkOptions {
   std::chrono::microseconds publisher_cursor_persist_max_delay{1000};
   bool pipeline_options_set{};
   bool engine_producer_lanes_parse_error{};
+  bool wal_phase_profile_parse_error{};
+  bool wal_phase_profile_option_set{};
   std::optional<std::filesystem::path> data_directory;
 };
 
@@ -226,6 +230,17 @@ std::optional<WalSyncMode> parse_wal_sync_mode(const std::string_view value) {
   return std::nullopt;
 }
 
+std::optional<WalPhaseProfileMode> parse_wal_phase_profile(
+    const std::string_view value) {
+  if (value == "off") {
+    return WalPhaseProfileMode::off;
+  }
+  if (value == "on") {
+    return WalPhaseProfileMode::on;
+  }
+  return std::nullopt;
+}
+
 std::optional<BenchmarkOptions> parse_options(const int argc, char** argv) {
   BenchmarkOptions options;
   for (int index = 1; index < argc; ++index) {
@@ -291,6 +306,15 @@ std::optional<BenchmarkOptions> parse_options(const int argc, char** argv) {
         return std::nullopt;
       }
       options.wal_sync_mode = *sync_mode;
+    } else if (argument.starts_with("--wal-phase-profile=")) {
+      options.wal_phase_profile_option_set = true;
+      const auto profile = parse_wal_phase_profile(
+          argument.substr(std::string_view("--wal-phase-profile=").size()));
+      if (!profile.has_value()) {
+        options.wal_phase_profile_parse_error = true;
+      } else {
+        options.wal_phase_profile = *profile;
+      }
     } else if (argument.starts_with("--data-dir=")) {
       const auto path = argument.substr(std::string_view("--data-dir=").size());
       if (path.empty()) {
@@ -623,7 +647,81 @@ struct WalGroupSamples {
   std::vector<std::uint64_t> append_ns;
   std::vector<std::uint64_t> sync_ns;
   std::vector<std::uint64_t> total_ns;
+  std::vector<std::uint64_t> fixture_build_ns;
+  std::vector<std::uint64_t> wal_append_call_ns;
+  std::vector<std::uint64_t> lock_wait_ns;
+  std::vector<std::uint64_t> prepare_ns;
+  std::vector<std::uint64_t> plan_copy_ns;
+  std::vector<std::uint64_t> rotation_ns;
+  std::vector<std::uint64_t> write_ns;
+  std::vector<std::uint64_t> publish_ns;
+  std::uint64_t profiled_groups{};
+  std::uint64_t profiled_commands{};
+  std::uint64_t profiled_frame_bytes{};
+  std::uint64_t profiled_data_write_calls{};
+  std::uint64_t profiled_rotations{};
 };
+
+struct WalProfileTotals {
+  std::uint64_t fixture_build{};
+  std::uint64_t wal_append_call{};
+  std::uint64_t lock_wait{};
+  std::uint64_t prepare{};
+  std::uint64_t plan_copy{};
+  std::uint64_t rotation{};
+  std::uint64_t write{};
+  std::uint64_t publish{};
+  std::uint64_t sync{};
+  std::uint64_t group_total{};
+};
+
+bool checked_add(std::uint64_t& target, const std::uint64_t value) {
+  if (target > std::numeric_limits<std::uint64_t>::max() - value) {
+    return false;
+  }
+  target += value;
+  return true;
+}
+
+std::optional<std::uint64_t> checked_multiply(const std::uint64_t lhs,
+                                              const std::uint64_t rhs) {
+  if (lhs != 0U && rhs > std::numeric_limits<std::uint64_t>::max() / lhs) {
+    return std::nullopt;
+  }
+  return lhs * rhs;
+}
+
+std::optional<std::uint64_t> sum_samples(
+    const std::vector<std::uint64_t>& samples) {
+  std::uint64_t total = 0;
+  for (const auto sample : samples) {
+    if (!checked_add(total, sample)) {
+      return std::nullopt;
+    }
+  }
+  return total;
+}
+
+std::optional<WalProfileTotals> profile_totals(const WalGroupSamples& samples) {
+  const auto fixture_build = sum_samples(samples.fixture_build_ns);
+  const auto wal_append_call = sum_samples(samples.wal_append_call_ns);
+  const auto lock_wait = sum_samples(samples.lock_wait_ns);
+  const auto prepare = sum_samples(samples.prepare_ns);
+  const auto plan_copy = sum_samples(samples.plan_copy_ns);
+  const auto rotation = sum_samples(samples.rotation_ns);
+  const auto write = sum_samples(samples.write_ns);
+  const auto publish = sum_samples(samples.publish_ns);
+  const auto sync = sum_samples(samples.sync_ns);
+  const auto group_total = sum_samples(samples.total_ns);
+  if (!fixture_build.has_value() || !wal_append_call.has_value() || !lock_wait.has_value() ||
+      !prepare.has_value() || !plan_copy.has_value() || !rotation.has_value() ||
+      !write.has_value() || !publish.has_value() || !sync.has_value() ||
+      !group_total.has_value()) {
+    return std::nullopt;
+  }
+  return WalProfileTotals{*fixture_build, *wal_append_call, *lock_wait, *prepare, *plan_copy,
+                          *rotation, *write, *publish, *sync, *group_total};
+}
 
 std::uint64_t elapsed_ns(const std::chrono::steady_clock::time_point start,
                          const std::chrono::steady_clock::time_point end) {
@@ -638,7 +736,8 @@ std::string_view wal_sync_mode_name(const WalSyncMode mode) {
 bool run_wal_groups(storage::Wal& wal, const std::uint64_t group_count,
                     const std::uint64_t group_size, const WalSyncMode sync_mode,
                     EngineSeq& next_sequence, std::uint64_t& remaining_commands,
-                    const std::string_view phase, WalGroupSamples* samples) {
+                    const std::string_view phase, WalGroupSamples* samples,
+                    const bool phase_profile) {
   for (std::uint64_t group = 0; group < group_count; ++group) {
     if (group_size == 0 || remaining_commands < group_size ||
         group_size > std::numeric_limits<std::size_t>::max() ||
@@ -648,7 +747,8 @@ bool run_wal_groups(storage::Wal& wal, const std::uint64_t group_count,
       return false;
     }
     const auto group_start = std::chrono::steady_clock::now();
-    const auto append_start = group_start;
+    const auto fixture_start = phase_profile ? group_start
+                                             : std::chrono::steady_clock::time_point{};
     std::vector<domain::CommittedCommand> commands;
     commands.reserve(static_cast<std::size_t>(group_size));
     for (std::uint64_t offset = 0; offset < group_size; ++offset) {
@@ -662,7 +762,15 @@ bool run_wal_groups(storage::Wal& wal, const std::uint64_t group_count,
         ++next_sequence;
       }
     }
-    const auto appended = wal.append_batch(commands);
+    const auto fixture_end = phase_profile ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
+    const auto append_start = group_start;
+    storage::WalAppendProfile profile;
+    const auto wal_call_start = phase_profile ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point{};
+    const auto appended = phase_profile
+                               ? wal.append_batch_profiled(commands, profile)
+                               : wal.append_batch(commands);
     if (std::holds_alternative<Error>(appended)) {
       report_wal_error(phase, "wal_append_failed",
                        std::get<Error>(appended).message);
@@ -687,6 +795,28 @@ bool run_wal_groups(storage::Wal& wal, const std::uint64_t group_count,
         samples->sync_ns.push_back(sync_duration);
       }
       samples->total_ns.push_back(elapsed_ns(group_start, group_end));
+      if (phase_profile) {
+        samples->fixture_build_ns.push_back(elapsed_ns(fixture_start, fixture_end));
+        samples->wal_append_call_ns.push_back(elapsed_ns(wal_call_start, append_end));
+        samples->lock_wait_ns.push_back(profile.lock_wait_ns);
+        samples->prepare_ns.push_back(profile.prepare_ns);
+        samples->plan_copy_ns.push_back(profile.plan_copy_ns);
+        if (profile.rotations != 0U) {
+          samples->rotation_ns.push_back(profile.rotation_ns);
+        }
+        samples->write_ns.push_back(profile.write_ns);
+        samples->publish_ns.push_back(profile.publish_ns);
+        if (!checked_add(samples->profiled_groups, 1U) ||
+            !checked_add(samples->profiled_commands,
+                         static_cast<std::uint64_t>(commands.size())) ||
+            !checked_add(samples->profiled_frame_bytes, profile.frame_bytes) ||
+            !checked_add(samples->profiled_data_write_calls,
+                         profile.data_write_calls) ||
+            !checked_add(samples->profiled_rotations, profile.rotations)) {
+          report_wal_error(phase, "profile_counter_overflow");
+          return false;
+        }
+      }
     }
   }
   return true;
@@ -753,11 +883,20 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
     return false;
   }
   auto wal = std::get<std::unique_ptr<storage::Wal>>(std::move(wal_result));
+  std::optional<std::uint64_t> segment_header_bytes;
+  if (options.wal_phase_profile == WalPhaseProfileMode::on) {
+    segment_header_bytes = wal->size_bytes();
+    if (*segment_header_bytes == 0U) {
+      report_wal_error("setup", "wal_segment_header_size_zero");
+      cleanup();
+      return false;
+    }
+  }
   std::uint64_t remaining_commands = total_commands;
   EngineSeq next_sequence = 1;
   if (!run_wal_groups(*wal, options.warmup, options.wal_group_size,
                       options.wal_sync_mode, next_sequence, remaining_commands, "warmup",
-                      nullptr)) {
+                      nullptr, false)) {
     cleanup();
     return false;
   }
@@ -782,11 +921,22 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
     if (options.wal_sync_mode == WalSyncMode::per_group) {
       samples.sync_ns.reserve(sample_count);
     }
+    if (options.wal_phase_profile == WalPhaseProfileMode::on) {
+      samples.fixture_build_ns.reserve(sample_count);
+      samples.wal_append_call_ns.reserve(sample_count);
+      samples.lock_wait_ns.reserve(sample_count);
+      samples.prepare_ns.reserve(sample_count);
+      samples.plan_copy_ns.reserve(sample_count);
+      samples.rotation_ns.reserve(sample_count);
+      samples.write_ns.reserve(sample_count);
+      samples.publish_ns.reserve(sample_count);
+    }
   }
   const auto measured_start = std::chrono::steady_clock::now();
   if (!run_wal_groups(*wal, options.iterations, options.wal_group_size,
                       options.wal_sync_mode, next_sequence, remaining_commands, "measured",
-                      &samples)) {
+                      &samples,
+                      options.wal_phase_profile == WalPhaseProfileMode::on)) {
     cleanup();
     return false;
   }
@@ -864,12 +1014,115 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
   std::sort(samples.append_ns.begin(), samples.append_ns.end());
   std::sort(samples.sync_ns.begin(), samples.sync_ns.end());
   std::sort(samples.total_ns.begin(), samples.total_ns.end());
+  const auto sort_profile_samples = [&samples] {
+    std::sort(samples.fixture_build_ns.begin(), samples.fixture_build_ns.end());
+    std::sort(samples.wal_append_call_ns.begin(), samples.wal_append_call_ns.end());
+    std::sort(samples.lock_wait_ns.begin(), samples.lock_wait_ns.end());
+    std::sort(samples.prepare_ns.begin(), samples.prepare_ns.end());
+    std::sort(samples.plan_copy_ns.begin(), samples.plan_copy_ns.end());
+    std::sort(samples.rotation_ns.begin(), samples.rotation_ns.end());
+    std::sort(samples.write_ns.begin(), samples.write_ns.end());
+    std::sort(samples.publish_ns.begin(), samples.publish_ns.end());
+  };
+  if (options.wal_phase_profile == WalPhaseProfileMode::on) {
+    sort_profile_samples();
+    const auto expected_commands = options.iterations * options.wal_group_size;
+    if (samples.profiled_groups != options.iterations ||
+        samples.profiled_commands != expected_commands ||
+        samples.fixture_build_ns.size() != options.iterations ||
+        samples.wal_append_call_ns.size() != options.iterations ||
+        samples.lock_wait_ns.size() != options.iterations ||
+        samples.prepare_ns.size() != options.iterations ||
+        samples.plan_copy_ns.size() != options.iterations ||
+        samples.rotation_ns.size() > options.iterations ||
+        samples.write_ns.size() != options.iterations ||
+        samples.publish_ns.size() != options.iterations ||
+        samples.profiled_rotations != measured_rotations ||
+        samples.profiled_frame_bytes > wal_bytes_delta) {
+      report_wal_error("report", "profile_counter_mismatch");
+      cleanup();
+      return false;
+    }
+    const auto profiled_header_bytes = wal_bytes_delta - samples.profiled_frame_bytes;
+    const auto expected_profiled_header_bytes =
+        checked_multiply(samples.profiled_rotations, *segment_header_bytes);
+    if (!expected_profiled_header_bytes.has_value()) {
+      report_wal_error("report", "profile_counter_overflow");
+      cleanup();
+      return false;
+    }
+    if (profiled_header_bytes != *expected_profiled_header_bytes ||
+        samples.profiled_data_write_calls < options.iterations ||
+        (measured_rotations == 0U &&
+         samples.profiled_data_write_calls != options.iterations)) {
+      report_wal_error("report", "profile_wal_observation_mismatch");
+      cleanup();
+      return false;
+    }
+  }
   const auto print_percentile = [](const std::vector<std::uint64_t>& values,
                                    const std::size_t numerator,
                                    const std::size_t denominator) {
     return values.empty() ? std::string("na")
                            : std::to_string(percentile_ns(values, numerator, denominator) /
                                             1'000.0);
+  };
+  const auto print_profile_percentiles = [&print_percentile](
+                                             const std::string_view name,
+                                             const std::vector<std::uint64_t>& values,
+                                             const std::uint64_t total_ns) {
+    std::cout << ' ' << name << "_total_us=" << total_ns / 1'000.0
+              << ' ' << name << "_p50_us=" << print_percentile(values, 50, 100)
+              << ' ' << name << "_p99_us=" << print_percentile(values, 99, 100)
+              << ' ' << name << "_p99.9_us=" << print_percentile(values, 999, 1000)
+              << ' ' << name << "_max_us="
+              << (values.empty() ? std::string("na")
+                                  : std::to_string(values.back() / 1'000.0));
+  };
+  std::optional<std::uint64_t> profile_denominator;
+  std::optional<std::uint64_t> profile_unattributed;
+  std::optional<WalProfileTotals> profile_total_values;
+  if (options.wal_phase_profile == WalPhaseProfileMode::on) {
+    const auto totals = profile_totals(samples);
+    if (!totals.has_value()) {
+      report_wal_error("report", "profile_phase_sum_overflow");
+      cleanup();
+      return false;
+    }
+    std::uint64_t denominator = totals->wal_append_call;
+    if (options.wal_sync_mode == WalSyncMode::per_group &&
+        !checked_add(denominator, totals->sync)) {
+      report_wal_error("report", "profile_phase_sum_overflow");
+      cleanup();
+      return false;
+    }
+    std::uint64_t phase_sum = 0;
+    const auto add_phase_sum = [&phase_sum](const std::uint64_t value) {
+      return checked_add(phase_sum, value);
+    };
+    if (!add_phase_sum(totals->lock_wait) || !add_phase_sum(totals->prepare) ||
+        !add_phase_sum(totals->plan_copy) || !add_phase_sum(totals->rotation) ||
+        !add_phase_sum(totals->write) || !add_phase_sum(totals->publish) ||
+        (options.wal_sync_mode == WalSyncMode::per_group &&
+         !checked_add(phase_sum, totals->sync))) {
+      report_wal_error("report", "profile_phase_sum_overflow");
+      cleanup();
+      return false;
+    }
+    if (phase_sum > denominator) {
+      report_wal_error("report", "profile_phase_accounting_overrun");
+      cleanup();
+      return false;
+    }
+    profile_denominator = denominator;
+    profile_unattributed = denominator - phase_sum;
+    profile_total_values = *totals;
+  }
+  const auto share_percent = [](const std::uint64_t value,
+                                const std::uint64_t denominator) {
+    return denominator == 0U ? std::string("na")
+                             : std::to_string(static_cast<double>(value) * 100.0 /
+                                              static_cast<double>(denominator));
   };
   std::cout << "wal_write_ceiling sync_mode=" << wal_sync_mode_name(options.wal_sync_mode)
             << " completion_boundary="
@@ -908,7 +1161,51 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
             << " segment_size_bytes=" << kWalCeilingSegmentSize
             << " segment_count=" << *ending_segment_count
             << " measured_segment_rotations=" << measured_rotations
-            << " wal_path=" << resolved_path << " replay_verified=true\n";
+            << " wal_path=" << resolved_path << " replay_verified=true"
+            << " phase_profile="
+            << (options.wal_phase_profile == WalPhaseProfileMode::on ? "on" : "off");
+  if (options.wal_phase_profile == WalPhaseProfileMode::on) {
+    const auto denominator = profile_denominator.value();
+    const auto& totals = profile_total_values.value();
+    std::cout << " profiled_groups=" << samples.profiled_groups
+              << " profiled_commands=" << samples.profiled_commands
+              << " profiled_frame_bytes=" << samples.profiled_frame_bytes
+              << " profiled_header_bytes="
+              << (wal_bytes_delta - samples.profiled_frame_bytes)
+              << " profiled_data_write_calls=" << samples.profiled_data_write_calls
+              << " profiled_rotations=" << samples.profiled_rotations
+              << " sync_total_us=" << totals.sync / 1'000.0
+              << " group_total_us=" << totals.group_total / 1'000.0;
+    print_profile_percentiles("fixture_build_group", samples.fixture_build_ns,
+                              totals.fixture_build);
+    print_profile_percentiles("wal_append_call_group", samples.wal_append_call_ns,
+                              totals.wal_append_call);
+    print_profile_percentiles("wal_lock_wait_group", samples.lock_wait_ns, totals.lock_wait);
+    print_profile_percentiles("wal_prepare_group", samples.prepare_ns, totals.prepare);
+    print_profile_percentiles("wal_plan_copy_group", samples.plan_copy_ns, totals.plan_copy);
+    print_profile_percentiles("wal_rotation_group", samples.rotation_ns, totals.rotation);
+    print_profile_percentiles("wal_write_group", samples.write_ns, totals.write);
+    print_profile_percentiles("wal_publish_group", samples.publish_ns, totals.publish);
+    std::cout << " lock_wait_share_percent="
+              << share_percent(totals.lock_wait, denominator)
+              << " prepare_share_percent="
+              << share_percent(totals.prepare, denominator)
+              << " plan_copy_share_percent="
+              << share_percent(totals.plan_copy, denominator)
+              << " rotation_share_percent="
+              << share_percent(totals.rotation, denominator)
+              << " write_share_percent="
+              << share_percent(totals.write, denominator)
+              << " publish_share_percent="
+              << share_percent(totals.publish, denominator)
+              << " sync_share_percent="
+              << (options.wal_sync_mode == WalSyncMode::per_group
+                      ? share_percent(totals.sync, denominator)
+                      : std::string("na"))
+              << " unattributed_share_percent="
+              << share_percent(profile_unattributed.value(), denominator);
+  }
+  std::cout << '\n';
   cleanup();
   return true;
 }
@@ -1185,7 +1482,8 @@ void print_usage() {
   std::cerr << "usage: order_books_benchmark [--iterations=N] [--warmup=N] "
                "[--workload=all|engine_durable_single_instrument|wal_write_ceiling|"
                "engine_pipeline_ceiling] [--data-dir=PATH] [--wal-group-size=N] "
-               "[--wal-sync=none|per_group] [--engine-group-size=N] "
+               "[--wal-sync=none|per_group] [--wal-phase-profile=off|on] "
+               "[--engine-group-size=N] "
                "[--engine-group-delay-us=N] [--engine-producer-lanes=N] "
                "[--pipeline-stage=STAGE] "
                "[--pipeline-batch-size=N] [--pipeline-active-orders=N] "
@@ -1206,6 +1504,12 @@ int main(const int argc, char** argv) {
   if (options->engine_producer_lanes_parse_error) {
     std::cerr << "workload=" << workload_name(options->workload)
               << " phase=cli error_code=engine_producer_lanes_invalid\n";
+    print_usage();
+    return 2;
+  }
+  if (options->wal_phase_profile_parse_error) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=wal_phase_profile_invalid\n";
     print_usage();
     return 2;
   }
@@ -1268,6 +1572,13 @@ int main(const int argc, char** argv) {
       options->workload != WorkloadSelection::engine_pipeline_ceiling) {
     std::cerr << "workload=" << workload_name(options->workload)
               << " phase=cli error_code=pipeline_option_requires_pipeline_workload\n";
+    print_usage();
+    return 2;
+  }
+  if (options->wal_phase_profile_option_set &&
+      options->workload != WorkloadSelection::wal_write_ceiling) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=wal_phase_profile_requires_wal_workload\n";
     print_usage();
     return 2;
   }
