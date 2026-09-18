@@ -26,6 +26,8 @@ struct PipelineBenchmarkOptions {
   std::size_t engine_group_size{};
   std::chrono::microseconds engine_group_delay{};
   std::size_t producer_lanes{};
+  std::size_t publisher_cursor_persist_max_commands{256};
+  std::chrono::microseconds publisher_cursor_persist_max_delay{1000};
   std::optional<std::filesystem::path> data_directory;
 };
 

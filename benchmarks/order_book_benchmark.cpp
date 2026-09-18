@@ -60,6 +60,8 @@ struct BenchmarkOptions {
   std::size_t pipeline_batch_size{256};
   std::size_t pipeline_active_orders{};
   std::size_t pipeline_producer_lanes{kPipelineProducerLanes};
+  std::size_t publisher_cursor_persist_max_commands{256};
+  std::chrono::microseconds publisher_cursor_persist_max_delay{1000};
   bool pipeline_options_set{};
   std::optional<std::filesystem::path> data_directory;
 };
@@ -247,6 +249,14 @@ std::optional<BenchmarkOptions> parse_options(const int argc, char** argv) {
     } else if (const auto producer_lanes =
                    parse_positive_option(argument, "--pipeline-producer-lanes=")) {
       options.pipeline_producer_lanes = static_cast<std::size_t>(*producer_lanes);
+      options.pipeline_options_set = true;
+    } else if (const auto max_commands = parse_positive_option(
+                   argument, "--publisher-cursor-persist-max-commands=")) {
+      options.publisher_cursor_persist_max_commands = static_cast<std::size_t>(*max_commands);
+      options.pipeline_options_set = true;
+    } else if (const auto max_delay = parse_positive_option(
+                   argument, "--publisher-cursor-persist-max-delay-us=")) {
+      options.publisher_cursor_persist_max_delay = std::chrono::microseconds(*max_delay);
       options.pipeline_options_set = true;
     } else if (argument.starts_with("--pipeline-stage=")) {
       const auto stage = benchmark::parse_pipeline_stage(
@@ -1088,7 +1098,9 @@ void print_usage() {
                "[--wal-sync=none|per_group] [--engine-group-size=N] "
                "[--engine-group-delay-us=N] [--pipeline-stage=STAGE] "
                "[--pipeline-batch-size=N] [--pipeline-active-orders=N] "
-               "[--pipeline-producer-lanes=N]\n";
+               "[--pipeline-producer-lanes=N] "
+               "[--publisher-cursor-persist-max-commands=N] "
+               "[--publisher-cursor-persist-max-delay-us=N]\n";
 }
 
 int main(const int argc, char** argv) {
@@ -1127,6 +1139,13 @@ int main(const int argc, char** argv) {
   if (options->pipeline_producer_lanes == 0) {
     std::cerr << "workload=" << workload_name(options->workload)
               << " phase=cli error_code=pipeline_producer_lanes_must_be_positive\n";
+    print_usage();
+    return 2;
+  }
+  if (options->publisher_cursor_persist_max_commands == 0 ||
+      options->publisher_cursor_persist_max_delay.count() <= 0) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=publisher_cursor_persist_limits_must_be_positive\n";
     print_usage();
     return 2;
   }
@@ -1190,6 +1209,8 @@ int main(const int argc, char** argv) {
         options->engine_group_size,
         options->engine_group_delay,
         options->pipeline_producer_lanes,
+        options->publisher_cursor_persist_max_commands,
+        options->publisher_cursor_persist_max_delay,
         options->data_directory,
     };
     return benchmark::run_pipeline_ceiling(pipeline_options, options->pipeline_stage) ? 0 : 1;

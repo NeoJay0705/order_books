@@ -25,7 +25,9 @@ class EventPublisher {
       domain::ShardState initial_state, storage::Wal& wal,
       storage::SnapshotStore replay_snapshots, EventSink& sink,
       MetricsSink& metrics, std::size_t snapshot_interval_commands,
-      std::chrono::minutes snapshot_interval);
+      std::chrono::minutes snapshot_interval,
+      std::size_t publisher_cursor_persist_max_commands,
+      std::chrono::microseconds publisher_cursor_persist_max_delay);
 
   ~EventPublisher();
 
@@ -38,6 +40,12 @@ class EventPublisher {
 
   [[nodiscard]] EngineSeq confirmed_cursor() const noexcept {
     return confirmed_cursor_.load(std::memory_order_acquire);
+  }
+  [[nodiscard]] EngineSeq durable_cursor() const noexcept {
+    return durable_cursor_.load(std::memory_order_acquire);
+  }
+  [[nodiscard]] std::uint64_t successful_cursor_persists() const noexcept {
+    return successful_cursor_persists_.load(std::memory_order_acquire);
   }
   [[nodiscard]] EngineSeq replay_snapshot_seq() const noexcept {
     return replay_snapshot_seq_.load(std::memory_order_acquire);
@@ -52,9 +60,13 @@ class EventPublisher {
   EventPublisher(domain::ShardState state, storage::Wal& wal,
                  storage::SnapshotStore replay_snapshots, EventSink& sink,
                  MetricsSink& metrics, std::size_t snapshot_interval_commands,
-                 std::chrono::minutes snapshot_interval, EngineSeq cursor);
+                 std::chrono::minutes snapshot_interval,
+                 std::size_t publisher_cursor_persist_max_commands,
+                 std::chrono::microseconds publisher_cursor_persist_max_delay,
+                 EngineSeq cursor);
 
   void run(std::stop_token stop_token);
+  Status flush_cursor_if_dirty();
   Status persist_cursor(EngineSeq cursor);
   Result<EngineSeq> load_cursor() const;
 
@@ -65,8 +77,13 @@ class EventPublisher {
   MetricsSink& metrics_;
   std::size_t snapshot_interval_commands_{};
   std::chrono::minutes snapshot_interval_{};
-  EngineSeq cursor_{};
+  std::size_t publisher_cursor_persist_max_commands_{};
+  std::chrono::microseconds publisher_cursor_persist_max_delay_{};
+  EngineSeq published_cursor_{};
   std::atomic<EngineSeq> confirmed_cursor_{};
+  std::atomic<EngineSeq> durable_cursor_{};
+  std::optional<std::chrono::steady_clock::time_point> dirty_since_;
+  std::atomic<std::uint64_t> successful_cursor_persists_{0};
   std::atomic<EngineSeq> replay_snapshot_seq_{};
   EngineSeq last_snapshot_seq_{};
   std::atomic<EngineSeq> publishable_seq_{};

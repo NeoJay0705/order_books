@@ -294,6 +294,8 @@ RuntimeConfig (operational, not part of replay result)
 ├── wal_soft_limit_per_shard = 64 GiB
 ├── snapshot_interval = 5 minutes or 1,000,000 commands
 ├── event_replay_snapshot_interval = 5 minutes or 1,000,000 commands
+├── publisher_cursor_persist_max_commands = 256
+├── publisher_cursor_persist_max_delay = 1 millisecond
 ├── max_publish_lag_age = 24 hours
 └── max_publish_lag_bytes = 32 GiB
 ```
@@ -617,7 +619,9 @@ Event batch for one EngineSeq
         ↓
 EventSink::publish
         ↓ durable ACK
-persist publisher cursor
+confirmed cursor (in-memory)
+        ↓ count/time/snapshot/clean-stop trigger
+persist publisher cursor → durable cursor
 ```
 
 Publisher 不直接依賴 live writer 暫存的 events，因為那些 events 在 crash 後不存在。Live writer 與 publisher 使用同一 state-machine code；determinism tests 必須比較兩者 output。
@@ -633,7 +637,7 @@ Publisher startup 固定：
 
 若 ACK 成功但 cursor 尚未 durable 就 crash，舊 cursor 會使該 batch 再次 publish；EventID 不變，由 consumer 去重。
 
-同一 shard 同時只允許一個未確認 batch。Publisher apply 下一筆 command 後保留其 EventBatch，持續 retry 到成功或 stop；未確認前不得 apply／publish 後續 EngineSeq，也不得建立包含該 command 的 event-replay Snapshot。不同 shard 可以並行 publish，且不提供跨 shard ordering。
+同一 shard 同時只允許一個未確認 batch。Publisher apply 下一筆 command 後保留其 EventBatch，持續 retry 到成功或 stop；未確認前不得 apply／publish 後續 EngineSeq，也不得建立包含該 command 的 event-replay Snapshot。不同 shard 可以並行 publish，且不提供跨 shard ordering。Sink ACK 後先前進 confirmed cursor；cursor persistence 以 runtime 的 command count 或 delay policy 分組，並在下一筆 WAL record 前完成 count trigger。ACK 與 cursor fsync 之間的 bounded window 可能在 crash 後重送，仍由 EventID 去重。
 
 ### 11.2 Cursor
 
@@ -642,11 +646,11 @@ Cursor file 只保存：
 ```text
 format_version
 shard_id
-last_confirmed_engine_seq
+last_durable_engine_seq
 checksum
 ```
 
-使用 temporary file + fsync + rename + directory fsync。ACK 成功但 cursor 尚未 durable 時 crash，只會造成 duplicate publish。零 event command 不呼叫 sink，直接成為可推進 cursor 的成功 batch。
+使用 temporary file + fsync + rename + directory fsync。confirmed cursor 表示 downstream 已 ACK 的連續 EngineSeq，durable cursor 表示 restart 可安全採用的 recovery boundary；兩者不可混用。ACK 成功但 cursor 尚未 durable 時 crash，只會造成 bounded duplicate publish。零 event command 不呼叫 sink，仍按 WAL command 計入 cursor group。建立 event-replay Snapshot 前必須先 flush 最新 confirmed cursor，避免 Snapshot sequence 超過 durable cursor。
 
 Publisher 失敗採 bounded exponential retry，預設 1 ms 起、最多 1 s；stop 時可中斷等待。Retry policy 是 runtime config，不影響 EventID 或 ordering。
 

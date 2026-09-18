@@ -42,6 +42,8 @@ Result<std::unique_ptr<Engine>> Engine::open(EngineConfig config,
       config.runtime.max_top_n == 0 || config.runtime.group_commit_max_delay.count() < 0 ||
       config.runtime.snapshot_interval.count() < 0 ||
       config.runtime.event_replay_snapshot_interval.count() < 0 ||
+      config.runtime.publisher_cursor_persist_max_commands == 0 ||
+      config.runtime.publisher_cursor_persist_max_delay.count() <= 0 ||
       config.runtime.max_publish_lag_age.count() <= 0) {
     return config_error("runtime limits must be positive");
   }

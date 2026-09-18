@@ -26,6 +26,8 @@ struct RuntimeConfig {
   std::size_t snapshot_interval_commands{1'000'000};
   std::chrono::minutes event_replay_snapshot_interval{5};
   std::size_t event_replay_snapshot_interval_commands{1'000'000};
+  std::size_t publisher_cursor_persist_max_commands{256};
+  std::chrono::microseconds publisher_cursor_persist_max_delay{1000};
   std::chrono::hours max_publish_lag_age{24};
   std::uint64_t max_publish_lag_bytes{32ULL * 1024ULL * 1024ULL * 1024ULL};
   std::size_t max_top_n{10'000};

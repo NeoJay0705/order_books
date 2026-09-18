@@ -51,7 +51,9 @@ Result<std::unique_ptr<EventPublisher>> EventPublisher::open(
     domain::ShardState initial_state, storage::Wal& wal,
     storage::SnapshotStore replay_snapshots, EventSink& sink,
     MetricsSink& metrics, const std::size_t snapshot_interval_commands,
-    const std::chrono::minutes snapshot_interval) {
+    const std::chrono::minutes snapshot_interval,
+    const std::size_t publisher_cursor_persist_max_commands,
+    const std::chrono::microseconds publisher_cursor_persist_max_delay) {
   const auto live_sequence = initial_state.last_committed_engine_seq;
   const auto make_genesis = [](domain::ShardState state) {
     state.last_committed_engine_seq = 0;
@@ -93,13 +95,15 @@ Result<std::unique_ptr<EventPublisher>> EventPublisher::open(
   }
   auto publisher = std::unique_ptr<EventPublisher>(new EventPublisher(
       std::move(base_state), wal, std::move(replay_snapshots), sink, metrics,
-      snapshot_interval_commands, snapshot_interval, snapshot_sequence));
+      snapshot_interval_commands, snapshot_interval,
+      publisher_cursor_persist_max_commands, publisher_cursor_persist_max_delay,
+      snapshot_sequence));
   auto loaded_cursor = publisher->load_cursor();
   if (std::holds_alternative<Error>(loaded_cursor)) {
-    publisher->cursor_ = snapshot_sequence;
+    publisher->published_cursor_ = snapshot_sequence;
   } else {
     const auto persisted_cursor = std::get<EngineSeq>(loaded_cursor);
-    publisher->cursor_ = persisted_cursor;
+    publisher->published_cursor_ = persisted_cursor;
     if (using_snapshot && persisted_cursor < snapshot_sequence) {
       // The latest replay snapshot is newer than the durable cursor.  It
       // cannot be used as a base because doing so would skip unconfirmed
@@ -118,7 +122,8 @@ Result<std::unique_ptr<EventPublisher>> EventPublisher::open(
       publisher->replay_snapshot_seq_.store(0, std::memory_order_release);
     }
   }
-  if (publisher->cursor_ > publisher->state_machine_.state().last_committed_engine_seq) {
+  if (publisher->published_cursor_ >
+      publisher->state_machine_.state().last_committed_engine_seq) {
     auto records = wal.replay();
     if (std::holds_alternative<Error>(records)) {
       return std::get<Error>(records);
@@ -127,7 +132,7 @@ Result<std::unique_ptr<EventPublisher>> EventPublisher::open(
       if (record.engine_seq <= publisher->state_machine_.state().last_committed_engine_seq) {
         continue;
       }
-      if (record.engine_seq > publisher->cursor_) {
+      if (record.engine_seq > publisher->published_cursor_) {
         break;
       }
       auto execution = publisher->state_machine_.apply(record);
@@ -137,7 +142,7 @@ Result<std::unique_ptr<EventPublisher>> EventPublisher::open(
       metrics.observe("replayed_records", 1);
     }
     if (publisher->state_machine_.state().last_committed_engine_seq !=
-        publisher->cursor_) {
+        publisher->published_cursor_) {
       return Error{ErrorCode::corrupt_wal, "publisher cursor is ahead of WAL"};
     }
   }
@@ -146,9 +151,13 @@ Result<std::unique_ptr<EventPublisher>> EventPublisher::open(
     return std::get<Error>(status);
   }
   publisher->last_snapshot_seq_ = replay_snapshot_base;
-  publisher->confirmed_cursor_.store(publisher->cursor_, std::memory_order_release);
+  publisher->confirmed_cursor_.store(publisher->published_cursor_,
+                                     std::memory_order_release);
+  publisher->durable_cursor_.store(publisher->published_cursor_,
+                                   std::memory_order_release);
   publisher->replay_snapshot_seq_.store(replay_snapshot_base, std::memory_order_release);
-  publisher->publishable_seq_.store(publisher->cursor_, std::memory_order_release);
+  publisher->publishable_seq_.store(publisher->published_cursor_,
+                                    std::memory_order_release);
   return publisher;
 }
 
@@ -157,6 +166,8 @@ EventPublisher::EventPublisher(domain::ShardState state, storage::Wal& wal,
                                EventSink& sink, MetricsSink& metrics,
                                const std::size_t snapshot_interval_commands,
                                const std::chrono::minutes snapshot_interval,
+                               const std::size_t publisher_cursor_persist_max_commands,
+                               const std::chrono::microseconds publisher_cursor_persist_max_delay,
                                const EngineSeq cursor)
     : state_machine_(std::move(state)),
       wal_(wal),
@@ -165,8 +176,11 @@ EventPublisher::EventPublisher(domain::ShardState state, storage::Wal& wal,
       metrics_(metrics),
       snapshot_interval_commands_(snapshot_interval_commands),
       snapshot_interval_(snapshot_interval),
-      cursor_(cursor),
+      publisher_cursor_persist_max_commands_(publisher_cursor_persist_max_commands),
+      publisher_cursor_persist_max_delay_(publisher_cursor_persist_max_delay),
+      published_cursor_(cursor),
       confirmed_cursor_(cursor),
+      durable_cursor_(cursor),
       replay_snapshot_seq_(cursor),
       last_snapshot_seq_(cursor),
       last_snapshot_time_(std::chrono::steady_clock::now()) {}
@@ -282,24 +296,75 @@ Result<EngineSeq> EventPublisher::load_cursor() const {
   return sequence;
 }
 
+Status EventPublisher::flush_cursor_if_dirty() {
+  const auto durable = durable_cursor_.load(std::memory_order_acquire);
+  if (published_cursor_ == durable) {
+    dirty_since_.reset();
+    return std::monostate{};
+  }
+  const auto cursor = published_cursor_;
+  if (const auto status = persist_cursor(cursor); std::holds_alternative<Error>(status)) {
+    return std::get<Error>(status);
+  }
+  durable_cursor_.store(cursor, std::memory_order_release);
+  dirty_since_.reset();
+  successful_cursor_persists_.fetch_add(1, std::memory_order_relaxed);
+  return std::monostate{};
+}
+
 void EventPublisher::run(const std::stop_token stop_token) {
   std::vector<Event> pending_events;
   EngineSeq pending_seq = 0;
   auto retry_delay = std::chrono::milliseconds(1);
   while (!stop_token.stop_requested()) {
-    const auto publishable = publishable_seq_.load(std::memory_order_acquire);
-    if (pending_seq == 0 && cursor_ >= publishable) {
-      std::unique_lock lock(mutex_);
-      condition_.wait_for(lock, stop_token, std::chrono::milliseconds(50), [this, &stop_token] {
-        return stop_token.stop_requested() ||
-               publishable_seq_.load(std::memory_order_acquire) > cursor_;
-      });
-      continue;
+    if (pending_seq == 0) {
+      const auto now = std::chrono::steady_clock::now();
+      const auto durable = durable_cursor_.load(std::memory_order_acquire);
+      if (published_cursor_ > durable && dirty_since_.has_value() &&
+          now - *dirty_since_ >= publisher_cursor_persist_max_delay_) {
+        if (const auto status = flush_cursor_if_dirty(); std::holds_alternative<Error>(status)) {
+          metrics_.observe("publisher_cursor_error", 1);
+          failed_.store(true, std::memory_order_release);
+          return;
+        }
+        continue;
+      }
+
+      const auto publishable = publishable_seq_.load(std::memory_order_acquire);
+      if (published_cursor_ >= publishable) {
+        std::unique_lock lock(mutex_);
+        if (dirty_since_.has_value()) {
+          const auto deadline = *dirty_since_ + publisher_cursor_persist_max_delay_;
+          const auto awakened = condition_.wait_until(
+              lock, stop_token, deadline, [this, &stop_token] {
+                return stop_token.stop_requested() ||
+                       publishable_seq_.load(std::memory_order_acquire) > published_cursor_;
+              });
+          if (stop_token.stop_requested()) {
+            break;
+          }
+          if (!awakened) {
+            lock.unlock();
+            if (const auto status = flush_cursor_if_dirty();
+                std::holds_alternative<Error>(status)) {
+              metrics_.observe("publisher_cursor_error", 1);
+              failed_.store(true, std::memory_order_release);
+              return;
+            }
+          }
+        } else {
+          condition_.wait(lock, stop_token, [this, &stop_token] {
+            return stop_token.stop_requested() ||
+                   publishable_seq_.load(std::memory_order_acquire) > published_cursor_;
+          });
+        }
+        continue;
+      }
     }
 
     if (pending_seq == 0) {
       const auto publishable = publishable_seq_.load(std::memory_order_acquire);
-      auto next = wal_.next_after(cursor_, publishable);
+      auto next = wal_.next_after(published_cursor_, publishable);
       if (std::holds_alternative<Error>(next)) {
         metrics_.observe("publisher_replay_error", 1);
         failed_.store(true, std::memory_order_release);
@@ -332,10 +397,16 @@ void EventPublisher::run(const std::stop_token stop_token) {
       }
       if (std::holds_alternative<Error>(published)) {
         metrics_.observe("event_publish_retry", 1);
+        if (stop_token.stop_requested()) {
+          break;
+        }
         std::unique_lock lock(mutex_);
         condition_.wait_for(lock, stop_token, retry_delay, [] {
           return false;
         });
+        if (stop_token.stop_requested()) {
+          break;
+        }
         retry_delay = std::min(retry_delay * 2, std::chrono::milliseconds(1000));
         continue;
       }
@@ -345,10 +416,15 @@ void EventPublisher::run(const std::stop_token stop_token) {
                        static_cast<std::uint64_t>(publish_latency.count()));
     }
     retry_delay = std::chrono::milliseconds(1);
-    cursor_ = pending_seq;
-    confirmed_cursor_.store(cursor_, std::memory_order_release);
+    published_cursor_ = pending_seq;
+    confirmed_cursor_.store(published_cursor_, std::memory_order_release);
+    if (!dirty_since_.has_value()) {
+      dirty_since_ = std::chrono::steady_clock::now();
+    }
     metrics_.observe("event_publish_lag_events",
-                     wal_.last_engine_seq() > cursor_ ? wal_.last_engine_seq() - cursor_ : 0);
+                     wal_.last_engine_seq() > published_cursor_
+                         ? wal_.last_engine_seq() - published_cursor_
+                         : 0);
     metrics_.observe("event_publish_lag_bytes", lag_bytes());
     const auto oldest = oldest_unconfirmed_received_at();
     const auto now = system_now_ns();
@@ -358,27 +434,51 @@ void EventPublisher::run(const std::stop_token stop_token) {
     metrics_.observe("event_publish_lag_age_ns", lag_age);
     pending_seq = 0;
     pending_events.clear();
-    if (const auto status = persist_cursor(cursor_); std::holds_alternative<Error>(status)) {
-      metrics_.observe("publisher_cursor_error", 1);
-      failed_.store(true, std::memory_order_release);
-      return;
+    const auto durable_after_ack = durable_cursor_.load(std::memory_order_acquire);
+    const auto dirty_commands = published_cursor_ >= durable_after_ack
+                                    ? published_cursor_ - durable_after_ack
+                                    : 0;
+    const auto count_trigger = dirty_commands >= publisher_cursor_persist_max_commands_;
+    const auto cursor_time_trigger = dirty_since_.has_value() &&
+                                     std::chrono::steady_clock::now() - *dirty_since_ >=
+                                         publisher_cursor_persist_max_delay_;
+    if (count_trigger || cursor_time_trigger) {
+      if (const auto status = flush_cursor_if_dirty(); std::holds_alternative<Error>(status)) {
+        metrics_.observe("publisher_cursor_error", 1);
+        failed_.store(true, std::memory_order_release);
+        return;
+      }
     }
     const auto command_trigger = snapshot_interval_commands_ != 0 &&
-                                 cursor_ - last_snapshot_seq_ >= snapshot_interval_commands_;
-    const auto time_trigger = snapshot_interval_.count() > 0 &&
-                              std::chrono::steady_clock::now() - last_snapshot_time_ >=
-                                  snapshot_interval_;
-    if (command_trigger || time_trigger) {
+                                 published_cursor_ - last_snapshot_seq_ >=
+                                     snapshot_interval_commands_;
+    const auto snapshot_time_trigger = snapshot_interval_.count() > 0 &&
+                                       std::chrono::steady_clock::now() - last_snapshot_time_ >=
+                                           snapshot_interval_;
+    if (command_trigger || snapshot_time_trigger) {
+      if (const auto status = flush_cursor_if_dirty(); std::holds_alternative<Error>(status)) {
+        metrics_.observe("publisher_cursor_error", 1);
+        failed_.store(true, std::memory_order_release);
+        return;
+      }
       if (const auto status = replay_snapshots_.write(state_machine_.state());
           std::holds_alternative<Error>(status)) {
         metrics_.observe("publisher_snapshot_error", 1);
         failed_.store(true, std::memory_order_release);
         return;
       }
-      last_snapshot_seq_ = cursor_;
+      last_snapshot_seq_ = published_cursor_;
       replay_snapshot_seq_.store(last_snapshot_seq_, std::memory_order_release);
       last_snapshot_time_ = std::chrono::steady_clock::now();
     }
+  }
+
+  if (failed_.load(std::memory_order_acquire)) {
+    return;
+  }
+  if (const auto status = flush_cursor_if_dirty(); std::holds_alternative<Error>(status)) {
+    metrics_.observe("publisher_cursor_error", 1);
+    failed_.store(true, std::memory_order_release);
   }
 }
 
@@ -386,6 +486,9 @@ Status EventPublisher::stop() {
   {
     std::lock_guard lock(mutex_);
     if (!started_) {
+      if (failed_.load(std::memory_order_acquire)) {
+        return Error{ErrorCode::engine_unavailable, "event publisher failed"};
+      }
       return std::monostate{};
     }
     thread_.request_stop();

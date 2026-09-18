@@ -81,6 +81,42 @@ TEST(EngineTest, RejectsZeroPublishLagAge) {
   std::filesystem::remove_all(data_directory, ignored);
 }
 
+TEST(EngineTest, RejectsInvalidPublisherCursorPersistencePolicy) {
+  const auto data_directory =
+      std::filesystem::temp_directory_path() / "order_books_invalid_publisher_policy_test";
+  std::error_code ignored;
+  std::filesystem::remove_all(data_directory, ignored);
+
+  const auto open_with = [&data_directory](const RuntimeConfig& runtime) {
+    RecordingSink sink;
+    NullMetricsSink metrics;
+    EngineConfig config;
+    config.data_directory = data_directory;
+    config.shard_ids = {1};
+    config.instruments = {InstrumentConfig{7, 1, 1, 1}};
+    config.runtime = runtime;
+    return Engine::open(std::move(config), sink, metrics);
+  };
+
+  RuntimeConfig zero_commands;
+  zero_commands.publisher_cursor_persist_max_commands = 0;
+  auto opened = open_with(zero_commands);
+  ASSERT_TRUE(std::holds_alternative<Error>(opened));
+  EXPECT_EQ(std::get<Error>(opened).code, ErrorCode::invalid_command);
+
+  RuntimeConfig zero_delay;
+  zero_delay.publisher_cursor_persist_max_delay = std::chrono::microseconds(0);
+  opened = open_with(zero_delay);
+  ASSERT_TRUE(std::holds_alternative<Error>(opened));
+  EXPECT_EQ(std::get<Error>(opened).code, ErrorCode::invalid_command);
+
+  RuntimeConfig negative_delay;
+  negative_delay.publisher_cursor_persist_max_delay = std::chrono::microseconds(-1);
+  opened = open_with(negative_delay);
+  ASSERT_TRUE(std::holds_alternative<Error>(opened));
+  EXPECT_EQ(std::get<Error>(opened).code, ErrorCode::invalid_command);
+}
+
 TEST(EngineTest, PublisherPressureRejectsNewMutationButPreservesDuplicate) {
   const auto data_directory = std::filesystem::temp_directory_path() /
                               "order_books_publisher_pressure_admission_test";

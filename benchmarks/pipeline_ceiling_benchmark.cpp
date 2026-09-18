@@ -1004,11 +1004,15 @@ bool wait_for_publisher(runtime::EventPublisher& publisher, const EngineSeq head
 struct PublisherRunResult {
   std::uint64_t elapsed_ns{};
   std::uint64_t wal_bytes{};
+  std::uint64_t successful_cursor_persists{};
+  EngineSeq confirmed_cursor{};
+  EngineSeq durable_cursor{};
 };
 
 PublisherRunResult run_publisher_instance(const std::filesystem::path& directory,
                                           const std::uint64_t command_count,
-                                          CountingPublisherSink& sink) {
+                                          CountingPublisherSink& sink,
+                                          const PipelineBenchmarkOptions& options) {
   auto fixture = build_publisher_fixture(directory, command_count);
   auto snapshots_result = storage::SnapshotStore::open(directory / "event-replay", 1);
   if (std::holds_alternative<Error>(snapshots_result)) {
@@ -1019,7 +1023,9 @@ PublisherRunResult run_publisher_instance(const std::filesystem::path& directory
   runtime::MetricsRegistry metrics(metrics_downstream);
   auto publisher_result = runtime::EventPublisher::open(
       clone_state(fixture.live_state), *fixture.wal, std::move(snapshots), sink, metrics,
-      std::numeric_limits<std::size_t>::max(), std::chrono::hours(24));
+      std::numeric_limits<std::size_t>::max(), std::chrono::hours(24),
+      options.publisher_cursor_persist_max_commands,
+      options.publisher_cursor_persist_max_delay);
   if (std::holds_alternative<Error>(publisher_result)) {
     throw std::runtime_error(error_message(std::get<Error>(publisher_result)));
   }
@@ -1039,6 +1045,9 @@ PublisherRunResult run_publisher_instance(const std::filesystem::path& directory
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now() - start)
           .count());
+  const auto successful_cursor_persists = publisher->successful_cursor_persists();
+  const auto confirmed_cursor = publisher->confirmed_cursor();
+  const auto durable_cursor = publisher->durable_cursor();
   publisher.reset();
 
   auto reopen_snapshots_result = storage::SnapshotStore::open(directory / "event-replay", 1);
@@ -1049,19 +1058,23 @@ PublisherRunResult run_publisher_instance(const std::filesystem::path& directory
       std::get<storage::SnapshotStore>(std::move(reopen_snapshots_result));
   auto reopened_result = runtime::EventPublisher::open(
       clone_state(fixture.live_state), *fixture.wal, std::move(reopen_snapshots), sink, metrics,
-      std::numeric_limits<std::size_t>::max(), std::chrono::hours(24));
+      std::numeric_limits<std::size_t>::max(), std::chrono::hours(24),
+      options.publisher_cursor_persist_max_commands,
+      options.publisher_cursor_persist_max_delay);
   if (std::holds_alternative<Error>(reopened_result)) {
     throw std::runtime_error(error_message(std::get<Error>(reopened_result)));
   }
   auto reopened = std::get<std::unique_ptr<runtime::EventPublisher>>(
       std::move(reopened_result));
-  if (reopened->confirmed_cursor() != fixture.head.engine_seq || sink.failed() ||
+  if (reopened->confirmed_cursor() != fixture.head.engine_seq ||
+      reopened->durable_cursor() != fixture.head.engine_seq || sink.failed() ||
       sink.calls() != command_count) {
     (void)reopened->stop();
     throw std::runtime_error("publisher cursor or sink validation failed");
   }
   (void)reopened->stop();
-  return PublisherRunResult{elapsed_ns, fixture.wal->size_bytes()};
+  return PublisherRunResult{elapsed_ns, fixture.wal->size_bytes(),
+                            successful_cursor_persists, confirmed_cursor, durable_cursor};
 }
 
 bool run_publisher_drain(const PipelineBenchmarkOptions& options,
@@ -1075,11 +1088,12 @@ bool run_publisher_drain(const PipelineBenchmarkOptions& options,
   try {
     if (warmup_commands != 0) {
       CountingPublisherSink warmup_sink;
-      (void)run_publisher_instance(root / "publisher_warmup", warmup_commands, warmup_sink);
+      (void)run_publisher_instance(root / "publisher_warmup", warmup_commands, warmup_sink,
+                                    options);
     }
     CountingPublisherSink measured_sink;
     const auto measured = run_publisher_instance(
-        root / "publisher_measured", measured_commands, measured_sink);
+        root / "publisher_measured", measured_commands, measured_sink, options);
     Samples samples;
     samples.values.push_back(measured.elapsed_ns);
     const auto rate = measured.elapsed_ns == 0
@@ -1094,6 +1108,19 @@ bool run_publisher_drain(const PipelineBenchmarkOptions& options,
             " sink_calls=" + std::to_string(measured_sink.calls()) +
             " sink_events=" + std::to_string(measured_sink.events()) +
             " cursor_head=" + std::to_string(measured_commands) +
+            " cursor_persist_max_commands=" +
+            std::to_string(options.publisher_cursor_persist_max_commands) +
+            " cursor_persist_max_delay_us=" +
+            std::to_string(options.publisher_cursor_persist_max_delay.count()) +
+            " successful_cursor_persists=" +
+            std::to_string(measured.successful_cursor_persists) +
+            " commands_per_cursor_persist=" +
+            (measured.successful_cursor_persists == 0
+                 ? std::string("na")
+                 : std::to_string(static_cast<double>(measured_commands) /
+                                  static_cast<double>(measured.successful_cursor_persists))) +
+            " confirmed_cursor=" + std::to_string(measured.confirmed_cursor) +
+            " durable_cursor=" + std::to_string(measured.durable_cursor) +
             " durable_cursor_verified=true",
         rate);
     return true;

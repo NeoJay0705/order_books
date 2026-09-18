@@ -221,6 +221,10 @@ Result<std::unique_ptr<ShardRuntime>> ShardRuntime::open(
       config.runtime.wal_segment_size == 0) {
     return invalid_config_error("runtime capacity is zero");
   }
+  if (config.runtime.publisher_cursor_persist_max_commands == 0 ||
+      config.runtime.publisher_cursor_persist_max_delay.count() <= 0) {
+    return invalid_config_error("publisher cursor persistence limits are invalid");
+  }
 
   auto state = genesis_state(shard_id, config);
   if (state.behavior_configurations.find(state.current_behavior_configuration_version) ==
@@ -367,7 +371,9 @@ Result<std::unique_ptr<ShardRuntime>> ShardRuntime::open(
       std::get<domain::ShardState>(std::move(publisher_state_result)), *wal,
       std::move(replay_snapshots), event_sink, *metrics_registry,
       config.runtime.event_replay_snapshot_interval_commands,
-      config.runtime.event_replay_snapshot_interval);
+      config.runtime.event_replay_snapshot_interval,
+      config.runtime.publisher_cursor_persist_max_commands,
+      config.runtime.publisher_cursor_persist_max_delay);
   if (std::holds_alternative<Error>(publisher_result)) {
     return std::get<Error>(publisher_result);
   }
