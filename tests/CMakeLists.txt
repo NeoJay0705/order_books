@@ -4,6 +4,7 @@ add_executable(order_books_tests
   toolchain_smoke_test.cpp
   unit/order_book_test.cpp
   unit/state_machine_test.cpp
+  unit/engine_tail_telemetry_test.cpp
   integration/codec_test.cpp
   integration/engine_durable_single_instrument_test.cpp
   integration/engine_pipeline_ceiling_test.cpp
@@ -13,6 +14,7 @@ add_executable(order_books_tests
   integration/persistence_test.cpp
   integration/wal_write_ceiling_test.cpp
   unit/metrics_registry_test.cpp
+  ../benchmarks/engine_tail_telemetry.cpp
 )
 
 set_target_properties(order_books_tests PROPERTIES
@@ -22,6 +24,7 @@ set_target_properties(order_books_tests PROPERTIES
 target_include_directories(order_books_tests
   PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../benchmarks"
 )
 
 target_link_libraries(order_books_tests

@@ -1,5 +1,6 @@
 add_executable(order_books_benchmark
   order_book_benchmark.cpp
+  engine_tail_telemetry.cpp
   engine_writer_profile_benchmark.cpp
   pipeline_ceiling_benchmark.cpp
 )
@@ -210,6 +211,33 @@ if(BUILD_TESTING)
     PROPERTIES
       PASS_REGULAR_EXPRESSION
       "engine_durable_single_instrument.*wal_prepare_workers=2.*actual_parallel_prepare_groups=[1-9][0-9]*.*wal_sync_full_run_p99_us=.*"
+  )
+
+  add_test(
+    NAME order_books_benchmark_engine_tail_telemetry_output_empty
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--engine-tail-telemetry-output=
+            -DEXPECTED_ERROR=engine_tail_telemetry_output_invalid
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_engine_tail_telemetry_wrong_workload
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DWORKLOAD=wal_write_ceiling
+            "-DCLI_ARGUMENT=--engine-tail-telemetry-output=${CMAKE_CURRENT_BINARY_DIR}/order_books-invalid-tail.csv"
+            -DEXPECTED_ERROR=engine_tail_telemetry_requires_engine_durable_workload
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_engine_tail_telemetry_smoke
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            "-DOUTPUT_PATH=${CMAKE_CURRENT_BINARY_DIR}/engine-tail-telemetry-smoke.csv"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_engine_tail_telemetry.cmake"
   )
 
   add_test(

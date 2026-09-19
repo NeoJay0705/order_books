@@ -2,7 +2,11 @@ if(NOT DEFINED PROGRAM OR NOT DEFINED CLI_ARGUMENT OR NOT DEFINED EXPECTED_ERROR
   message(FATAL_ERROR "PROGRAM, CLI_ARGUMENT and EXPECTED_ERROR are required")
 endif()
 
-set(command "${PROGRAM}" --workload=engine_durable_single_instrument "${CLI_ARGUMENT}")
+set(workload engine_durable_single_instrument)
+if(DEFINED WORKLOAD)
+  set(workload "${WORKLOAD}")
+endif()
+set(command "${PROGRAM}" "--workload=${workload}" "${CLI_ARGUMENT}")
 if(DEFINED CLI_ARGUMENT_2)
   list(APPEND command "${CLI_ARGUMENT_2}")
 endif()
