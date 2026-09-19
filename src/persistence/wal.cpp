@@ -3,11 +3,14 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <limits>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 
 #include "persistence/binary_codec.hpp"
@@ -164,11 +167,277 @@ Result<std::vector<std::byte>> encode_frame(
 
 }  // namespace
 
+struct Wal::PrepareWorkers {
+  struct Range {
+    std::size_t begin{};
+    std::size_t end{};
+  };
+
+  struct LaneResult {
+    std::vector<PreparedRecord> records;
+    WalAppendProfile profile{};
+    std::uint64_t task_ns{};
+    std::optional<Error> error;
+    std::exception_ptr exception;
+    std::size_t failure_index{};
+  };
+
+  struct Job {
+    std::span<const domain::CommittedCommand> commands;
+    std::vector<Range> ranges;
+    std::vector<LaneResult> lanes;
+    std::size_t completed_background{};
+    std::uint64_t generation{};
+    bool profiled{};
+  };
+
+  PrepareWorkers(const std::size_t lane_count, const std::size_t segment_size)
+      : lane_count_(lane_count), segment_size_(segment_size) {}
+
+  void start() {
+    workers_.reserve(lane_count_ - 1U);
+    for (std::size_t index = 1; index < lane_count_; ++index) {
+      workers_.emplace_back([this, index](std::stop_token token) {
+        worker_loop(index, token);
+      });
+    }
+  }
+
+  PrepareWorkers(const PrepareWorkers&) = delete;
+  PrepareWorkers& operator=(const PrepareWorkers&) = delete;
+
+  ~PrepareWorkers() { stop(); }
+
+  Result<std::vector<PreparedRecord>> prepare(
+      const std::span<const domain::CommittedCommand> commands,
+      const std::size_t min_parallel_commands, WalAppendProfile* profile,
+      WalPrepareStats* stats) {
+    const auto range_count = std::min(lane_count_, commands.size());
+    const bool use_parallel = commands.size() >= min_parallel_commands &&
+                               range_count > 1U;
+    if (!use_parallel) {
+      auto result = prepare_sequential(commands, segment_size_, profile);
+      if (stats != nullptr && std::holds_alternative<std::vector<PreparedRecord>>(result)) {
+        add_profile_ns(stats->tasks, 1U);
+      }
+      return result;
+    }
+    Job job;
+    job.commands = commands;
+    job.ranges.reserve(range_count);
+    job.lanes.resize(range_count);
+    const auto base_size = commands.size() / range_count;
+    const auto remainder = commands.size() % range_count;
+    std::size_t begin = 0;
+    for (std::size_t index = 0; index < range_count; ++index) {
+      const auto length = base_size + (index < remainder ? 1U : 0U);
+      job.ranges.push_back(Range{begin, begin + length});
+      begin += length;
+    }
+    {
+      std::lock_guard lock(mutex_);
+      job.generation = ++generation_;
+      job.profiled = profile != nullptr;
+      active_job_ = &job;
+      job_cv_.notify_all();
+    }
+    run_lane(job, 0U, segment_size_, profile != nullptr);
+    {
+      std::unique_lock lock(mutex_);
+      completed_cv_.wait(lock, [this, &job] {
+        return active_job_ == &job && job.completed_background == workers_.size();
+      });
+      active_job_ = nullptr;
+      job_cv_.notify_all();
+    }
+
+    std::optional<std::size_t> first_failure;
+    for (std::size_t index = 0; index < job.lanes.size(); ++index) {
+      if (job.lanes[index].error.has_value() || job.lanes[index].exception) {
+        const auto failure_index = job.lanes[index].failure_index;
+        if (!first_failure.has_value() || failure_index < *first_failure) {
+          first_failure = failure_index;
+        }
+      }
+    }
+    if (first_failure.has_value()) {
+      for (const auto& lane : job.lanes) {
+        if (lane.failure_index != *first_failure) {
+          continue;
+        }
+        if (lane.exception) {
+          std::rethrow_exception(lane.exception);
+        }
+        return *lane.error;
+      }
+    }
+
+    std::vector<PreparedRecord> records;
+    records.reserve(commands.size());
+    if (profile != nullptr) {
+      add_profile_ns(profile->parallel_prepare_groups, 1U);
+      add_profile_ns(profile->prepare_tasks,
+                     static_cast<std::uint64_t>(job.lanes.size()));
+    }
+    for (auto& lane : job.lanes) {
+      if (profile != nullptr) {
+        add_profile_ns(profile->prepare_task_ns, lane.task_ns);
+        merge_profile(profile, lane.profile);
+      }
+      for (auto& record : lane.records) {
+        records.push_back(std::move(record));
+      }
+    }
+    if (stats != nullptr) {
+      add_profile_ns(stats->parallel_groups, 1U);
+      add_profile_ns(stats->tasks, static_cast<std::uint64_t>(job.lanes.size()));
+    }
+    return records;
+  }
+
+  void stop() noexcept {
+    {
+      std::lock_guard lock(mutex_);
+      if (stopping_) {
+        return;
+      }
+      stopping_ = true;
+      job_cv_.notify_all();
+    }
+    workers_.clear();
+  }
+
+ private:
+  static Result<std::vector<PreparedRecord>> prepare_sequential(
+      const std::span<const domain::CommittedCommand> commands,
+      const std::size_t segment_size, WalAppendProfile* profile) {
+    const auto task_start = profile == nullptr ? ProfileClock::time_point{}
+                                                : ProfileClock::now();
+    std::vector<PreparedRecord> records;
+    records.reserve(commands.size());
+    for (const auto& command : commands) {
+      auto frame = encode_frame(command, profile);
+      if (std::holds_alternative<Error>(frame)) {
+        return std::get<Error>(frame);
+      }
+      auto prepared_frame = std::get<std::vector<std::byte>>(std::move(frame));
+      if (prepared_frame.size() > segment_size - kHeaderSize) {
+        return wal_error(ErrorCode::wal_failure, "WAL record cannot fit in a segment");
+      }
+      records.push_back(PreparedRecord{command, std::move(prepared_frame)});
+    }
+    if (profile != nullptr) {
+      add_profile_ns(profile->prepare_task_ns,
+                     profile_elapsed_ns(task_start, ProfileClock::now()));
+      profile->prepare_tasks = 1U;
+    }
+    return records;
+  }
+
+  static void merge_profile(WalAppendProfile* destination,
+                            const WalAppendProfile& source) noexcept {
+    add_profile_ns(destination->payload_encode_ns, source.payload_encode_ns);
+    add_profile_ns(destination->crc_ns, source.crc_ns);
+    add_profile_ns(destination->frame_assembly_ns, source.frame_assembly_ns);
+    add_profile_ns(destination->payload_bytes, source.payload_bytes);
+  }
+
+  static void run_lane(Job& job, const std::size_t lane_index,
+                       const std::size_t segment_size, const bool profiled) noexcept {
+    auto& lane = job.lanes[lane_index];
+    const auto range = job.ranges[lane_index];
+    const auto start = profiled ? ProfileClock::now() : ProfileClock::time_point{};
+    try {
+      lane.records.reserve(range.end - range.begin);
+      for (std::size_t index = range.begin; index < range.end; ++index) {
+        auto frame = encode_frame(job.commands[index], profiled ? &lane.profile : nullptr);
+        if (std::holds_alternative<Error>(frame)) {
+          lane.failure_index = index;
+          lane.error = std::get<Error>(std::move(frame));
+          break;
+        }
+        auto prepared_frame =
+            std::get<std::vector<std::byte>>(std::move(frame));
+        if (prepared_frame.size() > segment_size - kHeaderSize) {
+          lane.failure_index = index;
+          lane.error = wal_error(ErrorCode::wal_failure,
+                                 "WAL record cannot fit in a segment");
+          break;
+        }
+        lane.records.push_back(
+            PreparedRecord{job.commands[index], std::move(prepared_frame)});
+      }
+    } catch (...) {
+      lane.failure_index = range.begin + lane.records.size();
+      lane.exception = std::current_exception();
+    }
+    if (profiled) {
+      lane.task_ns = profile_elapsed_ns(start, ProfileClock::now());
+    }
+  }
+
+  void worker_loop(const std::size_t lane_index, const std::stop_token token) noexcept {
+    std::uint64_t last_generation = 0;
+    for (;;) {
+      Job* job = nullptr;
+      {
+        std::unique_lock lock(mutex_);
+        job_cv_.wait(lock, token, [this, &last_generation] {
+          return stopping_ || (active_job_ != nullptr &&
+                               active_job_->generation != last_generation);
+        });
+        if (stopping_ || token.stop_requested()) {
+          return;
+        }
+        job = active_job_;
+        last_generation = job->generation;
+        if (lane_index >= job->ranges.size()) {
+          ++job->completed_background;
+          job = nullptr;
+        }
+      }
+      if (job == nullptr) {
+        completed_cv_.notify_one();
+        continue;
+      }
+      run_lane(*job, lane_index, segment_size_, job->profiled);
+      {
+        std::lock_guard lock(mutex_);
+        ++job->completed_background;
+      }
+      completed_cv_.notify_one();
+    }
+  }
+
+  std::size_t lane_count_{};
+  std::size_t segment_size_{};
+  std::mutex mutex_;
+  std::condition_variable_any job_cv_;
+  std::condition_variable completed_cv_;
+  Job* active_job_{};
+  std::uint64_t generation_{};
+  bool stopping_{false};
+  std::vector<std::jthread> workers_;
+};
+
+Wal::Wal(std::filesystem::path directory, const ShardId shard_id,
+         const std::size_t segment_size, const WalPrepareOptions prepare_options)
+    : directory_(std::move(directory)),
+      shard_id_(shard_id),
+      segment_size_(segment_size),
+      prepare_options_(prepare_options) {}
+
 Result<std::unique_ptr<Wal>> Wal::open(std::filesystem::path directory,
                                         const ShardId shard_id,
-                                        const std::size_t segment_size) {
+                                        const std::size_t segment_size,
+                                        const WalPrepareOptions prepare_options) {
   if (segment_size <= kHeaderSize + 32U) {
     return wal_error(ErrorCode::wal_failure, "WAL segment size is too small");
+  }
+  if ((prepare_options.lane_count != 1U && prepare_options.lane_count != 2U &&
+       prepare_options.lane_count != 4U) ||
+      prepare_options.min_parallel_commands == 0U) {
+    return wal_error(ErrorCode::wal_failure, "invalid WAL prepare options");
   }
   std::error_code filesystem_error;
   std::filesystem::create_directories(directory, filesystem_error);
@@ -176,7 +445,12 @@ Result<std::unique_ptr<Wal>> Wal::open(std::filesystem::path directory,
     return wal_error(ErrorCode::wal_failure, "cannot create WAL directory");
   }
 
-  auto wal = std::unique_ptr<Wal>(new Wal(std::move(directory), shard_id, segment_size));
+  auto wal = std::unique_ptr<Wal>(
+      new Wal(std::move(directory), shard_id, segment_size, prepare_options));
+  if (const auto status = wal->initialize_prepare_workers();
+      std::holds_alternative<Error>(status)) {
+    return std::get<Error>(status);
+  }
   std::vector<std::filesystem::path> segments;
   for (const auto& entry : std::filesystem::directory_iterator(wal->directory_)) {
     if (entry.is_regular_file() && entry.path().extension() == ".wal") {
@@ -223,9 +497,28 @@ Result<std::unique_ptr<Wal>> Wal::open(std::filesystem::path directory,
 }
 
 Wal::~Wal() {
+  prepare_workers_.reset();
   if (active_descriptor_ >= 0) {
     FileOps::close(active_descriptor_);
   }
+}
+
+Status Wal::initialize_prepare_workers() {
+  if (prepare_options_.lane_count == 1U) {
+    return std::monostate{};
+  }
+  try {
+    prepare_workers_ = std::make_unique<PrepareWorkers>(
+        prepare_options_.lane_count, segment_size_);
+    prepare_workers_->start();
+  } catch (const std::exception&) {
+    return wal_error(ErrorCode::wal_failure,
+                     "cannot create WAL prepare workers");
+  } catch (...) {
+    return wal_error(ErrorCode::wal_failure,
+                     "cannot create WAL prepare workers");
+  }
+  return std::monostate{};
 }
 
 std::filesystem::path Wal::segment_path(const EngineSeq first_engine_seq) const {
@@ -350,21 +643,34 @@ Status Wal::rebuild_record_index_unlocked() {
 
 Result<std::vector<Wal::PreparedRecord>> Wal::prepare_records_unlocked(
     const std::span<const domain::CommittedCommand> commands,
-    WalAppendProfile* profile) const {
+    WalAppendProfile* profile) {
+  if (prepare_workers_ != nullptr) {
+    return prepare_workers_->prepare(commands,
+                                     prepare_options_.min_parallel_commands,
+                                     profile, &prepare_stats_);
+  }
   std::vector<PreparedRecord> records;
   records.reserve(commands.size());
+  const auto task_start = profile == nullptr ? ProfileClock::time_point{}
+                                              : ProfileClock::now();
   for (const auto& command : commands) {
     auto frame = encode_frame(command, profile);
     if (std::holds_alternative<Error>(frame)) {
       return std::get<Error>(frame);
     }
     const auto& frame_bytes = std::get<std::vector<std::byte>>(frame);
-    if (frame_bytes.size() + kHeaderSize > segment_size_) {
+    if (frame_bytes.size() > segment_size_ - kHeaderSize) {
       return wal_error(ErrorCode::wal_failure, "WAL record cannot fit in a segment");
     }
     records.push_back(PreparedRecord{command,
                                      std::get<std::vector<std::byte>>(std::move(frame))});
   }
+  if (profile != nullptr) {
+    add_profile_ns(profile->prepare_task_ns,
+                   profile_elapsed_ns(task_start, ProfileClock::now()));
+    profile->prepare_tasks = 1U;
+  }
+  add_profile_ns(prepare_stats_.tasks, 1U);
   return records;
 }
 
@@ -875,6 +1181,11 @@ EngineSeq Wal::last_engine_seq() const noexcept {
 WalPosition Wal::durable_position() const {
   std::lock_guard lock(mutex_);
   return durable_position_;
+}
+
+WalPrepareStats Wal::prepare_stats() const {
+  std::lock_guard lock(mutex_);
+  return prepare_stats_;
 }
 
 }  // namespace order_books::storage

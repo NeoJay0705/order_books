@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -53,6 +54,215 @@ std::vector<std::filesystem::path> wal_segments(const std::filesystem::path& dir
     }
   }
   return result;
+}
+
+std::vector<std::byte> read_file(const std::filesystem::path& path) {
+  std::ifstream input(path, std::ios::binary);
+  const std::vector<char> bytes{std::istreambuf_iterator<char>(input),
+                                std::istreambuf_iterator<char>()};
+  std::vector<std::byte> result;
+  result.reserve(bytes.size());
+  for (const auto byte : bytes) {
+    result.push_back(static_cast<std::byte>(static_cast<unsigned char>(byte)));
+  }
+  return result;
+}
+
+void sort_segments(std::vector<std::filesystem::path>& segments) {
+  std::sort(segments.begin(), segments.end());
+}
+
+TEST(PersistenceTest, WalPrepareOptionsRejectUnsupportedValues) {
+  TemporaryDirectory temporary("order_books_wal_prepare_options_test");
+  auto invalid_lanes = Wal::open(temporary.path() / "lanes", 1, 1U * 1024U * 1024U,
+                                 WalPrepareOptions{3, 1});
+  ASSERT_TRUE(std::holds_alternative<Error>(invalid_lanes));
+  EXPECT_EQ(std::get<Error>(invalid_lanes).code, ErrorCode::wal_failure);
+
+  auto invalid_threshold = Wal::open(temporary.path() / "threshold", 1,
+                                     1U * 1024U * 1024U,
+                                     WalPrepareOptions{2, 0});
+  ASSERT_TRUE(std::holds_alternative<Error>(invalid_threshold));
+  EXPECT_EQ(std::get<Error>(invalid_threshold).code, ErrorCode::wal_failure);
+}
+
+TEST(PersistenceTest, WalParallelPreparePreservesBytesOrderingAndReplay) {
+  TemporaryDirectory temporary("order_books_wal_parallel_prepare_test");
+  const auto sequential_directory = temporary.path() / "sequential";
+  const auto two_lane_directory = temporary.path() / "two-lane";
+  const auto parallel_directory = temporary.path() / "parallel";
+  const auto first_frame = 4U + encode_committed_command(command(1)).size() + 6U;
+  const auto segment_size = std::size_t{22} + first_frame * 3U + 1U;
+  std::vector<domain::CommittedCommand> commands;
+  for (EngineSeq sequence = 1; sequence <= 11; ++sequence) {
+    commands.push_back(command(sequence));
+  }
+
+  auto sequential_opened = Wal::open(sequential_directory, 1, segment_size,
+                                     WalPrepareOptions{1, 1});
+  auto two_lane_opened = Wal::open(two_lane_directory, 1, segment_size,
+                                   WalPrepareOptions{2, 1});
+  auto parallel_opened = Wal::open(parallel_directory, 1, segment_size,
+                                   WalPrepareOptions{4, 1});
+  ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Wal>>(sequential_opened));
+  ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Wal>>(two_lane_opened));
+  ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Wal>>(parallel_opened));
+  auto sequential = std::get<std::unique_ptr<Wal>>(std::move(sequential_opened));
+  auto two_lane = std::get<std::unique_ptr<Wal>>(std::move(two_lane_opened));
+  auto parallel = std::get<std::unique_ptr<Wal>>(std::move(parallel_opened));
+
+  WalAppendProfile sequential_profile;
+  WalAppendProfile profile;
+  const auto sequential_appended =
+      sequential->append_batch_profiled(commands, sequential_profile);
+  const auto two_lane_appended = two_lane->append_batch(commands);
+  const auto parallel_appended = parallel->append_batch_profiled(commands, profile);
+  ASSERT_TRUE(std::holds_alternative<WalPosition>(sequential_appended));
+  ASSERT_TRUE(std::holds_alternative<WalPosition>(two_lane_appended));
+  ASSERT_TRUE(std::holds_alternative<WalPosition>(parallel_appended));
+  ASSERT_TRUE(std::holds_alternative<std::monostate>(sequential->sync()));
+  ASSERT_TRUE(std::holds_alternative<std::monostate>(two_lane->sync()));
+  ASSERT_TRUE(std::holds_alternative<std::monostate>(parallel->sync()));
+  EXPECT_EQ(profile.parallel_prepare_groups, 1U);
+  EXPECT_EQ(profile.prepare_tasks, 4U);
+  EXPECT_GE(profile.prepare_task_ns,
+            profile.payload_encode_ns + profile.crc_ns + profile.frame_assembly_ns);
+  const auto& sequential_position = std::get<WalPosition>(sequential_appended);
+  const auto& two_lane_position = std::get<WalPosition>(two_lane_appended);
+  const auto& parallel_position = std::get<WalPosition>(parallel_appended);
+  EXPECT_EQ(sequential_position.engine_seq, parallel_position.engine_seq);
+  EXPECT_EQ(sequential_position.segment.filename(), parallel_position.segment.filename());
+  EXPECT_EQ(sequential_position.end_offset, parallel_position.end_offset);
+  EXPECT_EQ(two_lane_position.engine_seq, parallel_position.engine_seq);
+  EXPECT_EQ(two_lane_position.segment.filename(), parallel_position.segment.filename());
+  EXPECT_EQ(two_lane_position.end_offset, parallel_position.end_offset);
+  EXPECT_EQ(sequential->size_bytes(), parallel->size_bytes());
+  EXPECT_EQ(two_lane->size_bytes(), parallel->size_bytes());
+  EXPECT_EQ(sequential_profile.frame_bytes, profile.frame_bytes);
+  EXPECT_EQ(sequential_profile.data_write_calls, profile.data_write_calls);
+  EXPECT_EQ(sequential_profile.rotations, profile.rotations);
+  const auto prepare_stats = parallel->prepare_stats();
+  EXPECT_EQ(prepare_stats.parallel_groups, 1U);
+  EXPECT_EQ(prepare_stats.tasks, 4U);
+  const auto sequential_stats = sequential->prepare_stats();
+  const auto two_lane_stats = two_lane->prepare_stats();
+  EXPECT_EQ(sequential_stats.parallel_groups, 0U);
+  EXPECT_EQ(sequential_stats.tasks, 1U);
+  EXPECT_EQ(two_lane_stats.parallel_groups, 1U);
+  EXPECT_EQ(two_lane_stats.tasks, 2U);
+
+  auto sequential_segments = wal_segments(sequential_directory);
+  auto parallel_segments = wal_segments(parallel_directory);
+  sort_segments(sequential_segments);
+  sort_segments(parallel_segments);
+  ASSERT_EQ(sequential_segments.size(), parallel_segments.size());
+  for (std::size_t index = 0; index < sequential_segments.size(); ++index) {
+    EXPECT_EQ(sequential_segments[index].filename(), parallel_segments[index].filename());
+    EXPECT_EQ(read_file(sequential_segments[index]), read_file(parallel_segments[index]));
+  }
+  auto two_lane_segments = wal_segments(two_lane_directory);
+  sort_segments(two_lane_segments);
+  ASSERT_EQ(sequential_segments.size(), two_lane_segments.size());
+  for (std::size_t index = 0; index < sequential_segments.size(); ++index) {
+    EXPECT_EQ(sequential_segments[index].filename(), two_lane_segments[index].filename());
+    EXPECT_EQ(read_file(sequential_segments[index]), read_file(two_lane_segments[index]));
+  }
+
+  two_lane.reset();
+  parallel.reset();
+  auto reopened = Wal::open(parallel_directory, 1, segment_size,
+                            WalPrepareOptions{4, 1});
+  ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Wal>>(reopened));
+  parallel = std::get<std::unique_ptr<Wal>>(std::move(reopened));
+  auto replayed = parallel->replay();
+  ASSERT_TRUE(std::holds_alternative<std::vector<domain::CommittedCommand>>(replayed));
+  const auto& records = std::get<std::vector<domain::CommittedCommand>>(replayed);
+  ASSERT_EQ(records.size(), commands.size());
+  for (std::size_t index = 0; index < records.size(); ++index) {
+    EXPECT_EQ(records[index].engine_seq, commands[index].engine_seq);
+    EXPECT_EQ(records[index].command, commands[index].command);
+  }
+}
+
+TEST(PersistenceTest, WalParallelPrepareFallsBackBelowThreshold) {
+  TemporaryDirectory temporary("order_books_wal_parallel_prepare_fallback_test");
+  auto opened = Wal::open(temporary.path(), 1, 1U * 1024U * 1024U,
+                          WalPrepareOptions{4, 8});
+  ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Wal>>(opened));
+  auto wal = std::get<std::unique_ptr<Wal>>(std::move(opened));
+  const std::vector<domain::CommittedCommand> commands{command(1), command(2), command(3)};
+  WalAppendProfile profile;
+  ASSERT_TRUE(std::holds_alternative<WalPosition>(wal->append_batch_profiled(commands, profile)));
+  EXPECT_EQ(profile.parallel_prepare_groups, 0U);
+  EXPECT_EQ(profile.prepare_tasks, 1U);
+  EXPECT_GE(profile.prepare_task_ns,
+            profile.payload_encode_ns + profile.crc_ns + profile.frame_assembly_ns);
+  const auto prepare_stats = wal->prepare_stats();
+  EXPECT_EQ(prepare_stats.parallel_groups, 0U);
+  EXPECT_EQ(prepare_stats.tasks, 1U);
+  ASSERT_TRUE(std::holds_alternative<std::monostate>(wal->sync()));
+}
+
+TEST(PersistenceTest, WalParallelPrepareUsesOnlyNonEmptyRanges) {
+  TemporaryDirectory temporary("order_books_wal_parallel_prepare_uneven_test");
+  auto opened = Wal::open(temporary.path(), 1, 1U * 1024U * 1024U,
+                          WalPrepareOptions{4, 1});
+  ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Wal>>(opened));
+  auto wal = std::get<std::unique_ptr<Wal>>(std::move(opened));
+  const std::vector<domain::CommittedCommand> commands{command(1), command(2), command(3)};
+  WalAppendProfile profile;
+  ASSERT_TRUE(std::holds_alternative<WalPosition>(wal->append_batch_profiled(commands, profile)));
+  EXPECT_EQ(profile.parallel_prepare_groups, 1U);
+  EXPECT_EQ(profile.prepare_tasks, 3U);
+  EXPECT_GE(profile.prepare_task_ns,
+            profile.payload_encode_ns + profile.crc_ns + profile.frame_assembly_ns);
+  auto prepare_stats = wal->prepare_stats();
+  EXPECT_EQ(prepare_stats.parallel_groups, 1U);
+  EXPECT_EQ(prepare_stats.tasks, 3U);
+  const std::vector<domain::CommittedCommand> second_commands{
+      command(4), command(5), command(6)};
+  ASSERT_TRUE(std::holds_alternative<WalPosition>(
+      wal->append_batch(second_commands)));
+  prepare_stats = wal->prepare_stats();
+  EXPECT_EQ(prepare_stats.parallel_groups, 2U);
+  EXPECT_EQ(prepare_stats.tasks, 6U);
+  ASSERT_TRUE(std::holds_alternative<std::monostate>(wal->sync()));
+}
+
+TEST(PersistenceTest, WalParallelPrepareRepeatedOpenAppendAndShutdown) {
+  TemporaryDirectory temporary("order_books_wal_parallel_prepare_lifecycle_test");
+  const auto wal_directory = temporary.path() / "wal";
+  constexpr auto segment_size = std::size_t{1U * 1024U * 1024U};
+  constexpr EngineSeq commands_per_cycle = 3;
+  constexpr EngineSeq cycle_count = 8;
+
+  for (EngineSeq cycle = 0; cycle < cycle_count; ++cycle) {
+    auto opened = Wal::open(wal_directory, 1, segment_size, WalPrepareOptions{4, 1});
+    ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Wal>>(opened));
+    auto wal = std::get<std::unique_ptr<Wal>>(std::move(opened));
+    auto existing = wal->replay();
+    ASSERT_TRUE(std::holds_alternative<std::vector<domain::CommittedCommand>>(existing));
+    const auto first_sequence = cycle * commands_per_cycle + 1U;
+    const std::vector<domain::CommittedCommand> commands{
+        command(first_sequence), command(first_sequence + 1U), command(first_sequence + 2U)};
+    ASSERT_TRUE(std::holds_alternative<WalPosition>(wal->append_batch(commands)));
+    const auto stats = wal->prepare_stats();
+    EXPECT_EQ(stats.parallel_groups, 1U);
+    EXPECT_EQ(stats.tasks, 3U);
+    ASSERT_TRUE(std::holds_alternative<std::monostate>(wal->sync()));
+    wal.reset();
+  }
+
+  auto reopened = Wal::open(wal_directory, 1, segment_size, WalPrepareOptions{4, 1});
+  ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Wal>>(reopened));
+  auto wal = std::get<std::unique_ptr<Wal>>(std::move(reopened));
+  auto replayed = wal->replay();
+  ASSERT_TRUE(std::holds_alternative<std::vector<domain::CommittedCommand>>(replayed));
+  const auto& records = std::get<std::vector<domain::CommittedCommand>>(replayed);
+  ASSERT_EQ(records.size(), cycle_count * commands_per_cycle);
+  for (std::size_t index = 0; index < records.size(); ++index) {
+    EXPECT_EQ(records[index].engine_seq, static_cast<EngineSeq>(index + 1U));
+  }
 }
 
 TEST(PersistenceTest, WalRotationReplaysEveryDurableSegment) {
@@ -327,6 +537,13 @@ TEST(PersistenceTest, WalProfiledBatchPreservesRecordAndPhaseBoundaries) {
   }
   EXPECT_EQ(profile.payload_bytes, expected_payload_bytes);
   EXPECT_LE(profile.payload_bytes, profile.frame_bytes);
+  EXPECT_EQ(profile.parallel_prepare_groups, 0U);
+  EXPECT_EQ(profile.prepare_tasks, 1U);
+  EXPECT_GE(profile.prepare_task_ns,
+            profile.payload_encode_ns + profile.crc_ns + profile.frame_assembly_ns);
+  const auto prepare_stats = profiled_wal->prepare_stats();
+  EXPECT_EQ(prepare_stats.parallel_groups, 0U);
+  EXPECT_EQ(prepare_stats.tasks, 1U);
   EXPECT_LE(profile.chunk_copy_ns, profile.plan_copy_ns);
   EXPECT_EQ(profile.data_write_calls, 1U);
   EXPECT_EQ(profile.rotations, 0U);

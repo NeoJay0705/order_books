@@ -227,7 +227,8 @@ class ScopeGuard final {
 Result<std::unique_ptr<ShardRuntime>> ShardRuntime::open(
     const ShardId shard_id, const EngineConfig& config, EventSink& event_sink,
     MetricsSink& metrics_sink, WriterProfileCollector* profile,
-    const WriterProfileOptions profile_options) {
+    const WriterProfileOptions profile_options,
+    const storage::WalPrepareOptions wal_prepare_options) {
   if (config.data_directory.empty()) {
     return invalid_config_error("data directory is empty");
   }
@@ -276,7 +277,8 @@ Result<std::unique_ptr<ShardRuntime>> ShardRuntime::open(
     return std::get<Error>(status);
   }
   auto wal_result = storage::Wal::open(shard_directory / "wal", shard_id,
-                                       config.runtime.wal_segment_size);
+                                       config.runtime.wal_segment_size,
+                                       wal_prepare_options);
   if (std::holds_alternative<Error>(wal_result)) {
     return std::get<Error>(wal_result);
   }
@@ -450,6 +452,10 @@ void ShardRuntime::set_writer_profile_phase_active(const bool active) noexcept {
 void ShardRuntime::reset_writer_profile_phase() noexcept {
   profile_groups_seen_.store(0, std::memory_order_release);
   profile_phase_active_.store(true, std::memory_order_release);
+}
+
+storage::WalPrepareStats ShardRuntime::wal_prepare_stats() const {
+  return wal_->prepare_stats();
 }
 
 SubmitResult ShardRuntime::submit(Command command, CompletionHandler completion) {

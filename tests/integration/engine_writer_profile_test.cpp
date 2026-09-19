@@ -138,7 +138,7 @@ TEST(EngineWriterProfileTest, ShardRuntimeReportsWriterAndCompletionSamples) {
                                  sample.completion_enqueue_ns;
     EXPECT_GE(sample.writer_service_ns, writer_children);
     EXPECT_GE(sample.writer_cycle_ns, sample.group_collect_ns + sample.writer_service_ns);
-    EXPECT_GE(sample.wal.prepare_ns,
+    EXPECT_GE(sample.wal.prepare_task_ns,
               sample.wal.payload_encode_ns + sample.wal.crc_ns + sample.wal.frame_assembly_ns);
     EXPECT_GE(sample.wal.plan_copy_ns, sample.wal.chunk_copy_ns);
   }

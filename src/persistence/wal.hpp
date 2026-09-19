@@ -21,12 +21,30 @@ struct WalPosition {
   std::uint64_t end_offset{};
 };
 
+// Internal prototype control for bounded WAL record preparation.  The type is
+// deliberately kept under src/ and is not part of the installed API.  A lane
+// includes the caller that owns the WAL mutex.
+struct WalPrepareOptions {
+  std::size_t lane_count{1};
+  std::size_t min_parallel_commands{256};
+};
+
+// Low-overhead cumulative counters used by benchmark diagnostics.  These do
+// not enable per-record timing and are not part of the installed API.
+struct WalPrepareStats {
+  std::uint64_t parallel_groups{};
+  std::uint64_t tasks{};
+};
+
 // Populated only by the benchmark-only diagnostic append path.  This type is
 // intentionally kept in the internal storage header and is not part of the
 // installed library API.
 struct WalAppendProfile {
   std::uint64_t lock_wait_ns{};
   std::uint64_t prepare_ns{};
+  std::uint64_t prepare_task_ns{};
+  std::uint64_t parallel_prepare_groups{};
+  std::uint64_t prepare_tasks{};
   std::uint64_t plan_copy_ns{};
   std::uint64_t payload_encode_ns{};
   std::uint64_t crc_ns{};
@@ -45,7 +63,8 @@ class Wal {
  public:
   static Result<std::unique_ptr<Wal>> open(std::filesystem::path directory,
                                            ShardId shard_id,
-                                           std::size_t segment_size);
+                                           std::size_t segment_size,
+                                           WalPrepareOptions prepare_options = {});
 
   ~Wal();
 
@@ -65,12 +84,11 @@ class Wal {
   [[nodiscard]] std::uint64_t size_bytes() const noexcept;
   [[nodiscard]] EngineSeq last_engine_seq() const noexcept;
   [[nodiscard]] WalPosition durable_position() const;
+  [[nodiscard]] WalPrepareStats prepare_stats() const;
 
  private:
-  Wal(std::filesystem::path directory, ShardId shard_id, std::size_t segment_size)
-      : directory_(std::move(directory)),
-        shard_id_(shard_id),
-        segment_size_(segment_size) {}
+  Wal(std::filesystem::path directory, ShardId shard_id, std::size_t segment_size,
+      WalPrepareOptions prepare_options);
 
   Status create_segment(EngineSeq first_engine_seq);
   Status sync_active_unlocked();
@@ -91,9 +109,12 @@ class Wal {
     std::vector<std::byte> frame;
   };
 
+  struct PrepareWorkers;
+
   Result<std::vector<PreparedRecord>> prepare_records_unlocked(
       std::span<const domain::CommittedCommand> commands,
-      WalAppendProfile* profile) const;
+      WalAppendProfile* profile);
+  Status initialize_prepare_workers();
   Result<WalPosition> append_batch_unlocked(
       std::span<const domain::CommittedCommand> commands,
       WalAppendProfile* profile);
@@ -113,6 +134,9 @@ class Wal {
   bool active_dirty_{false};
   std::vector<CachedRecord> records_;
   bool records_loaded_{false};
+  WalPrepareOptions prepare_options_{};
+  WalPrepareStats prepare_stats_{};
+  std::unique_ptr<PrepareWorkers> prepare_workers_;
   mutable std::mutex mutex_;
 };
 

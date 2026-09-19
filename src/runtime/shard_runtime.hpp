@@ -34,7 +34,8 @@ class ShardRuntime {
   static Result<std::unique_ptr<ShardRuntime>> open(
       ShardId shard_id, const EngineConfig& config, EventSink& event_sink,
       MetricsSink& metrics_sink, WriterProfileCollector* profile = nullptr,
-      WriterProfileOptions profile_options = {});
+      WriterProfileOptions profile_options = {},
+      storage::WalPrepareOptions wal_prepare_options = {});
 
   ~ShardRuntime();
 
@@ -46,6 +47,8 @@ class ShardRuntime {
   // re-enabled with a fresh sampling sequence for the measured phase.
   void set_writer_profile_phase_active(bool active) noexcept;
   void reset_writer_profile_phase() noexcept;
+  // Internal benchmark diagnostic; does not alter the public Engine API.
+  [[nodiscard]] storage::WalPrepareStats wal_prepare_stats() const;
   SubmitResult submit(Command command, CompletionHandler completion);
   std::future<Result<OrderView>> get_order(InstrumentId instrument_id, OrderId order_id);
   std::future<Result<BookDepth>> depth(InstrumentId instrument_id, Side side,

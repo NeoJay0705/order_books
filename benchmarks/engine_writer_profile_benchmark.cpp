@@ -134,6 +134,9 @@ class ProfileCollector final : public WriterProfileCollector {
     add(target.completion_enqueue_ns, sample.completion_enqueue_ns);
     add(target.wal.lock_wait_ns, sample.wal.lock_wait_ns);
     add(target.wal.prepare_ns, sample.wal.prepare_ns);
+    add(target.wal.prepare_task_ns, sample.wal.prepare_task_ns);
+    add(target.wal.parallel_prepare_groups, sample.wal.parallel_prepare_groups);
+    add(target.wal.prepare_tasks, sample.wal.prepare_tasks);
     add(target.wal.plan_copy_ns, sample.wal.plan_copy_ns);
     add(target.wal.payload_encode_ns, sample.wal.payload_encode_ns);
     add(target.wal.crc_ns, sample.wal.crc_ns);
@@ -207,6 +210,16 @@ std::optional<std::uint64_t> doubled(const std::uint64_t value) {
     return std::nullopt;
   }
   return value * 2U;
+}
+
+std::optional<storage::WalPrepareStats> prepare_stats_delta(
+    const storage::WalPrepareStats& before,
+    const storage::WalPrepareStats& after) {
+  if (after.parallel_groups < before.parallel_groups || after.tasks < before.tasks) {
+    return std::nullopt;
+  }
+  return storage::WalPrepareStats{after.parallel_groups - before.parallel_groups,
+                                  after.tasks - before.tasks};
 }
 
 std::uint64_t elapsed_ns(const std::chrono::steady_clock::time_point start,
@@ -393,7 +406,7 @@ bool print_profile(const ProfileCollector& collector, const std::uint64_t measur
   }
   if (writer_children > totals.writer_service_ns ||
       cycle_children > totals.writer_cycle_ns ||
-      prepare_children > totals.wal.prepare_ns ||
+      prepare_children > totals.wal.prepare_task_ns ||
       totals.wal.chunk_copy_ns > totals.wal.plan_copy_ns) {
     std::cerr << "workload=engine_writer_hot_path_profile phase=profile "
                  "error_code=profile_hierarchy_invalid\n";
@@ -413,7 +426,7 @@ bool print_profile(const ProfileCollector& collector, const std::uint64_t measur
                : static_cast<double>(value) /
                      static_cast<double>(totals.accepted_commands);
   };
-  const auto prepare_remainder = totals.wal.prepare_ns - prepare_children;
+  const auto prepare_remainder = totals.wal.prepare_task_ns - prepare_children;
   const auto plan_copy_remainder = totals.wal.plan_copy_ns - totals.wal.chunk_copy_ns;
   const auto completion_residence = [&collector](const auto selector) {
     std::vector<std::uint64_t> values;
@@ -500,6 +513,11 @@ bool print_profile(const ProfileCollector& collector, const std::uint64_t measur
             << " cycle_unattributed_ns_per_command=" << per_command(cycle_unattributed)
             << " wal_prepare_ns=" << totals.wal.prepare_ns
             << " wal_prepare_ns_per_command=" << per_command(totals.wal.prepare_ns)
+            << " wal_prepare_task_ns=" << totals.wal.prepare_task_ns
+            << " wal_prepare_task_ns_per_command="
+            << per_command(totals.wal.prepare_task_ns)
+            << " wal_parallel_prepare_groups=" << totals.wal.parallel_prepare_groups
+            << " wal_prepare_tasks=" << totals.wal.prepare_tasks
             << " wal_payload_encode_ns=" << totals.wal.payload_encode_ns
             << " wal_payload_encode_ns_per_command="
             << per_command(totals.wal.payload_encode_ns)
@@ -508,8 +526,9 @@ bool print_profile(const ProfileCollector& collector, const std::uint64_t measur
             << " wal_frame_assembly_ns=" << totals.wal.frame_assembly_ns
             << " wal_frame_assembly_ns_per_command="
             << per_command(totals.wal.frame_assembly_ns)
-            << " wal_prepare_remainder_ns=" << prepare_remainder
-            << " wal_prepare_remainder_ns_per_command=" << per_command(prepare_remainder)
+            << " wal_prepare_task_remainder_ns=" << prepare_remainder
+            << " wal_prepare_task_remainder_ns_per_command="
+            << per_command(prepare_remainder)
             << " wal_plan_copy_ns=" << totals.wal.plan_copy_ns
             << " wal_plan_copy_ns_per_command=" << per_command(totals.wal.plan_copy_ns)
             << " wal_chunk_copy_ns=" << totals.wal.chunk_copy_ns
@@ -548,7 +567,10 @@ bool run_engine_writer_hot_path_profile(const WriterProfileBenchmarkOptions& opt
   if (options.iterations == 0 || options.group_size == 0 ||
       options.group_size > kIngressCapacity ||
       options.group_delay.count() < 0 || options.producer_lanes == 0 ||
-      options.producer_lanes > kIngressCapacity || options.profile_sample_every == 0) {
+      options.producer_lanes > kIngressCapacity || options.profile_sample_every == 0 ||
+      (options.wal_prepare_workers != 1U && options.wal_prepare_workers != 2U &&
+       options.wal_prepare_workers != 4U) ||
+      options.wal_parallel_prepare_min_commands == 0U) {
     std::cerr << "workload=engine_writer_hot_path_profile phase=setup "
                  "error_code=invalid_profile_options\n";
     return false;
@@ -626,7 +648,9 @@ bool run_engine_writer_hot_path_profile(const WriterProfileBenchmarkOptions& opt
   }
   auto opened = runtime::ShardRuntime::open(
       1, config, event_sink, metrics_sink, options.profile ? &collector : nullptr,
-      runtime::WriterProfileOptions{options.profile_sample_every});
+      runtime::WriterProfileOptions{options.profile_sample_every},
+      storage::WalPrepareOptions{options.wal_prepare_workers,
+                                 options.wal_parallel_prepare_min_commands});
   if (std::holds_alternative<Error>(opened)) {
     std::cerr << "workload=engine_writer_hot_path_profile phase=open error_code=engine_open_failed\n";
     cleanup();
@@ -646,6 +670,7 @@ bool run_engine_writer_hot_path_profile(const WriterProfileBenchmarkOptions& opt
     cleanup();
     return false;
   }
+  const auto prepare_stats_before_measured = runtime->wal_prepare_stats();
   if (options.profile) {
     collector.reset();
     runtime->reset_writer_profile_phase();
@@ -653,6 +678,16 @@ bool run_engine_writer_hot_path_profile(const WriterProfileBenchmarkOptions& opt
   std::uint64_t measured_elapsed = 0;
   if (!run_phase(*runtime, state, *measured_commands, true, next_order_id, measured_elapsed)) {
     std::cerr << "workload=engine_writer_hot_path_profile phase=measured error_code=phase_failed\n";
+    (void)runtime->stop();
+    cleanup();
+    return false;
+  }
+  const auto prepare_stats_after_measured = runtime->wal_prepare_stats();
+  const auto actual_prepare_stats =
+      prepare_stats_delta(prepare_stats_before_measured, prepare_stats_after_measured);
+  if (!actual_prepare_stats.has_value()) {
+    std::cerr << "workload=engine_writer_hot_path_profile phase=measured "
+                 "error_code=wal_prepare_stats_regressed\n";
     (void)runtime->stop();
     cleanup();
     return false;
@@ -668,7 +703,10 @@ bool run_engine_writer_hot_path_profile(const WriterProfileBenchmarkOptions& opt
   runtime.reset();
 
   auto wal_result = storage::Wal::open(directory / "shard-1" / "wal", 1,
-                                       config.runtime.wal_segment_size);
+                                       config.runtime.wal_segment_size,
+                                       storage::WalPrepareOptions{
+                                           options.wal_prepare_workers,
+                                           options.wal_parallel_prepare_min_commands});
   if (std::holds_alternative<Error>(wal_result)) {
     std::cerr << "workload=engine_writer_hot_path_profile phase=recovery error_code=wal_reopen_failed\n";
     cleanup();
@@ -727,6 +765,11 @@ bool run_engine_writer_hot_path_profile(const WriterProfileBenchmarkOptions& opt
             << " group_size=" << options.group_size
             << " group_delay_us=" << options.group_delay.count()
             << " producer_lanes=" << options.producer_lanes
+            << " wal_prepare_workers=" << options.wal_prepare_workers
+            << " wal_parallel_prepare_min_commands="
+            << options.wal_parallel_prepare_min_commands
+            << " actual_parallel_prepare_groups=" << actual_prepare_stats->parallel_groups
+            << " actual_prepare_tasks=" << actual_prepare_stats->tasks
             << " wal_group_commits=" << snapshot.wal_group_commits
             << " wal_group_commands=" << snapshot.wal_group_commands
             << " actual_commands_per_group="

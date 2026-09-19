@@ -164,6 +164,46 @@ if(BUILD_TESTING)
   )
 
   add_test(
+    NAME order_books_benchmark_wal_prepare_workers_invalid
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--workload=wal_write_ceiling
+            -DCLI_ARGUMENT_2=--wal-prepare-workers=abc
+            -DEXPECTED_ERROR=wal_prepare_workers_invalid
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_wal_prepare_workers_unsupported
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--workload=wal_write_ceiling
+            -DCLI_ARGUMENT_2=--wal-prepare-workers=3
+            -DEXPECTED_ERROR=wal_prepare_workers_must_be_1_2_or_4
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_wal_prepare_min_commands_zero
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--workload=wal_write_ceiling
+            -DCLI_ARGUMENT_2=--wal-parallel-prepare-min-commands=0
+            -DEXPECTED_ERROR=wal_parallel_prepare_min_commands_must_be_positive
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_wal_prepare_options_requires_wal_or_writer
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--workload=engine_durable_single_instrument
+            -DCLI_ARGUMENT_2=--wal-prepare-workers=2
+            -DEXPECTED_ERROR=wal_prepare_options_requires_wal_or_writer_workload
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
     NAME order_books_benchmark_writer_phase_profile_off_smoke
     COMMAND $<TARGET_FILE:order_books_benchmark>
             --workload=engine_writer_hot_path_profile
@@ -197,5 +237,63 @@ if(BUILD_TESTING)
     PROPERTIES
       PASS_REGULAR_EXPRESSION
       "workload=engine_writer_hot_path_profile phase=profile.*profiled_groups=.*profiled_input_commands=4.*profiled_accepted_commands=4.*wal_lock_wait_ns=.*completion_service_rps=.*completion_max_queue_depth=.*"
+  )
+
+  add_test(
+    NAME order_books_benchmark_writer_parallel_prepare_smoke
+    COMMAND $<TARGET_FILE:order_books_benchmark>
+            --workload=engine_writer_hot_path_profile
+            --writer-phase-profile=on
+            --engine-group-size=4
+            --engine-group-delay-us=1000
+            --engine-producer-lanes=4
+            --wal-prepare-workers=4
+            --wal-parallel-prepare-min-commands=2
+            --iterations=2
+            --warmup=8
+  )
+  set_tests_properties(
+    order_books_benchmark_writer_parallel_prepare_smoke
+    PROPERTIES
+      PASS_REGULAR_EXPRESSION
+      "workload=engine_writer_hot_path_profile phase=summary.*actual_parallel_prepare_groups=[1-9][0-9]*.*actual_prepare_tasks=[1-9][0-9]*"
+  )
+
+  add_test(
+    NAME order_books_benchmark_wal_prepare_workers_two_smoke
+    COMMAND $<TARGET_FILE:order_books_benchmark>
+            --workload=wal_write_ceiling
+            --wal-prepare-workers=2
+            --wal-parallel-prepare-min-commands=2
+            --wal-sync=none
+            --wal-group-size=2
+            --iterations=2
+            --warmup=1
+  )
+  set_tests_properties(
+    order_books_benchmark_wal_prepare_workers_two_smoke
+    PROPERTIES
+      PASS_REGULAR_EXPRESSION
+      "wal_prepare_workers=2.*actual_parallel_prepare_groups=[1-9][0-9]*.*actual_prepare_tasks=[1-9][0-9]*.*replay_verified=true"
+  )
+
+  add_test(
+    NAME order_books_benchmark_writer_parallel_prepare_profile_off_smoke
+    COMMAND $<TARGET_FILE:order_books_benchmark>
+            --workload=engine_writer_hot_path_profile
+            --writer-phase-profile=off
+            --engine-group-size=4
+            --engine-group-delay-us=1000
+            --engine-producer-lanes=4
+            --wal-prepare-workers=4
+            --wal-parallel-prepare-min-commands=2
+            --iterations=2
+            --warmup=8
+  )
+  set_tests_properties(
+    order_books_benchmark_writer_parallel_prepare_profile_off_smoke
+    PROPERTIES
+      PASS_REGULAR_EXPRESSION
+      "workload=engine_writer_hot_path_profile phase=summary.*profile=off.*actual_parallel_prepare_groups=[1-9][0-9]*.*actual_prepare_tasks=[1-9][0-9]*"
   )
 endif()

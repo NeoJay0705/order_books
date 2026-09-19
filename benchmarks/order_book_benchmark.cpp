@@ -64,6 +64,8 @@ struct BenchmarkOptions {
   std::size_t engine_group_size{256};
   std::chrono::microseconds engine_group_delay{200};
   std::size_t engine_producer_lanes{kDurableProducerLanes};
+  std::size_t wal_prepare_workers{1};
+  std::size_t wal_parallel_prepare_min_commands{256};
   std::uint64_t writer_profile_sample_every{1};
   benchmark::PipelineStage pipeline_stage{benchmark::PipelineStage::all};
   std::size_t pipeline_batch_size{256};
@@ -73,6 +75,9 @@ struct BenchmarkOptions {
   std::chrono::microseconds publisher_cursor_persist_max_delay{1000};
   bool pipeline_options_set{};
   bool engine_producer_lanes_parse_error{};
+  bool wal_prepare_workers_parse_error{};
+  bool wal_prepare_min_commands_parse_error{};
+  bool wal_prepare_options_set{};
   bool wal_phase_profile_parse_error{};
   bool wal_phase_profile_option_set{};
   bool writer_phase_profile_parse_error{};
@@ -289,6 +294,23 @@ std::optional<BenchmarkOptions> parse_options(const int argc, char** argv) {
         options.engine_producer_lanes_parse_error = true;
       } else {
         options.engine_producer_lanes = static_cast<std::size_t>(*producer_lanes);
+      }
+    } else if (argument.starts_with("--wal-prepare-workers=")) {
+      options.wal_prepare_options_set = true;
+      const auto workers = parse_positive_option(argument, "--wal-prepare-workers=");
+      if (!workers.has_value() || *workers > std::numeric_limits<std::size_t>::max()) {
+        options.wal_prepare_workers_parse_error = true;
+      } else {
+        options.wal_prepare_workers = static_cast<std::size_t>(*workers);
+      }
+    } else if (argument.starts_with("--wal-parallel-prepare-min-commands=")) {
+      options.wal_prepare_options_set = true;
+      const auto minimum = parse_positive_option(
+          argument, "--wal-parallel-prepare-min-commands=");
+      if (!minimum.has_value() || *minimum > std::numeric_limits<std::size_t>::max()) {
+        options.wal_prepare_min_commands_parse_error = true;
+      } else {
+        options.wal_parallel_prepare_min_commands = static_cast<std::size_t>(*minimum);
       }
     } else if (const auto batch_size =
                    parse_positive_option(argument, "--pipeline-batch-size=")) {
@@ -694,6 +716,7 @@ struct WalGroupSamples {
   std::vector<std::uint64_t> wal_append_call_ns;
   std::vector<std::uint64_t> lock_wait_ns;
   std::vector<std::uint64_t> prepare_ns;
+  std::vector<std::uint64_t> prepare_task_ns;
   std::vector<std::uint64_t> plan_copy_ns;
   std::vector<std::uint64_t> rotation_ns;
   std::vector<std::uint64_t> write_ns;
@@ -703,6 +726,8 @@ struct WalGroupSamples {
   std::uint64_t profiled_frame_bytes{};
   std::uint64_t profiled_data_write_calls{};
   std::uint64_t profiled_rotations{};
+  std::uint64_t parallel_prepare_groups{};
+  std::uint64_t prepare_tasks{};
 };
 
 struct WalProfileTotals {
@@ -710,6 +735,7 @@ struct WalProfileTotals {
   std::uint64_t wal_append_call{};
   std::uint64_t lock_wait{};
   std::uint64_t prepare{};
+  std::uint64_t prepare_task{};
   std::uint64_t plan_copy{};
   std::uint64_t rotation{};
   std::uint64_t write{};
@@ -724,6 +750,16 @@ bool checked_add(std::uint64_t& target, const std::uint64_t value) {
   }
   target += value;
   return true;
+}
+
+std::optional<storage::WalPrepareStats> prepare_stats_delta(
+    const storage::WalPrepareStats& before,
+    const storage::WalPrepareStats& after) {
+  if (after.parallel_groups < before.parallel_groups || after.tasks < before.tasks) {
+    return std::nullopt;
+  }
+  return storage::WalPrepareStats{after.parallel_groups - before.parallel_groups,
+                                  after.tasks - before.tasks};
 }
 
 std::optional<std::uint64_t> checked_multiply(const std::uint64_t lhs,
@@ -750,6 +786,7 @@ std::optional<WalProfileTotals> profile_totals(const WalGroupSamples& samples) {
   const auto wal_append_call = sum_samples(samples.wal_append_call_ns);
   const auto lock_wait = sum_samples(samples.lock_wait_ns);
   const auto prepare = sum_samples(samples.prepare_ns);
+  const auto prepare_task = sum_samples(samples.prepare_task_ns);
   const auto plan_copy = sum_samples(samples.plan_copy_ns);
   const auto rotation = sum_samples(samples.rotation_ns);
   const auto write = sum_samples(samples.write_ns);
@@ -757,13 +794,15 @@ std::optional<WalProfileTotals> profile_totals(const WalGroupSamples& samples) {
   const auto sync = sum_samples(samples.sync_ns);
   const auto group_total = sum_samples(samples.total_ns);
   if (!fixture_build.has_value() || !wal_append_call.has_value() || !lock_wait.has_value() ||
-      !prepare.has_value() || !plan_copy.has_value() || !rotation.has_value() ||
+      !prepare.has_value() || !prepare_task.has_value() || !plan_copy.has_value() ||
+      !rotation.has_value() ||
       !write.has_value() || !publish.has_value() || !sync.has_value() ||
       !group_total.has_value()) {
     return std::nullopt;
   }
-  return WalProfileTotals{*fixture_build, *wal_append_call, *lock_wait, *prepare, *plan_copy,
-                          *rotation, *write, *publish, *sync, *group_total};
+  return WalProfileTotals{*fixture_build, *wal_append_call, *lock_wait, *prepare,
+                          *prepare_task, *plan_copy, *rotation, *write, *publish, *sync,
+                          *group_total};
 }
 
 std::uint64_t elapsed_ns(const std::chrono::steady_clock::time_point start,
@@ -843,6 +882,7 @@ bool run_wal_groups(storage::Wal& wal, const std::uint64_t group_count,
         samples->wal_append_call_ns.push_back(elapsed_ns(wal_call_start, append_end));
         samples->lock_wait_ns.push_back(profile.lock_wait_ns);
         samples->prepare_ns.push_back(profile.prepare_ns);
+        samples->prepare_task_ns.push_back(profile.prepare_task_ns);
         samples->plan_copy_ns.push_back(profile.plan_copy_ns);
         if (profile.rotations != 0U) {
           samples->rotation_ns.push_back(profile.rotation_ns);
@@ -855,7 +895,10 @@ bool run_wal_groups(storage::Wal& wal, const std::uint64_t group_count,
             !checked_add(samples->profiled_frame_bytes, profile.frame_bytes) ||
             !checked_add(samples->profiled_data_write_calls,
                          profile.data_write_calls) ||
-            !checked_add(samples->profiled_rotations, profile.rotations)) {
+            !checked_add(samples->profiled_rotations, profile.rotations) ||
+            !checked_add(samples->parallel_prepare_groups,
+                         profile.parallel_prepare_groups) ||
+            !checked_add(samples->prepare_tasks, profile.prepare_tasks)) {
           report_wal_error(phase, "profile_counter_overflow");
           return false;
         }
@@ -918,7 +961,10 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
     }
   };
 
-  auto wal_result = storage::Wal::open(data_directory, 1, kWalCeilingSegmentSize);
+  auto wal_result = storage::Wal::open(
+      data_directory, 1, kWalCeilingSegmentSize,
+      storage::WalPrepareOptions{options.wal_prepare_workers,
+                                 options.wal_parallel_prepare_min_commands});
   if (!std::holds_alternative<std::unique_ptr<storage::Wal>>(wal_result)) {
     report_wal_error("open", "wal_open_failed",
                      std::get<Error>(wal_result).message);
@@ -955,6 +1001,7 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
     cleanup();
     return false;
   }
+  const auto prepare_stats_before_measured = wal->prepare_stats();
 
   WalGroupSamples samples;
   if (options.iterations <= std::numeric_limits<std::size_t>::max()) {
@@ -969,6 +1016,7 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
       samples.wal_append_call_ns.reserve(sample_count);
       samples.lock_wait_ns.reserve(sample_count);
       samples.prepare_ns.reserve(sample_count);
+      samples.prepare_task_ns.reserve(sample_count);
       samples.plan_copy_ns.reserve(sample_count);
       samples.rotation_ns.reserve(sample_count);
       samples.write_ns.reserve(sample_count);
@@ -984,6 +1032,14 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
     return false;
   }
   const auto measured_end = std::chrono::steady_clock::now();
+  const auto prepare_stats_after_measured = wal->prepare_stats();
+  const auto actual_prepare_stats =
+      prepare_stats_delta(prepare_stats_before_measured, prepare_stats_after_measured);
+  if (!actual_prepare_stats.has_value()) {
+    report_wal_error("measured", "wal_prepare_stats_regressed");
+    cleanup();
+    return false;
+  }
   const auto ending_wal_bytes = wal->size_bytes();
   const auto ending_segment_count = count_wal_segments(data_directory);
   if (!ending_segment_count.has_value() || *ending_segment_count < *starting_segment_count ||
@@ -1004,7 +1060,10 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
   }
 
   wal.reset();
-  auto reopened_result = storage::Wal::open(data_directory, 1, kWalCeilingSegmentSize);
+  auto reopened_result = storage::Wal::open(
+      data_directory, 1, kWalCeilingSegmentSize,
+      storage::WalPrepareOptions{options.wal_prepare_workers,
+                                 options.wal_parallel_prepare_min_commands});
   if (!std::holds_alternative<std::unique_ptr<storage::Wal>>(reopened_result)) {
     report_wal_error("reopen", "wal_reopen_failed",
                      std::get<Error>(reopened_result).message);
@@ -1062,6 +1121,7 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
     std::sort(samples.wal_append_call_ns.begin(), samples.wal_append_call_ns.end());
     std::sort(samples.lock_wait_ns.begin(), samples.lock_wait_ns.end());
     std::sort(samples.prepare_ns.begin(), samples.prepare_ns.end());
+    std::sort(samples.prepare_task_ns.begin(), samples.prepare_task_ns.end());
     std::sort(samples.plan_copy_ns.begin(), samples.plan_copy_ns.end());
     std::sort(samples.rotation_ns.begin(), samples.rotation_ns.end());
     std::sort(samples.write_ns.begin(), samples.write_ns.end());
@@ -1076,6 +1136,7 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
         samples.wal_append_call_ns.size() != options.iterations ||
         samples.lock_wait_ns.size() != options.iterations ||
         samples.prepare_ns.size() != options.iterations ||
+        samples.prepare_task_ns.size() != options.iterations ||
         samples.plan_copy_ns.size() != options.iterations ||
         samples.rotation_ns.size() > options.iterations ||
         samples.write_ns.size() != options.iterations ||
@@ -1172,6 +1233,11 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
             << (options.wal_sync_mode == WalSyncMode::none ? "append_return" : "group_fsync")
             << " warmup_groups=" << options.warmup << " groups=" << options.iterations
             << " group_size=" << options.wal_group_size
+            << " wal_prepare_workers=" << options.wal_prepare_workers
+            << " wal_parallel_prepare_min_commands="
+            << options.wal_parallel_prepare_min_commands
+            << " actual_parallel_prepare_groups=" << actual_prepare_stats->parallel_groups
+            << " actual_prepare_tasks=" << actual_prepare_stats->tasks
             << " commands=" << options.iterations * options.wal_group_size
             << " commands_per_second=" << commands_per_second
             << " target_commands_per_second=1000000"
@@ -1217,6 +1283,8 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
               << (wal_bytes_delta - samples.profiled_frame_bytes)
               << " profiled_data_write_calls=" << samples.profiled_data_write_calls
               << " profiled_rotations=" << samples.profiled_rotations
+              << " parallel_prepare_groups=" << samples.parallel_prepare_groups
+              << " prepare_tasks=" << samples.prepare_tasks
               << " sync_total_us=" << totals.sync / 1'000.0
               << " group_total_us=" << totals.group_total / 1'000.0;
     print_profile_percentiles("fixture_build_group", samples.fixture_build_ns,
@@ -1225,6 +1293,8 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
                               totals.wal_append_call);
     print_profile_percentiles("wal_lock_wait_group", samples.lock_wait_ns, totals.lock_wait);
     print_profile_percentiles("wal_prepare_group", samples.prepare_ns, totals.prepare);
+    print_profile_percentiles("wal_prepare_task_group", samples.prepare_task_ns,
+                              totals.prepare_task);
     print_profile_percentiles("wal_plan_copy_group", samples.plan_copy_ns, totals.plan_copy);
     print_profile_percentiles("wal_rotation_group", samples.rotation_ns, totals.rotation);
     print_profile_percentiles("wal_write_group", samples.write_ns, totals.write);
@@ -1530,6 +1600,8 @@ void print_usage() {
                "[--writer-phase-profile=off|on] [--writer-profile-sample-every=N] "
                "[--engine-group-size=N] "
                "[--engine-group-delay-us=N] [--engine-producer-lanes=N] "
+               "[--wal-prepare-workers=1|2|4] "
+               "[--wal-parallel-prepare-min-commands=N] "
                "[--pipeline-stage=STAGE] "
                "[--pipeline-batch-size=N] [--pipeline-active-orders=N] "
                "[--pipeline-producer-lanes=N] "
@@ -1549,6 +1621,18 @@ int main(const int argc, char** argv) {
   if (options->engine_producer_lanes_parse_error) {
     std::cerr << "workload=" << workload_name(options->workload)
               << " phase=cli error_code=engine_producer_lanes_invalid\n";
+    print_usage();
+    return 2;
+  }
+  if (options->wal_prepare_workers_parse_error) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=wal_prepare_workers_invalid\n";
+    print_usage();
+    return 2;
+  }
+  if (options->wal_prepare_min_commands_parse_error) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=wal_parallel_prepare_min_commands_invalid\n";
     print_usage();
     return 2;
   }
@@ -1598,6 +1682,19 @@ int main(const int argc, char** argv) {
   if (options->engine_producer_lanes > kDurableIngressQueueCapacity) {
     std::cerr << "workload=" << workload_name(options->workload)
               << " phase=cli error_code=engine_producer_lanes_exceed_capacity\n";
+    print_usage();
+    return 2;
+  }
+  if (options->wal_prepare_workers != 1U && options->wal_prepare_workers != 2U &&
+      options->wal_prepare_workers != 4U) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=wal_prepare_workers_must_be_1_2_or_4\n";
+    print_usage();
+    return 2;
+  }
+  if (options->wal_parallel_prepare_min_commands == 0U) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=wal_parallel_prepare_min_commands_must_be_positive\n";
     print_usage();
     return 2;
   }
@@ -1658,6 +1755,14 @@ int main(const int argc, char** argv) {
       options->workload != WorkloadSelection::engine_writer_hot_path_profile) {
     std::cerr << "workload=" << workload_name(options->workload)
               << " phase=cli error_code=writer_profile_sample_requires_writer_profile_workload\n";
+    print_usage();
+    return 2;
+  }
+  if (options->wal_prepare_options_set &&
+      options->workload != WorkloadSelection::wal_write_ceiling &&
+      options->workload != WorkloadSelection::engine_writer_hot_path_profile) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=wal_prepare_options_requires_wal_or_writer_workload\n";
     print_usage();
     return 2;
   }
@@ -1729,6 +1834,8 @@ int main(const int argc, char** argv) {
         options->engine_group_size,
         options->engine_group_delay,
         options->engine_producer_lanes,
+        options->wal_prepare_workers,
+        options->wal_parallel_prepare_min_commands,
         options->writer_phase_profile == WriterPhaseProfileMode::on,
         options->writer_profile_sample_every,
         options->data_directory,

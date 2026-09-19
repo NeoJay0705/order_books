@@ -14,6 +14,8 @@ struct WriterProfileBenchmarkOptions {
   std::size_t group_size{};
   std::chrono::microseconds group_delay{};
   std::size_t producer_lanes{};
+  std::size_t wal_prepare_workers{1};
+  std::size_t wal_parallel_prepare_min_commands{256};
   bool profile{};
   std::uint64_t profile_sample_every{1};
   std::optional<std::filesystem::path> data_directory;
