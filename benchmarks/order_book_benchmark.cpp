@@ -24,6 +24,7 @@
 #include "domain/invariant_checker.hpp"
 #include "domain/state_machine.hpp"
 #include "order_books/engine.hpp"
+#include "engine_writer_profile_benchmark.hpp"
 #include "pipeline_ceiling_benchmark.hpp"
 #include "persistence/snapshot_store.hpp"
 #include "persistence/wal.hpp"
@@ -45,10 +46,12 @@ enum class WorkloadSelection {
   engine_durable_single_instrument,
   wal_write_ceiling,
   engine_pipeline_ceiling,
+  engine_writer_hot_path_profile,
 };
 
 enum class WalSyncMode { none, per_group };
 enum class WalPhaseProfileMode { off, on };
+enum class WriterPhaseProfileMode { off, on };
 
 struct BenchmarkOptions {
   std::uint64_t iterations{kIterations};
@@ -57,9 +60,11 @@ struct BenchmarkOptions {
   std::uint64_t wal_group_size{256};
   WalSyncMode wal_sync_mode{WalSyncMode::per_group};
   WalPhaseProfileMode wal_phase_profile{WalPhaseProfileMode::off};
+  WriterPhaseProfileMode writer_phase_profile{WriterPhaseProfileMode::off};
   std::size_t engine_group_size{256};
   std::chrono::microseconds engine_group_delay{200};
   std::size_t engine_producer_lanes{kDurableProducerLanes};
+  std::uint64_t writer_profile_sample_every{1};
   benchmark::PipelineStage pipeline_stage{benchmark::PipelineStage::all};
   std::size_t pipeline_batch_size{256};
   std::size_t pipeline_active_orders{};
@@ -70,6 +75,10 @@ struct BenchmarkOptions {
   bool engine_producer_lanes_parse_error{};
   bool wal_phase_profile_parse_error{};
   bool wal_phase_profile_option_set{};
+  bool writer_phase_profile_parse_error{};
+  bool writer_phase_profile_option_set{};
+  bool writer_profile_sample_parse_error{};
+  bool writer_profile_sample_option_set{};
   std::optional<std::filesystem::path> data_directory;
 };
 
@@ -203,6 +212,9 @@ std::optional<WorkloadSelection> parse_workload(const std::string_view value) {
   if (value == "engine_pipeline_ceiling") {
     return WorkloadSelection::engine_pipeline_ceiling;
   }
+  if (value == "engine_writer_hot_path_profile") {
+    return WorkloadSelection::engine_writer_hot_path_profile;
+  }
   return std::nullopt;
 }
 
@@ -216,6 +228,8 @@ std::string_view workload_name(const WorkloadSelection workload) {
       return "wal_write_ceiling";
     case WorkloadSelection::engine_pipeline_ceiling:
       return "engine_pipeline_ceiling";
+    case WorkloadSelection::engine_writer_hot_path_profile:
+      return "engine_writer_hot_path_profile";
   }
   return "unknown";
 }
@@ -237,6 +251,17 @@ std::optional<WalPhaseProfileMode> parse_wal_phase_profile(
   }
   if (value == "on") {
     return WalPhaseProfileMode::on;
+  }
+  return std::nullopt;
+}
+
+std::optional<WriterPhaseProfileMode> parse_writer_phase_profile(
+    const std::string_view value) {
+  if (value == "off") {
+    return WriterPhaseProfileMode::off;
+  }
+  if (value == "on") {
+    return WriterPhaseProfileMode::on;
   }
   return std::nullopt;
 }
@@ -314,6 +339,24 @@ std::optional<BenchmarkOptions> parse_options(const int argc, char** argv) {
         options.wal_phase_profile_parse_error = true;
       } else {
         options.wal_phase_profile = *profile;
+      }
+    } else if (argument.starts_with("--writer-phase-profile=")) {
+      options.writer_phase_profile_option_set = true;
+      const auto profile = parse_writer_phase_profile(
+          argument.substr(std::string_view("--writer-phase-profile=").size()));
+      if (!profile.has_value()) {
+        options.writer_phase_profile_parse_error = true;
+      } else {
+        options.writer_phase_profile = *profile;
+      }
+    } else if (argument.starts_with("--writer-profile-sample-every=")) {
+      options.writer_profile_sample_option_set = true;
+      const auto sample_every = parse_positive_option(
+          argument, "--writer-profile-sample-every=");
+      if (!sample_every.has_value()) {
+        options.writer_profile_sample_parse_error = true;
+      } else {
+        options.writer_profile_sample_every = *sample_every;
       }
     } else if (argument.starts_with("--data-dir=")) {
       const auto path = argument.substr(std::string_view("--data-dir=").size());
@@ -1481,8 +1524,10 @@ bool run_engine_durable_single_instrument(const BenchmarkOptions& options) {
 void print_usage() {
   std::cerr << "usage: order_books_benchmark [--iterations=N] [--warmup=N] "
                "[--workload=all|engine_durable_single_instrument|wal_write_ceiling|"
-               "engine_pipeline_ceiling] [--data-dir=PATH] [--wal-group-size=N] "
+               "engine_pipeline_ceiling|engine_writer_hot_path_profile] [--data-dir=PATH] "
+               "[--wal-group-size=N] "
                "[--wal-sync=none|per_group] [--wal-phase-profile=off|on] "
+               "[--writer-phase-profile=off|on] [--writer-profile-sample-every=N] "
                "[--engine-group-size=N] "
                "[--engine-group-delay-us=N] [--engine-producer-lanes=N] "
                "[--pipeline-stage=STAGE] "
@@ -1513,6 +1558,19 @@ int main(const int argc, char** argv) {
     print_usage();
     return 2;
   }
+  if (options->writer_phase_profile_parse_error) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=writer_phase_profile_invalid\n";
+    print_usage();
+    return 2;
+  }
+  if (options->writer_profile_sample_parse_error ||
+      options->writer_profile_sample_every == 0) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=writer_profile_sample_every_invalid\n";
+    print_usage();
+    return 2;
+  }
   if (options->iterations == 0) {
     std::cerr << "workload=" << workload_name(options->workload)
               << " phase=cli error_code=iterations_must_be_positive\n";
@@ -1540,6 +1598,13 @@ int main(const int argc, char** argv) {
   if (options->engine_producer_lanes > kDurableIngressQueueCapacity) {
     std::cerr << "workload=" << workload_name(options->workload)
               << " phase=cli error_code=engine_producer_lanes_exceed_capacity\n";
+    print_usage();
+    return 2;
+  }
+  if (options->workload == WorkloadSelection::engine_writer_hot_path_profile &&
+      options->engine_group_size > kDurableIngressQueueCapacity) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=engine_group_size_exceed_capacity\n";
     print_usage();
     return 2;
   }
@@ -1579,6 +1644,28 @@ int main(const int argc, char** argv) {
       options->workload != WorkloadSelection::wal_write_ceiling) {
     std::cerr << "workload=" << workload_name(options->workload)
               << " phase=cli error_code=wal_phase_profile_requires_wal_workload\n";
+    print_usage();
+    return 2;
+  }
+  if (options->writer_phase_profile_option_set &&
+      options->workload != WorkloadSelection::engine_writer_hot_path_profile) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=writer_phase_profile_requires_writer_profile_workload\n";
+    print_usage();
+    return 2;
+  }
+  if (options->writer_profile_sample_option_set &&
+      options->workload != WorkloadSelection::engine_writer_hot_path_profile) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=writer_profile_sample_requires_writer_profile_workload\n";
+    print_usage();
+    return 2;
+  }
+  if (options->writer_profile_sample_option_set &&
+      (!options->writer_phase_profile_option_set ||
+       options->writer_phase_profile != WriterPhaseProfileMode::on)) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=writer_profile_sample_requires_profile_on\n";
     print_usage();
     return 2;
   }
@@ -1634,6 +1721,19 @@ int main(const int argc, char** argv) {
         options->data_directory,
     };
     return benchmark::run_pipeline_ceiling(pipeline_options, options->pipeline_stage) ? 0 : 1;
+  }
+  if (options->workload == WorkloadSelection::engine_writer_hot_path_profile) {
+    const benchmark::WriterProfileBenchmarkOptions writer_options{
+        options->iterations,
+        options->warmup,
+        options->engine_group_size,
+        options->engine_group_delay,
+        options->engine_producer_lanes,
+        options->writer_phase_profile == WriterPhaseProfileMode::on,
+        options->writer_profile_sample_every,
+        options->data_directory,
+    };
+    return benchmark::run_engine_writer_hot_path_profile(writer_options) ? 0 : 1;
   }
 
   OrderBook resting(1);

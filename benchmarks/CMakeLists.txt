@@ -1,5 +1,6 @@
 add_executable(order_books_benchmark
   order_book_benchmark.cpp
+  engine_writer_profile_benchmark.cpp
   pipeline_ceiling_benchmark.cpp
 )
 
@@ -122,5 +123,79 @@ if(BUILD_TESTING)
     order_books_benchmark_wal_phase_profile_per_group_smoke
     PROPERTIES
       PASS_REGULAR_EXPRESSION "sync_samples=2.*replay_verified=true.*phase_profile=on.*sync_total_us="
+  )
+  add_test(
+    NAME order_books_benchmark_writer_phase_profile_invalid
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--workload=engine_writer_hot_path_profile
+            -DCLI_ARGUMENT_2=--writer-phase-profile=invalid
+            -DEXPECTED_ERROR=writer_phase_profile_invalid
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_writer_phase_profile_empty
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--workload=engine_writer_hot_path_profile
+            -DCLI_ARGUMENT_2=--writer-phase-profile=
+            -DEXPECTED_ERROR=writer_phase_profile_invalid
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_writer_group_size_over_capacity
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--workload=engine_writer_hot_path_profile
+            -DCLI_ARGUMENT_2=--engine-group-size=65537
+            -DEXPECTED_ERROR=engine_group_size_exceed_capacity
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_writer_phase_profile_requires_writer_workload
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--writer-phase-profile=on
+            -DEXPECTED_ERROR=writer_phase_profile_requires_writer_profile_workload
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_writer_phase_profile_off_smoke
+    COMMAND $<TARGET_FILE:order_books_benchmark>
+            --workload=engine_writer_hot_path_profile
+            --writer-phase-profile=off
+            --engine-group-size=2
+            --engine-group-delay-us=0
+            --engine-producer-lanes=2
+            --iterations=2
+            --warmup=1
+  )
+  set_tests_properties(
+    order_books_benchmark_writer_phase_profile_off_smoke
+    PROPERTIES
+      PASS_REGULAR_EXPRESSION
+      "workload=engine_writer_hot_path_profile phase=summary.*profile=off.*correctness_verified=true"
+  )
+
+  add_test(
+    NAME order_books_benchmark_writer_phase_profile_on_smoke
+    COMMAND $<TARGET_FILE:order_books_benchmark>
+            --workload=engine_writer_hot_path_profile
+            --writer-phase-profile=on
+            --engine-group-size=2
+            --engine-group-delay-us=0
+            --engine-producer-lanes=2
+            --iterations=2
+            --warmup=8
+  )
+  set_tests_properties(
+    order_books_benchmark_writer_phase_profile_on_smoke
+    PROPERTIES
+      PASS_REGULAR_EXPRESSION
+      "workload=engine_writer_hot_path_profile phase=profile.*profiled_groups=.*profiled_input_commands=4.*profiled_accepted_commands=4.*wal_lock_wait_ns=.*completion_service_rps=.*completion_max_queue_depth=.*"
   )
 endif()

@@ -25,6 +25,14 @@ std::uint64_t profile_elapsed_ns(const ProfileClock::time_point start,
       std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
 }
 
+void add_profile_ns(std::uint64_t& target, const std::uint64_t value) {
+  if (target > std::numeric_limits<std::uint64_t>::max() - value) {
+    target = std::numeric_limits<std::uint64_t>::max();
+    return;
+  }
+  target += value;
+}
+
 constexpr std::uint16_t kRecordVersion = 1;
 constexpr std::size_t kHeaderSize = 22;
 constexpr std::size_t kMaxRecordSize = 1U * 1024U * 1024U;
@@ -111,12 +119,33 @@ Result<EngineSeq> segment_sequence_checked(const std::filesystem::path& path) {
 }
 
 Result<std::vector<std::byte>> encode_frame(
-    const domain::CommittedCommand& command) {
+    const domain::CommittedCommand& command, WalAppendProfile* profile) {
+  const auto payload_start = profile == nullptr ? ProfileClock::time_point{}
+                                                : ProfileClock::now();
   const auto payload = encode_committed_command(command);
+  if (profile != nullptr) {
+    add_profile_ns(profile->payload_encode_ns,
+                   profile_elapsed_ns(payload_start, ProfileClock::now()));
+    add_profile_ns(profile->payload_bytes,
+                   static_cast<std::uint64_t>(payload.size()));
+  }
+
+  const auto assembly_before_crc_start =
+      profile == nullptr ? ProfileClock::time_point{} : ProfileClock::now();
   BinaryWriter body_writer;
   body_writer.u16(kRecordVersion);
   body_writer.data().insert(body_writer.data().end(), payload.begin(), payload.end());
+
+  const auto crc_start = profile == nullptr ? ProfileClock::time_point{}
+                                            : ProfileClock::now();
   const auto body_crc = crc32c(body_writer.data());
+  const auto crc_end = profile == nullptr ? ProfileClock::time_point{}
+                                          : ProfileClock::now();
+  if (profile != nullptr) {
+    add_profile_ns(profile->frame_assembly_ns,
+                   profile_elapsed_ns(assembly_before_crc_start, crc_start));
+    add_profile_ns(profile->crc_ns, profile_elapsed_ns(crc_start, crc_end));
+  }
   body_writer.u32(body_crc);
   const auto& body = body_writer.data();
   if (body.size() > kMaxRecordSize) {
@@ -126,6 +155,10 @@ Result<std::vector<std::byte>> encode_frame(
   BinaryWriter frame_writer;
   frame_writer.u32(static_cast<std::uint32_t>(body.size()));
   frame_writer.data().insert(frame_writer.data().end(), body.begin(), body.end());
+  if (profile != nullptr) {
+    add_profile_ns(profile->frame_assembly_ns,
+                   profile_elapsed_ns(crc_end, ProfileClock::now()));
+  }
   return frame_writer.data();
 }
 
@@ -316,11 +349,12 @@ Status Wal::rebuild_record_index_unlocked() {
 }
 
 Result<std::vector<Wal::PreparedRecord>> Wal::prepare_records_unlocked(
-    const std::span<const domain::CommittedCommand> commands) const {
+    const std::span<const domain::CommittedCommand> commands,
+    WalAppendProfile* profile) const {
   std::vector<PreparedRecord> records;
   records.reserve(commands.size());
   for (const auto& command : commands) {
-    auto frame = encode_frame(command);
+    auto frame = encode_frame(command, profile);
     if (std::holds_alternative<Error>(frame)) {
       return std::get<Error>(frame);
     }
@@ -337,7 +371,7 @@ Result<std::vector<Wal::PreparedRecord>> Wal::prepare_records_unlocked(
 Result<WalPosition> Wal::append(const domain::CommittedCommand& command) {
   std::lock_guard lock(mutex_);
   const std::span<const domain::CommittedCommand> commands(&command, 1);
-  auto prepared = prepare_records_unlocked(commands);
+  auto prepared = prepare_records_unlocked(commands, nullptr);
   if (std::holds_alternative<Error>(prepared)) {
     return std::get<Error>(prepared);
   }
@@ -372,7 +406,7 @@ Result<WalPosition> Wal::append_batch_unlocked(
   }
   const auto prepare_start = profile == nullptr ? ProfileClock::time_point{}
                                                 : ProfileClock::now();
-  auto prepared = prepare_records_unlocked(commands);
+  auto prepared = prepare_records_unlocked(commands, profile);
   if (std::holds_alternative<Error>(prepared)) {
     return std::get<Error>(prepared);
   }
@@ -473,11 +507,17 @@ Result<WalPosition> Wal::append_prepared_unlocked(
       rotate_before = true;
       continue;
     }
+    const auto copy_start = profile != nullptr ? ProfileClock::now()
+                                               : ProfileClock::time_point{};
     std::vector<std::byte> bytes;
     bytes.reserve(static_cast<std::size_t>(chunk_bytes));
     for (std::size_t index = first_record; index < end_record; ++index) {
       const auto& frame = records[index].frame;
       bytes.insert(bytes.end(), frame.begin(), frame.end());
+    }
+    if (profile != nullptr) {
+      add_profile_ns(profile->chunk_copy_ns,
+                     profile_elapsed_ns(copy_start, ProfileClock::now()));
     }
     chunks.push_back(PreparedChunk{first_record, end_record - first_record,
                                    rotate_before, std::move(bytes)});
@@ -508,11 +548,12 @@ Result<WalPosition> Wal::append_prepared_unlocked(
         return std::get<Error>(status);
       }
       if (profile != nullptr) {
-        ++profile->rotations;
+        add_profile_ns(profile->rotations, 1U);
       }
     }
     if (profile != nullptr && chunk.rotate_before) {
-      profile->rotation_ns += profile_elapsed_ns(rotation_start, ProfileClock::now());
+      add_profile_ns(profile->rotation_ns,
+                     profile_elapsed_ns(rotation_start, ProfileClock::now()));
     }
     if (active_descriptor_ < 0) {
       return wal_error(ErrorCode::wal_failure, "active WAL descriptor is not open");
@@ -524,8 +565,9 @@ Result<WalPosition> Wal::append_prepared_unlocked(
       return std::get<Error>(status);
     }
     if (profile != nullptr) {
-      profile->write_ns += profile_elapsed_ns(write_start, ProfileClock::now());
-      ++profile->data_write_calls;
+      add_profile_ns(profile->write_ns,
+                     profile_elapsed_ns(write_start, ProfileClock::now()));
+      add_profile_ns(profile->data_write_calls, 1U);
     }
     const auto publish_start = profile == nullptr ? ProfileClock::time_point{}
                                                   : ProfileClock::now();
@@ -541,7 +583,8 @@ Result<WalPosition> Wal::append_prepared_unlocked(
     }
     active_dirty_ = true;
     if (profile != nullptr) {
-      profile->publish_ns += profile_elapsed_ns(publish_start, ProfileClock::now());
+      add_profile_ns(profile->publish_ns,
+                     profile_elapsed_ns(publish_start, ProfileClock::now()));
     }
   }
   return last_position;

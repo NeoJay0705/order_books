@@ -28,10 +28,15 @@ struct WalAppendProfile {
   std::uint64_t lock_wait_ns{};
   std::uint64_t prepare_ns{};
   std::uint64_t plan_copy_ns{};
+  std::uint64_t payload_encode_ns{};
+  std::uint64_t crc_ns{};
+  std::uint64_t frame_assembly_ns{};
+  std::uint64_t chunk_copy_ns{};
   std::uint64_t rotation_ns{};
   std::uint64_t write_ns{};
   std::uint64_t publish_ns{};
   std::uint64_t frame_bytes{};
+  std::uint64_t payload_bytes{};
   std::uint64_t data_write_calls{};
   std::uint64_t rotations{};
 };
@@ -87,7 +92,8 @@ class Wal {
   };
 
   Result<std::vector<PreparedRecord>> prepare_records_unlocked(
-      std::span<const domain::CommittedCommand> commands) const;
+      std::span<const domain::CommittedCommand> commands,
+      WalAppendProfile* profile) const;
   Result<WalPosition> append_batch_unlocked(
       std::span<const domain::CommittedCommand> commands,
       WalAppendProfile* profile);

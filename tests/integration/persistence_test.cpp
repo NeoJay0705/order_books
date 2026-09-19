@@ -321,6 +321,13 @@ TEST(PersistenceTest, WalProfiledBatchPreservesRecordAndPhaseBoundaries) {
   EXPECT_EQ(normal_position.end_offset, profiled_position.end_offset);
   EXPECT_EQ(normal_wal->size_bytes(), profiled_wal->size_bytes());
   EXPECT_EQ(profile.frame_bytes, expected_frame_bytes);
+  std::uint64_t expected_payload_bytes = 0;
+  for (const auto& record : commands) {
+    expected_payload_bytes += encode_committed_command(record).size();
+  }
+  EXPECT_EQ(profile.payload_bytes, expected_payload_bytes);
+  EXPECT_LE(profile.payload_bytes, profile.frame_bytes);
+  EXPECT_LE(profile.chunk_copy_ns, profile.plan_copy_ns);
   EXPECT_EQ(profile.data_write_calls, 1U);
   EXPECT_EQ(profile.rotations, 0U);
   EXPECT_EQ(profiled_wal->durable_position().engine_seq, 0U);
@@ -390,10 +397,15 @@ TEST(PersistenceTest, WalProfiledEmptyBatchClearsProfileAndChangesNothing) {
   profile.lock_wait_ns = 99U;
   profile.prepare_ns = 99U;
   profile.plan_copy_ns = 99U;
+  profile.payload_encode_ns = 99U;
+  profile.crc_ns = 99U;
+  profile.frame_assembly_ns = 99U;
+  profile.chunk_copy_ns = 99U;
   profile.rotation_ns = 99U;
   profile.write_ns = 99U;
   profile.publish_ns = 99U;
   profile.frame_bytes = 99U;
+  profile.payload_bytes = 99U;
   profile.data_write_calls = 99U;
   profile.rotations = 99U;
   const std::span<const domain::CommittedCommand> empty;
@@ -404,10 +416,15 @@ TEST(PersistenceTest, WalProfiledEmptyBatchClearsProfileAndChangesNothing) {
   EXPECT_EQ(profile.lock_wait_ns, 0U);
   EXPECT_EQ(profile.prepare_ns, 0U);
   EXPECT_EQ(profile.plan_copy_ns, 0U);
+  EXPECT_EQ(profile.payload_encode_ns, 0U);
+  EXPECT_EQ(profile.crc_ns, 0U);
+  EXPECT_EQ(profile.frame_assembly_ns, 0U);
+  EXPECT_EQ(profile.chunk_copy_ns, 0U);
   EXPECT_EQ(profile.rotation_ns, 0U);
   EXPECT_EQ(profile.write_ns, 0U);
   EXPECT_EQ(profile.publish_ns, 0U);
   EXPECT_EQ(profile.frame_bytes, 0U);
+  EXPECT_EQ(profile.payload_bytes, 0U);
   EXPECT_EQ(profile.data_write_calls, 0U);
   EXPECT_EQ(profile.rotations, 0U);
   EXPECT_EQ(wal->size_bytes(), before_size);

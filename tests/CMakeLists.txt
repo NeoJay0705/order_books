@@ -7,6 +7,7 @@ add_executable(order_books_tests
   integration/codec_test.cpp
   integration/engine_durable_single_instrument_test.cpp
   integration/engine_pipeline_ceiling_test.cpp
+  integration/engine_writer_profile_test.cpp
   integration/event_publisher_test.cpp
   integration/engine_test.cpp
   integration/persistence_test.cpp

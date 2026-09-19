@@ -28,6 +28,20 @@ Timestamp now_ns() noexcept {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
 }
 
+std::uint64_t steady_elapsed_ns(const std::chrono::steady_clock::time_point start,
+                               const std::chrono::steady_clock::time_point end) noexcept {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+}
+
+void saturating_add(std::uint64_t& target, const std::uint64_t value) noexcept {
+  if (target > std::numeric_limits<std::uint64_t>::max() - value) {
+    target = std::numeric_limits<std::uint64_t>::max();
+    return;
+  }
+  target += value;
+}
+
 domain::ShardState genesis_state(const ShardId shard_id, const EngineConfig& config) {
   domain::ShardState state;
   state.shard_id = shard_id;
@@ -212,7 +226,8 @@ class ScopeGuard final {
 
 Result<std::unique_ptr<ShardRuntime>> ShardRuntime::open(
     const ShardId shard_id, const EngineConfig& config, EventSink& event_sink,
-    MetricsSink& metrics_sink) {
+    MetricsSink& metrics_sink, WriterProfileCollector* profile,
+    const WriterProfileOptions profile_options) {
   if (config.data_directory.empty()) {
     return invalid_config_error("data directory is empty");
   }
@@ -224,6 +239,9 @@ Result<std::unique_ptr<ShardRuntime>> ShardRuntime::open(
   if (config.runtime.publisher_cursor_persist_max_commands == 0 ||
       config.runtime.publisher_cursor_persist_max_delay.count() <= 0) {
     return invalid_config_error("publisher cursor persistence limits are invalid");
+  }
+  if (profile != nullptr && profile_options.sample_every == 0) {
+    return invalid_config_error("writer profile sample interval is zero");
   }
 
   auto state = genesis_state(shard_id, config);
@@ -386,7 +404,8 @@ Result<std::unique_ptr<ShardRuntime>> ShardRuntime::open(
 
   return std::unique_ptr<ShardRuntime>(new ShardRuntime(
       shard_id, config, std::move(metrics_registry), std::move(publisher_metrics),
-      std::move(wal), std::move(snapshots), std::move(state_machine), std::move(publisher)));
+      std::move(wal), std::move(snapshots), std::move(state_machine), std::move(publisher),
+      profile, profile_options));
 }
 
 ShardRuntime::ShardRuntime(ShardId shard_id, EngineConfig config,
@@ -395,7 +414,9 @@ ShardRuntime::ShardRuntime(ShardId shard_id, EngineConfig config,
                            std::unique_ptr<storage::Wal> wal,
                            storage::SnapshotStore snapshots,
                            domain::StateMachine state_machine,
-                           std::unique_ptr<EventPublisher> publisher)
+                           std::unique_ptr<EventPublisher> publisher,
+                           WriterProfileCollector* profile,
+                           const WriterProfileOptions profile_options)
     : shard_id_(shard_id),
       config_(std::move(config)),
       metrics_registry_(std::move(metrics_registry)),
@@ -404,6 +425,8 @@ ShardRuntime::ShardRuntime(ShardId shard_id, EngineConfig config,
       snapshots_(std::move(snapshots)),
       state_machine_(std::move(state_machine)),
       publisher_(std::move(publisher)),
+      profile_(profile),
+      profile_options_(profile_options),
       last_snapshot_time_(std::chrono::steady_clock::now()) {}
 
 ShardRuntime::~ShardRuntime() { (void)stop(); }
@@ -418,6 +441,15 @@ void ShardRuntime::start() {
   completion_worker_ = std::jthread(
       [this](std::stop_token token) { completion_run(token); });
   worker_ = std::jthread([this](std::stop_token token) { run(token); });
+}
+
+void ShardRuntime::set_writer_profile_phase_active(const bool active) noexcept {
+  profile_phase_active_.store(active, std::memory_order_release);
+}
+
+void ShardRuntime::reset_writer_profile_phase() noexcept {
+  profile_groups_seen_.store(0, std::memory_order_release);
+  profile_phase_active_.store(true, std::memory_order_release);
 }
 
 SubmitResult ShardRuntime::submit(Command command, CompletionHandler completion) {
@@ -581,6 +613,8 @@ Status ShardRuntime::stop() {
 
 void ShardRuntime::run(const std::stop_token stop_token) {
   for (;;) {
+    std::chrono::steady_clock::time_point profile_group_start{};
+    bool profile_sampled = false;
     Work first;
     {
       std::unique_lock lock(queue_mutex_);
@@ -603,8 +637,18 @@ void ShardRuntime::run(const std::stop_token stop_token) {
       continue;
     }
 
+    if (profile_ != nullptr && profile_phase_active_.load(std::memory_order_acquire)) {
+      const auto group_index = profile_groups_seen_.fetch_add(1, std::memory_order_relaxed);
+      profile_sampled = group_index % profile_options_.sample_every == 0;
+      profile_->observe_profile_group(profile_sampled);
+    }
+    if (profile_sampled) {
+      profile_group_start = std::chrono::steady_clock::now();
+    }
+
     std::vector<CommandWork> batch;
     batch.push_back(std::move(std::get<CommandWork>(first)));
+    std::uint64_t profile_group_wait_ns = 0;
     const auto deadline = std::chrono::steady_clock::now() +
                           config_.runtime.group_commit_max_delay;
     while (batch.size() < config_.runtime.group_commit_max_commands) {
@@ -618,9 +662,16 @@ void ShardRuntime::run(const std::stop_token stop_token) {
       if (stop_token.stop_requested() || stopping_ || config_.runtime.group_commit_max_delay.count() == 0) {
         break;
       }
-      if (queue_condition_.wait_until(lock, stop_token, deadline, [this] {
-            return stopping_ || failed_ || !queue_.empty();
-          }) &&
+      const auto wait_start = profile_sampled ? std::chrono::steady_clock::now()
+                                                   : std::chrono::steady_clock::time_point{};
+      const bool woke = queue_condition_.wait_until(lock, stop_token, deadline, [this] {
+        return stopping_ || failed_ || !queue_.empty();
+      });
+      if (profile_sampled) {
+        saturating_add(profile_group_wait_ns,
+                       steady_elapsed_ns(wait_start, std::chrono::steady_clock::now()));
+      }
+      if (woke &&
           !queue_.empty() && std::holds_alternative<CommandWork>(queue_.front())) {
         batch.push_back(std::move(std::get<CommandWork>(queue_.front())));
         queue_.pop_front();
@@ -630,7 +681,14 @@ void ShardRuntime::run(const std::stop_token stop_token) {
       break;
     }
     try {
-      process_command_batch(std::move(batch));
+      const auto profile_group_collect_ns = profile_sampled
+                                                ? steady_elapsed_ns(
+                                                      profile_group_start,
+                                                      std::chrono::steady_clock::now())
+                                                : 0U;
+      process_command_batch(std::move(batch), profile_group_start,
+                            profile_group_collect_ns, profile_group_wait_ns,
+                            profile_sampled);
     } catch (...) {
       fail(Error{ErrorCode::engine_unavailable, "unexpected shard exception"});
     }
@@ -682,7 +740,11 @@ void ShardRuntime::completion_run(const std::stop_token stop_token) {
   }
 }
 
-void ShardRuntime::process_command_batch(std::vector<CommandWork> batch) {
+void ShardRuntime::process_command_batch(std::vector<CommandWork> batch,
+                                         const std::chrono::steady_clock::time_point group_start,
+                                         const std::uint64_t group_collect_ns,
+                                         const std::uint64_t group_wait_ns,
+                                         const bool profile_sampled) {
   if (publisher_->failed()) {
     for (auto& work : batch) {
       auto result = admission_error(work.command, ErrorCode::engine_unavailable);
@@ -691,6 +753,9 @@ void ShardRuntime::process_command_batch(std::vector<CommandWork> batch) {
     fail(Error{ErrorCode::engine_unavailable, "event publisher failed"});
     return;
   }
+  const auto service_start = profile_sampled ? std::chrono::steady_clock::now()
+                                                 : std::chrono::steady_clock::time_point{};
+  const auto admission_start = service_start;
   std::vector<CompletionHandler> batch_completions;
   std::vector<domain::CommittedCommand> accepted;
   std::vector<std::chrono::steady_clock::time_point> enqueued_times;
@@ -708,10 +773,10 @@ void ShardRuntime::process_command_batch(std::vector<CommandWork> batch) {
       }
     }
   };
-  const auto dispatch_results = [&] {
+  const auto dispatch_results = [&](const bool profile_completion) {
     for (std::size_t index = 0; index < batch_completions.size(); ++index) {
       if (batch_completions[index] && results[index].has_value()) {
-        dispatch(std::move(*results[index]), batch_completions[index]);
+        dispatch(std::move(*results[index]), batch_completions[index], profile_completion);
       }
     }
   };
@@ -870,8 +935,16 @@ void ShardRuntime::process_command_batch(std::vector<CommandWork> batch) {
     batch_producers.emplace(key);
   }
 
+  const auto admission_ns = profile_sampled
+                                ? steady_elapsed_ns(admission_start,
+                                                    std::chrono::steady_clock::now())
+                                : 0U;
+
   if (accepted.empty()) {
-    dispatch_results();
+    if (profile_sampled) {
+      profile_->observe_rejected_group(static_cast<std::uint64_t>(batch.size()));
+    }
+    dispatch_results(false);
     batch_finished = true;
     return;
   }
@@ -883,17 +956,31 @@ void ShardRuntime::process_command_batch(std::vector<CommandWork> batch) {
                                static_cast<std::uint64_t>(queue_latency.count()));
   }
   const auto wal_start = std::chrono::steady_clock::now();
-  auto appended = wal_->append_batch(accepted);
+  const auto wal_append_start = wal_start;
+  storage::WalAppendProfile wal_profile;
+  auto appended = profile_sampled
+                      ? wal_->append_batch_profiled(accepted, wal_profile)
+                      : wal_->append_batch(accepted);
   if (std::holds_alternative<Error>(appended)) {
     reject_batch_pending(ErrorCode::engine_unavailable);
     fail(std::get<Error>(appended));
     return;
   }
+  const auto wal_append_ns = profile_sampled
+                                 ? steady_elapsed_ns(wal_append_start,
+                                                     std::chrono::steady_clock::now())
+                                 : 0U;
+  const auto wal_sync_start = profile_sampled ? std::chrono::steady_clock::now()
+                                                   : std::chrono::steady_clock::time_point{};
   if (const auto status = wal_->sync(); std::holds_alternative<Error>(status)) {
     reject_batch_pending(ErrorCode::engine_unavailable);
     fail(std::get<Error>(status));
     return;
   }
+  const auto wal_sync_ns = profile_sampled
+                               ? steady_elapsed_ns(wal_sync_start,
+                                                   std::chrono::steady_clock::now())
+                               : 0U;
   const auto wal_latency = std::chrono::duration_cast<std::chrono::microseconds>(
       std::chrono::steady_clock::now() - wal_start);
   metrics_registry_->observe("wal_group_commits", 1);
@@ -917,6 +1004,13 @@ void ShardRuntime::process_command_batch(std::vector<CommandWork> batch) {
     outputs.push_back(std::get<domain::ExecutionOutput>(std::move(execution)));
   }
 
+  const auto apply_ns = profile_sampled
+                            ? steady_elapsed_ns(execution_start,
+                                                std::chrono::steady_clock::now())
+                            : 0U;
+  const auto publisher_notify_start = profile_sampled
+                                          ? std::chrono::steady_clock::now()
+                                          : std::chrono::steady_clock::time_point{};
   if (publisher_->failed()) {
     reject_batch_pending(ErrorCode::engine_unavailable);
     fail(Error{ErrorCode::engine_unavailable, "event publisher failed"});
@@ -925,7 +1019,14 @@ void ShardRuntime::process_command_batch(std::vector<CommandWork> batch) {
   const auto execution_latency = std::chrono::duration_cast<std::chrono::microseconds>(
       std::chrono::steady_clock::now() - execution_start);
   publisher_->notify_publishable(wal_->durable_position());
+  const auto publisher_notify_ns = profile_sampled
+                                       ? steady_elapsed_ns(
+                                             publisher_notify_start,
+                                             std::chrono::steady_clock::now())
+                                       : 0U;
 
+  const auto post_apply_start = profile_sampled ? std::chrono::steady_clock::now()
+                                                    : std::chrono::steady_clock::time_point{};
   for (std::size_t index = 0; index < outputs.size(); ++index) {
     auto& output = outputs[index];
     results[accepted_slots[index]] = std::move(output.result);
@@ -953,8 +1054,39 @@ void ShardRuntime::process_command_batch(std::vector<CommandWork> batch) {
     ++commands_since_snapshot_;
   }
 
-  dispatch_results();
+  const auto post_apply_ns = profile_sampled
+                                 ? steady_elapsed_ns(post_apply_start,
+                                                     std::chrono::steady_clock::now())
+                                 : 0U;
+  const auto completion_enqueue_start = profile_sampled
+                                            ? std::chrono::steady_clock::now()
+                                            : std::chrono::steady_clock::time_point{};
+  dispatch_results(profile_sampled);
+  const auto writer_end = profile_sampled ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point{};
+  const auto completion_enqueue_ns = profile_sampled
+                                         ? steady_elapsed_ns(completion_enqueue_start, writer_end)
+                                         : 0U;
   batch_finished = true;
+
+  if (profile_sampled) {
+    WriterGroupProfile profile;
+    profile.input_commands = static_cast<std::uint64_t>(batch.size());
+    profile.accepted_commands = static_cast<std::uint64_t>(accepted.size());
+    profile.group_collect_ns = group_collect_ns;
+    profile.group_wait_ns = group_wait_ns;
+    profile.writer_service_ns = steady_elapsed_ns(service_start, writer_end);
+    profile.writer_cycle_ns = steady_elapsed_ns(group_start, writer_end);
+    profile.admission_ns = admission_ns;
+    profile.wal_append_ns = wal_append_ns;
+    profile.wal_sync_ns = wal_sync_ns;
+    profile.apply_ns = apply_ns;
+    profile.publisher_notify_ns = publisher_notify_ns;
+    profile.post_apply_ns = post_apply_ns;
+    profile.completion_enqueue_ns = completion_enqueue_ns;
+    profile.wal = wal_profile;
+    profile_->observe_writer_group(profile);
+  }
 
   // The publisher is an independent replay replica.  A replay, sink cursor,
   // or replay-snapshot failure is fatal to the shard: continuing to accept
@@ -998,7 +1130,8 @@ void ShardRuntime::process_query(const QueryWork& query) {
   }
 }
 
-void ShardRuntime::dispatch(CommandResult result, CompletionHandler& completion) {
+void ShardRuntime::dispatch(CommandResult result, CompletionHandler& completion,
+                            const bool profile_completion) {
   if (!completion) {
     return;
   }
@@ -1006,7 +1139,36 @@ void ShardRuntime::dispatch(CommandResult result, CompletionHandler& completion)
   completion_condition_.wait(lock, [this] {
     return completions_.size() < config_.runtime.ingress_queue_capacity;
   });
-  completions_.emplace_back(std::move(result), std::move(completion));
+  if (!profile_completion) {
+    completions_.emplace_back(std::move(result), std::move(completion));
+  } else {
+    const auto enqueued_at = std::chrono::steady_clock::now();
+    const auto enqueue_depth = static_cast<std::uint64_t>(completions_.size() + 1U);
+    auto handler = std::move(completion);
+    auto* const collector = profile_;
+    CompletionHandler profiled =
+        [collector, enqueued_at, enqueue_depth,
+         handler = std::move(handler)](CommandResult callback_result) mutable {
+          const auto dequeued_at = std::chrono::steady_clock::now();
+          CompletionProfile sample;
+          sample.queue_residence_ns = steady_elapsed_ns(enqueued_at, dequeued_at);
+          sample.completions = 1;
+          sample.max_queue_depth = enqueue_depth;
+          const auto callback_start = dequeued_at;
+          try {
+            handler(std::move(callback_result));
+          } catch (...) {
+            sample.callback_service_ns = steady_elapsed_ns(
+                callback_start, std::chrono::steady_clock::now());
+            collector->observe_completion(sample);
+            throw;
+          }
+          sample.callback_service_ns = steady_elapsed_ns(
+              callback_start, std::chrono::steady_clock::now());
+          collector->observe_completion(sample);
+        };
+    completions_.emplace_back(std::move(result), std::move(profiled));
+  }
   lock.unlock();
   completion_condition_.notify_all();
 }

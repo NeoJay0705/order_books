@@ -1,8 +1,10 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <filesystem>
 #include <functional>
@@ -21,6 +23,7 @@
 #include "persistence/wal.hpp"
 #include "runtime/event_publisher.hpp"
 #include "runtime/metrics_registry.hpp"
+#include "runtime/writer_profile.hpp"
 
 namespace order_books::runtime {
 
@@ -30,7 +33,8 @@ class ShardRuntime {
  public:
   static Result<std::unique_ptr<ShardRuntime>> open(
       ShardId shard_id, const EngineConfig& config, EventSink& event_sink,
-      MetricsSink& metrics_sink);
+      MetricsSink& metrics_sink, WriterProfileCollector* profile = nullptr,
+      WriterProfileOptions profile_options = {});
 
   ~ShardRuntime();
 
@@ -38,6 +42,10 @@ class ShardRuntime {
   ShardRuntime& operator=(const ShardRuntime&) = delete;
 
   void start();
+  // Internal benchmark control: profiling is disabled during warmup and
+  // re-enabled with a fresh sampling sequence for the measured phase.
+  void set_writer_profile_phase_active(bool active) noexcept;
+  void reset_writer_profile_phase() noexcept;
   SubmitResult submit(Command command, CompletionHandler completion);
   std::future<Result<OrderView>> get_order(InstrumentId instrument_id, OrderId order_id);
   std::future<Result<BookDepth>> depth(InstrumentId instrument_id, Side side,
@@ -69,13 +77,20 @@ class ShardRuntime {
                std::unique_ptr<storage::Wal> wal,
                storage::SnapshotStore snapshots,
                domain::StateMachine state_machine,
-               std::unique_ptr<EventPublisher> publisher);
+               std::unique_ptr<EventPublisher> publisher,
+               WriterProfileCollector* profile,
+               WriterProfileOptions profile_options);
 
   void run(std::stop_token stop_token);
   void completion_run(std::stop_token stop_token);
-  void process_command_batch(std::vector<CommandWork> batch);
+  void process_command_batch(std::vector<CommandWork> batch,
+                             std::chrono::steady_clock::time_point group_start,
+                             std::uint64_t group_collect_ns,
+                             std::uint64_t group_wait_ns,
+                             bool profile_sampled);
   void process_query(const QueryWork& query);
-  void dispatch(CommandResult result, CompletionHandler& completion);
+  void dispatch(CommandResult result, CompletionHandler& completion,
+                bool profile_completion = false);
   void fail(Error error);
 
   [[nodiscard]] Result<domain::CommittedCommand> prepare(
@@ -94,6 +109,10 @@ class ShardRuntime {
   storage::SnapshotStore snapshots_;
   domain::StateMachine state_machine_;
   std::unique_ptr<EventPublisher> publisher_;
+  WriterProfileCollector* profile_{};
+  WriterProfileOptions profile_options_{};
+  std::atomic<std::uint64_t> profile_groups_seen_{};
+  std::atomic<bool> profile_phase_active_{true};
 
   std::mutex queue_mutex_;
   std::condition_variable_any queue_condition_;
