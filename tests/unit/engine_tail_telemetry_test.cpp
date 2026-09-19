@@ -11,6 +11,11 @@
 namespace order_books::benchmark {
 namespace {
 
+TEST(EngineTailTelemetryTest, KeepsTheDesignedStateSamplingInterval) {
+  EXPECT_EQ(EngineTailTelemetry::kStateSampleInterval,
+            std::chrono::milliseconds(10));
+}
+
 TEST(EngineTailTelemetryTest, AdvancesDeadlineWithoutCatchingUpMissedTicks) {
   using Clock = std::chrono::steady_clock;
   const auto previous = Clock::time_point{} + std::chrono::milliseconds(100);
@@ -55,6 +60,44 @@ TEST(EngineTailTelemetryTest, CollectsMeasuredSamplesAndSeparatesDrain) {
   EXPECT_EQ(result.measured_group_sample_commands, 4U);
   EXPECT_EQ(result.telemetry_dropped_samples, 0U);
   EXPECT_FALSE(result.sampler_error);
+}
+
+TEST(EngineTailTelemetryTest, RecordsDrainBoundarySnapshots) {
+  EngineTailTelemetry telemetry(2);
+  ASSERT_TRUE(telemetry.reserve());
+  ASSERT_TRUE(telemetry.begin_measured());
+  ASSERT_TRUE(telemetry.begin_drain());
+
+  order_books::MetricsSnapshot first;
+  first.queue_depth = 3;
+  first.event_publish_lag_events = 5;
+  first.event_publish_lag_bytes = 7;
+  first.event_publish_lag_age_ns = 11;
+  order_books::MetricsSnapshot last;
+  last.queue_depth = 13;
+  last.event_publish_lag_events = 17;
+  last.event_publish_lag_bytes = 19;
+  last.event_publish_lag_age_ns = 23;
+  ASSERT_FALSE(telemetry.record_drain_snapshot(
+      last, TailTelemetryBoundary::drain_end));
+  ASSERT_TRUE(telemetry.record_drain_snapshot(first,
+                                              TailTelemetryBoundary::drain_start));
+  ASSERT_FALSE(telemetry.record_drain_snapshot(
+      first, TailTelemetryBoundary::drain_start));
+  ASSERT_TRUE(telemetry.record_drain_snapshot(last,
+                                              TailTelemetryBoundary::drain_end));
+  ASSERT_FALSE(telemetry.record_drain_snapshot(
+      last, TailTelemetryBoundary::drain_end));
+  telemetry.stop_collection();
+
+  const auto result = telemetry.summary();
+  EXPECT_EQ(result.drain_state_sample_count, 2U);
+  EXPECT_EQ(result.drain_publisher_lag_events_first, 5U);
+  EXPECT_EQ(result.drain_publisher_lag_bytes_first, 7U);
+  EXPECT_EQ(result.drain_publisher_lag_age_ns_first, 11U);
+  EXPECT_EQ(result.drain_publisher_lag_events_last, 17U);
+  EXPECT_EQ(result.drain_publisher_lag_bytes_last, 19U);
+  EXPECT_EQ(result.drain_publisher_lag_age_ns_last, 23U);
 }
 
 TEST(EngineTailTelemetryTest, WritesSchemaAndDoesNotOverwriteArtifact) {

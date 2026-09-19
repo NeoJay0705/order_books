@@ -144,6 +144,17 @@ bool EngineTailTelemetry::begin_drain() noexcept {
                                          std::memory_order_acquire);
 }
 
+bool EngineTailTelemetry::record_drain_snapshot(
+    const order_books::MetricsSnapshot& metrics,
+    const TailTelemetryBoundary boundary) noexcept {
+  if (boundary != TailTelemetryBoundary::drain_start &&
+      boundary != TailTelemetryBoundary::drain_end) {
+    return false;
+  }
+  return record_state(TailTelemetryPhase::drain, metrics,
+                      std::chrono::steady_clock::now(), boundary);
+}
+
 void EngineTailTelemetry::stop_collection() noexcept {
   phase_.store(TailTelemetryPhase::stopped, std::memory_order_release);
 }
@@ -199,8 +210,8 @@ void EngineTailTelemetry::sampler_loop(
         const auto observed_phase = phase_.load(std::memory_order_acquire);
         if (observed_phase == TailTelemetryPhase::measured ||
             observed_phase == TailTelemetryPhase::drain) {
-          record_state(observed_phase, std::get<MetricsSnapshot>(metrics),
-                       std::chrono::steady_clock::now());
+          (void)record_state(observed_phase, std::get<MetricsSnapshot>(metrics),
+                             std::chrono::steady_clock::now());
         }
       }
       next_sample = next_tail_sample_deadline(next_sample,
@@ -211,23 +222,43 @@ void EngineTailTelemetry::sampler_loop(
   }
 }
 
-void EngineTailTelemetry::record_state(
+bool EngineTailTelemetry::record_state(
     const TailTelemetryPhase phase, const MetricsSnapshot& metrics,
-    const std::chrono::steady_clock::time_point observed_at) noexcept {
+    const std::chrono::steady_clock::time_point observed_at,
+    const TailTelemetryBoundary boundary) noexcept {
   try {
     std::lock_guard lock(mutex_);
     if (phase_.load(std::memory_order_acquire) != phase) {
-      return;
+      return false;
+    }
+    if (phase == TailTelemetryPhase::drain) {
+      if (boundary == TailTelemetryBoundary::none && !drain_start_recorded_) {
+        // Do not let a periodic sample win the race with the explicit drain-start
+        // snapshot.  The CSV intentionally has no boundary column, so this keeps
+        // its first drain row deterministic without counting a sample as dropped.
+        return true;
+      }
+      if (boundary == TailTelemetryBoundary::drain_start &&
+          (drain_start_recorded_ || drain_end_recorded_)) {
+        return false;
+      }
+      if (boundary == TailTelemetryBoundary::drain_end &&
+          (!drain_start_recorded_ || drain_end_recorded_)) {
+        return false;
+      }
+      if (drain_end_recorded_) {
+        return false;
+      }
     }
     if (state_sample_count_ >= kMaxStateSamples) {
       if (dropped_samples_ != std::numeric_limits<std::uint64_t>::max()) {
         ++dropped_samples_;
       }
-      return;
+      return false;
     }
     if (next_order_ == std::numeric_limits<std::uint64_t>::max()) {
       aggregate_overflow_ = true;
-      return;
+      return false;
     }
     records_.push_back(Record{
         TailTelemetryRecordType::state,
@@ -239,8 +270,15 @@ void EngineTailTelemetry::record_state(
         metrics.event_publish_lag_bytes,
         metrics.event_publish_lag_age_ns,
         next_order_++,
+        boundary,
     });
     ++state_sample_count_;
+    if (boundary == TailTelemetryBoundary::drain_start) {
+      drain_start_recorded_ = true;
+    } else if (boundary == TailTelemetryBoundary::drain_end) {
+      drain_end_recorded_ = true;
+    }
+    return true;
   } catch (...) {
     try {
       std::lock_guard lock(mutex_);
@@ -249,6 +287,7 @@ void EngineTailTelemetry::record_state(
       }
     } catch (...) {
     }
+    return false;
   }
 }
 
@@ -339,9 +378,16 @@ TailTelemetrySummary EngineTailTelemetry::summary() const {
                                  : std::optional<std::uint64_t>(record.publisher_lag_age_ns);
     } else if (record.type == TailTelemetryRecordType::state &&
                record.phase == TailTelemetryPhase::drain) {
-      result.drain_publisher_lag_events_last = record.publisher_lag_events;
-      result.drain_publisher_lag_bytes_last = record.publisher_lag_bytes;
-      result.drain_publisher_lag_age_ns_last = record.publisher_lag_age_ns;
+      ++result.drain_state_sample_count;
+      if (record.boundary == TailTelemetryBoundary::drain_start) {
+        result.drain_publisher_lag_events_first = record.publisher_lag_events;
+        result.drain_publisher_lag_bytes_first = record.publisher_lag_bytes;
+        result.drain_publisher_lag_age_ns_first = record.publisher_lag_age_ns;
+      } else if (record.boundary == TailTelemetryBoundary::drain_end) {
+        result.drain_publisher_lag_events_last = record.publisher_lag_events;
+        result.drain_publisher_lag_bytes_last = record.publisher_lag_bytes;
+        result.drain_publisher_lag_age_ns_last = record.publisher_lag_age_ns;
+      }
     }
   }
   std::sort(sync_values.begin(), sync_values.end());

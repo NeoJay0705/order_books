@@ -28,6 +28,12 @@ enum class TailTelemetryRecordType : std::uint8_t {
   state,
 };
 
+enum class TailTelemetryBoundary : std::uint8_t {
+  none,
+  drain_start,
+  drain_end,
+};
+
 [[nodiscard]] std::chrono::steady_clock::time_point next_tail_sample_deadline(
     std::chrono::steady_clock::time_point previous_deadline,
     std::chrono::steady_clock::time_point observed_at) noexcept;
@@ -48,6 +54,10 @@ struct TailTelemetrySummary {
   std::optional<std::uint64_t> measured_publisher_lag_events_max;
   std::optional<std::uint64_t> measured_publisher_lag_bytes_max;
   std::optional<std::uint64_t> measured_publisher_lag_age_ns_max;
+  std::uint64_t drain_state_sample_count{};
+  std::optional<std::uint64_t> drain_publisher_lag_events_first;
+  std::optional<std::uint64_t> drain_publisher_lag_bytes_first;
+  std::optional<std::uint64_t> drain_publisher_lag_age_ns_first;
   std::optional<std::uint64_t> drain_publisher_lag_events_last;
   std::optional<std::uint64_t> drain_publisher_lag_bytes_last;
   std::optional<std::uint64_t> drain_publisher_lag_age_ns_last;
@@ -73,6 +83,9 @@ class EngineTailTelemetry final : public order_books::MetricsSink {
 
   [[nodiscard]] bool begin_measured() noexcept;
   [[nodiscard]] bool begin_drain() noexcept;
+  [[nodiscard]] bool record_drain_snapshot(
+      const order_books::MetricsSnapshot& metrics,
+      TailTelemetryBoundary boundary) noexcept;
   void stop_collection() noexcept;
 
   [[nodiscard]] bool start_sampler(order_books::Engine& engine,
@@ -93,13 +106,15 @@ class EngineTailTelemetry final : public order_books::MetricsSink {
     std::uint64_t publisher_lag_bytes{};
     std::uint64_t publisher_lag_age_ns{};
     std::uint64_t order{};
+    TailTelemetryBoundary boundary{TailTelemetryBoundary::none};
   };
 
   void sampler_loop(std::stop_token stop_token, order_books::Engine* engine,
                     order_books::ShardId shard_id) noexcept;
-  void record_state(TailTelemetryPhase phase,
-                    const order_books::MetricsSnapshot& metrics,
-                    std::chrono::steady_clock::time_point observed_at) noexcept;
+  [[nodiscard]] bool record_state(
+      TailTelemetryPhase phase, const order_books::MetricsSnapshot& metrics,
+      std::chrono::steady_clock::time_point observed_at,
+      TailTelemetryBoundary boundary = TailTelemetryBoundary::none) noexcept;
   void record_sampler_error() noexcept;
   [[nodiscard]] std::uint64_t elapsed_us(
       std::chrono::steady_clock::time_point observed_at) const noexcept;
@@ -113,6 +128,8 @@ class EngineTailTelemetry final : public order_books::MetricsSink {
   std::size_t sync_sample_count_{};
   std::size_t group_command_sample_count_{};
   std::size_t state_sample_count_{};
+  bool drain_start_recorded_{};
+  bool drain_end_recorded_{};
   std::uint64_t next_order_{};
   std::uint64_t dropped_samples_{};
   bool aggregate_overflow_{};

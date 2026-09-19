@@ -223,6 +223,24 @@ if(BUILD_TESTING)
   )
 
   add_test(
+    NAME order_books_benchmark_engine_tail_state_sampling_invalid
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--engine-tail-state-sampling=invalid
+            -DEXPECTED_ERROR=engine_tail_state_sampling_invalid
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_engine_tail_state_sampling_requires_telemetry
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--engine-tail-state-sampling=off
+            -DEXPECTED_ERROR=engine_tail_state_sampling_requires_telemetry
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
     NAME order_books_benchmark_engine_tail_telemetry_wrong_workload
     COMMAND ${CMAKE_COMMAND}
             "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
@@ -237,6 +255,15 @@ if(BUILD_TESTING)
     COMMAND ${CMAKE_COMMAND}
             "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
             "-DOUTPUT_PATH=${CMAKE_CURRENT_BINARY_DIR}/engine-tail-telemetry-smoke.csv"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_engine_tail_telemetry.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_engine_tail_telemetry_collector_only_smoke
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            "-DOUTPUT_PATH=${CMAKE_CURRENT_BINARY_DIR}/engine-tail-telemetry-collector-only.csv"
+            -DSTATE_SAMPLING=off
             -P "${CMAKE_CURRENT_SOURCE_DIR}/check_engine_tail_telemetry.cmake"
   )
 

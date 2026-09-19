@@ -87,6 +87,9 @@ struct BenchmarkOptions {
   bool writer_profile_sample_option_set{};
   bool engine_tail_telemetry_parse_error{};
   bool engine_tail_telemetry_option_set{};
+  bool engine_tail_state_sampling{true};
+  bool engine_tail_state_sampling_parse_error{};
+  bool engine_tail_state_sampling_option_set{};
   std::optional<std::filesystem::path> data_directory;
   std::optional<std::filesystem::path> engine_tail_telemetry_output;
 };
@@ -398,6 +401,17 @@ std::optional<BenchmarkOptions> parse_options(const int argc, char** argv) {
         options.engine_tail_telemetry_parse_error = true;
       } else {
         options.engine_tail_telemetry_output = std::filesystem::path(path);
+      }
+    } else if (argument.starts_with("--engine-tail-state-sampling=")) {
+      options.engine_tail_state_sampling_option_set = true;
+      const auto value = argument.substr(
+          std::string_view("--engine-tail-state-sampling=").size());
+      if (value == "on") {
+        options.engine_tail_state_sampling = true;
+      } else if (value == "off") {
+        options.engine_tail_state_sampling = false;
+      } else {
+        options.engine_tail_state_sampling_parse_error = true;
       }
     } else {
       return std::nullopt;
@@ -1436,7 +1450,8 @@ bool run_engine_durable_single_instrument(const BenchmarkOptions& options) {
     stop_telemetry();
     cleanup_data();
   };
-  if (telemetry.has_value() && !telemetry->start_sampler(*engine, 1)) {
+  if (telemetry.has_value() && options.engine_tail_state_sampling &&
+      !telemetry->start_sampler(*engine, 1)) {
     report_durable_error("setup", "tail_telemetry_sampler_start_failed");
     (void)stop_engine_after_telemetry();
     cleanup();
@@ -1506,10 +1521,34 @@ bool run_engine_durable_single_instrument(const BenchmarkOptions& options) {
     return false;
   }
   const auto final_metrics = engine->metrics(1);
+  bool drain_boundary_error = false;
+  if (telemetry.has_value() && options.engine_tail_state_sampling &&
+      std::holds_alternative<MetricsSnapshot>(final_metrics) &&
+      !telemetry->record_drain_snapshot(
+          std::get<MetricsSnapshot>(final_metrics),
+          benchmark::TailTelemetryBoundary::drain_start)) {
+    drain_boundary_error = true;
+  }
   const auto stop_status = engine->stop();
-  stop_telemetry();
+  std::optional<Result<MetricsSnapshot>> drain_end_metrics;
+  if (telemetry.has_value()) {
+    telemetry->stop_sampler();
+    if (options.engine_tail_state_sampling) {
+      drain_end_metrics = engine->metrics(1);
+      if (std::holds_alternative<MetricsSnapshot>(*drain_end_metrics) &&
+          !telemetry->record_drain_snapshot(
+              std::get<MetricsSnapshot>(*drain_end_metrics),
+              benchmark::TailTelemetryBoundary::drain_end)) {
+        drain_boundary_error = true;
+      }
+    }
+    telemetry->stop_collection();
+  }
   if (std::holds_alternative<Error>(final_metrics) ||
-      std::holds_alternative<Error>(stop_status)) {
+      std::holds_alternative<Error>(stop_status) ||
+      (drain_end_metrics.has_value() &&
+       std::holds_alternative<Error>(*drain_end_metrics)) ||
+      drain_boundary_error) {
     if (std::holds_alternative<Error>(final_metrics)) {
       const auto& error = std::get<Error>(final_metrics);
       report_durable_error("final_metrics", "metrics_failed",
@@ -1519,6 +1558,15 @@ bool run_engine_durable_single_instrument(const BenchmarkOptions& options) {
       const auto& error = std::get<Error>(stop_status);
       report_durable_error("stop", "engine_stop_failed",
                            error_code_message(error.code) + " message=" + error.message);
+    }
+    if (drain_end_metrics.has_value() &&
+        std::holds_alternative<Error>(*drain_end_metrics)) {
+      const auto& error = std::get<Error>(*drain_end_metrics);
+      report_durable_error("drain", "metrics_failed",
+                           error_code_message(error.code) + " message=" + error.message);
+    }
+    if (drain_boundary_error) {
+      report_durable_error("drain", "tail_telemetry_snapshot_failed");
     }
     if (telemetry.has_value() &&
         !telemetry->write_csv(*options.engine_tail_telemetry_output)) {
@@ -1648,11 +1696,22 @@ bool run_engine_durable_single_instrument(const BenchmarkOptions& options) {
       return false;
     }
     tail_summary = telemetry->summary();
+    const auto full_state_sampling_valid =
+        !options.engine_tail_state_sampling ||
+        (tail_summary->measured_queue_depth_max.has_value() &&
+         tail_summary->drain_state_sample_count >= 2U &&
+         tail_summary->drain_publisher_lag_events_first.has_value() &&
+         tail_summary->drain_publisher_lag_bytes_first.has_value() &&
+         tail_summary->drain_publisher_lag_age_ns_first.has_value() &&
+         tail_summary->drain_publisher_lag_events_last.has_value() &&
+         tail_summary->drain_publisher_lag_bytes_last.has_value() &&
+         tail_summary->drain_publisher_lag_age_ns_last.has_value());
     if (tail_summary->sampler_error || tail_summary->aggregate_overflow ||
         tail_summary->telemetry_dropped_samples != 0U ||
         tail_summary->measured_sync_count != *measured_group_commits ||
         tail_summary->measured_group_sample_count != *measured_group_commits ||
-        tail_summary->measured_group_sample_commands != *measured_group_commands) {
+        tail_summary->measured_group_sample_commands != *measured_group_commands ||
+        !full_state_sampling_valid) {
       report_durable_error("telemetry", "telemetry_validation_failed");
       cleanup();
       return false;
@@ -1713,6 +1772,8 @@ bool run_engine_durable_single_instrument(const BenchmarkOptions& options) {
             << " wal_path=" << wal_path << " wal_bytes=" << after_measured.wal_size_bytes;
   if (tail_summary.has_value()) {
     std::cout << " tail_telemetry=on"
+              << " tail_state_sampling="
+              << (options.engine_tail_state_sampling ? "on" : "off")
               << " measured_sync_count=" << tail_summary->measured_sync_count
               << " measured_sync_p50_us="
               << optional_metric_value(tail_summary->measured_sync_p50_us)
@@ -1738,6 +1799,20 @@ bool run_engine_durable_single_instrument(const BenchmarkOptions& options) {
               << optional_metric_value(tail_summary->measured_publisher_lag_bytes_max)
               << " measured_publisher_lag_age_ns_max="
               << optional_metric_value(tail_summary->measured_publisher_lag_age_ns_max)
+              << " drain_state_sample_count="
+              << tail_summary->drain_state_sample_count
+              << " drain_publisher_lag_events_first="
+              << (options.engine_tail_state_sampling
+                      ? optional_metric_value(tail_summary->drain_publisher_lag_events_first)
+                      : std::string("na"))
+              << " drain_publisher_lag_bytes_first="
+              << (options.engine_tail_state_sampling
+                      ? optional_metric_value(tail_summary->drain_publisher_lag_bytes_first)
+                      : std::string("na"))
+              << " drain_publisher_lag_age_ns_first="
+              << (options.engine_tail_state_sampling
+                      ? optional_metric_value(tail_summary->drain_publisher_lag_age_ns_first)
+                      : std::string("na"))
               << " drain_publisher_lag_events_last="
               << optional_metric_value(tail_summary->drain_publisher_lag_events_last)
               << " drain_publisher_lag_bytes_last="
@@ -1772,7 +1847,8 @@ void print_usage() {
                "[--pipeline-producer-lanes=N] "
                "[--publisher-cursor-persist-max-commands=N] "
                "[--publisher-cursor-persist-max-delay-us=N] "
-               "[--engine-tail-telemetry-output=PATH]\n";
+               "[--engine-tail-telemetry-output=PATH] "
+               "[--engine-tail-state-sampling=on|off]\n";
 }
 
 int main(const int argc, char** argv) {
@@ -1824,6 +1900,12 @@ int main(const int argc, char** argv) {
   if (options->engine_tail_telemetry_parse_error) {
     std::cerr << "workload=" << workload_name(options->workload)
               << " phase=cli error_code=engine_tail_telemetry_output_invalid\n";
+    print_usage();
+    return 2;
+  }
+  if (options->engine_tail_state_sampling_parse_error) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=engine_tail_state_sampling_invalid\n";
     print_usage();
     return 2;
   }
@@ -1951,6 +2033,13 @@ int main(const int argc, char** argv) {
       options->workload != WorkloadSelection::engine_durable_single_instrument) {
     std::cerr << "workload=" << workload_name(options->workload)
               << " phase=cli error_code=engine_tail_telemetry_requires_engine_durable_workload\n";
+    print_usage();
+    return 2;
+  }
+  if (options->engine_tail_state_sampling_option_set &&
+      !options->engine_tail_telemetry_option_set) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=engine_tail_state_sampling_requires_telemetry\n";
     print_usage();
     return 2;
   }
