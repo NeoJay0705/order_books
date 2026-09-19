@@ -31,6 +31,11 @@ struct RuntimeConfig {
   std::chrono::hours max_publish_lag_age{24};
   std::uint64_t max_publish_lag_bytes{32ULL * 1024ULL * 1024ULL * 1024ULL};
   std::size_t max_top_n{10'000};
+  // Bounded WAL preparation lanes include the shard writer caller.  The
+  // default keeps the production path single-threaded; values >1 are an
+  // explicit deployment opt-in.
+  std::size_t wal_prepare_lanes{1};
+  std::size_t wal_parallel_prepare_min_commands{4096};
 };
 
 struct EngineConfig {

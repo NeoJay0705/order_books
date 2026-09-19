@@ -6,6 +6,7 @@
 #include <future>
 #include <mutex>
 #include <stop_token>
+#include <string>
 #include <thread>
 #include <tuple>
 #include <unordered_map>
@@ -104,6 +105,76 @@ TEST(EngineTest, RejectsZeroPublishLagAge) {
   auto opened = Engine::open(std::move(config), sink, metrics);
   ASSERT_TRUE(std::holds_alternative<Error>(opened));
   EXPECT_EQ(std::get<Error>(opened).code, ErrorCode::invalid_command);
+  std::filesystem::remove_all(data_directory, ignored);
+}
+
+TEST(EngineTest, RejectsUnsupportedWalPrepareLanes) {
+  const auto data_directory =
+      std::filesystem::temp_directory_path() / "order_books_invalid_wal_prepare_lanes_test";
+  std::error_code ignored;
+  std::filesystem::remove_all(data_directory, ignored);
+
+  RecordingSink sink;
+  NullMetricsSink metrics;
+  EngineConfig config;
+  config.data_directory = data_directory;
+  config.shard_ids = {1};
+  config.instruments = {InstrumentConfig{7, 1, 1, 1}};
+  config.runtime.wal_prepare_lanes = 3;
+
+  const auto opened = Engine::open(std::move(config), sink, metrics);
+  ASSERT_TRUE(std::holds_alternative<Error>(opened));
+  EXPECT_EQ(std::get<Error>(opened).code, ErrorCode::invalid_command);
+  EXPECT_EQ(std::get<Error>(opened).message,
+            "wal prepare lanes must be 1, 2, or 4");
+  EXPECT_FALSE(std::filesystem::exists(data_directory));
+  std::filesystem::remove_all(data_directory, ignored);
+}
+
+TEST(EngineTest, AcceptsSupportedWalPrepareLanes) {
+  for (const auto lanes : {std::size_t{1}, std::size_t{2}, std::size_t{4}}) {
+    const auto data_directory = std::filesystem::temp_directory_path() /
+                                ("order_books_supported_wal_prepare_lanes_" +
+                                 std::to_string(lanes));
+    std::error_code ignored;
+    std::filesystem::remove_all(data_directory, ignored);
+
+    RecordingSink sink;
+    NullMetricsSink metrics;
+    EngineConfig config;
+    config.data_directory = data_directory;
+    config.shard_ids = {1};
+    config.instruments = {InstrumentConfig{7, 1, 1, 1}};
+    config.runtime.wal_prepare_lanes = lanes;
+
+    auto opened = Engine::open(config, sink, metrics);
+    ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Engine>>(opened)) << lanes;
+    auto engine = std::get<std::unique_ptr<Engine>>(std::move(opened));
+    EXPECT_TRUE(std::holds_alternative<std::monostate>(engine->stop())) << lanes;
+    std::filesystem::remove_all(data_directory, ignored);
+  }
+}
+
+TEST(EngineTest, RejectsZeroWalPrepareThreshold) {
+  const auto data_directory =
+      std::filesystem::temp_directory_path() / "order_books_zero_wal_prepare_threshold_test";
+  std::error_code ignored;
+  std::filesystem::remove_all(data_directory, ignored);
+
+  RecordingSink sink;
+  NullMetricsSink metrics;
+  EngineConfig config;
+  config.data_directory = data_directory;
+  config.shard_ids = {1};
+  config.instruments = {InstrumentConfig{7, 1, 1, 1}};
+  config.runtime.wal_parallel_prepare_min_commands = 0;
+
+  const auto opened = Engine::open(std::move(config), sink, metrics);
+  ASSERT_TRUE(std::holds_alternative<Error>(opened));
+  EXPECT_EQ(std::get<Error>(opened).code, ErrorCode::invalid_command);
+  EXPECT_EQ(std::get<Error>(opened).message,
+            "wal parallel prepare threshold must be positive");
+  EXPECT_FALSE(std::filesystem::exists(data_directory));
   std::filesystem::remove_all(data_directory, ignored);
 }
 

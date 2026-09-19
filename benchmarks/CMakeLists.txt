@@ -194,13 +194,22 @@ if(BUILD_TESTING)
   )
 
   add_test(
-    NAME order_books_benchmark_wal_prepare_options_requires_wal_or_writer
-    COMMAND ${CMAKE_COMMAND}
-            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
-            -DCLI_ARGUMENT=--workload=engine_durable_single_instrument
-            -DCLI_ARGUMENT_2=--wal-prepare-workers=2
-            -DEXPECTED_ERROR=wal_prepare_options_requires_wal_or_writer_workload
-            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+    NAME order_books_benchmark_wal_prepare_options_engine_smoke
+    COMMAND $<TARGET_FILE:order_books_benchmark>
+            --workload=engine_durable_single_instrument
+            --wal-prepare-workers=2
+            --wal-parallel-prepare-min-commands=2
+            --engine-group-size=2
+            --engine-group-delay-us=0
+            --engine-producer-lanes=2
+            --iterations=2
+            --warmup=1
+  )
+  set_tests_properties(
+    order_books_benchmark_wal_prepare_options_engine_smoke
+    PROPERTIES
+      PASS_REGULAR_EXPRESSION
+      "engine_durable_single_instrument.*wal_prepare_workers=2.*actual_parallel_prepare_groups=[1-9][0-9]*.*wal_sync_full_run_p99_us=.*"
   )
 
   add_test(

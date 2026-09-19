@@ -618,6 +618,9 @@ bool run_engine_writer_hot_path_profile(const WriterProfileBenchmarkOptions& opt
   config.runtime.ingress_queue_capacity = kIngressCapacity;
   config.runtime.group_commit_max_commands = options.group_size;
   config.runtime.group_commit_max_delay = options.group_delay;
+  config.runtime.wal_prepare_lanes = options.wal_prepare_workers;
+  config.runtime.wal_parallel_prepare_min_commands =
+      options.wal_parallel_prepare_min_commands;
   config.runtime.snapshot_interval_commands = std::numeric_limits<std::size_t>::max();
   config.runtime.snapshot_interval = std::chrono::hours(24);
   config.runtime.event_replay_snapshot_interval_commands =
@@ -648,9 +651,7 @@ bool run_engine_writer_hot_path_profile(const WriterProfileBenchmarkOptions& opt
   }
   auto opened = runtime::ShardRuntime::open(
       1, config, event_sink, metrics_sink, options.profile ? &collector : nullptr,
-      runtime::WriterProfileOptions{options.profile_sample_every},
-      storage::WalPrepareOptions{options.wal_prepare_workers,
-                                 options.wal_parallel_prepare_min_commands});
+      runtime::WriterProfileOptions{options.profile_sample_every});
   if (std::holds_alternative<Error>(opened)) {
     std::cerr << "workload=engine_writer_hot_path_profile phase=open error_code=engine_open_failed\n";
     cleanup();
@@ -705,8 +706,8 @@ bool run_engine_writer_hot_path_profile(const WriterProfileBenchmarkOptions& opt
   auto wal_result = storage::Wal::open(directory / "shard-1" / "wal", 1,
                                        config.runtime.wal_segment_size,
                                        storage::WalPrepareOptions{
-                                           options.wal_prepare_workers,
-                                           options.wal_parallel_prepare_min_commands});
+                                           config.runtime.wal_prepare_lanes,
+                                           config.runtime.wal_parallel_prepare_min_commands});
   if (std::holds_alternative<Error>(wal_result)) {
     std::cerr << "workload=engine_writer_hot_path_profile phase=recovery error_code=wal_reopen_failed\n";
     cleanup();

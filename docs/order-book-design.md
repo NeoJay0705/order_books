@@ -290,6 +290,8 @@ RuntimeConfig (operational, not part of replay result)
 ├── ingress_queue_capacity = 65,536
 ├── group_commit_max_delay = 200 microseconds
 ├── group_commit_max_commands = 256
+├── wal_prepare_lanes = 1 (caller only; opt-in 2 or 4)
+├── wal_parallel_prepare_min_commands = 4,096
 ├── wal_segment_size = 256 MiB
 ├── wal_soft_limit_per_shard = 64 GiB
 ├── snapshot_interval = 5 minutes or 1,000,000 commands
@@ -301,6 +303,12 @@ RuntimeConfig (operational, not part of replay result)
 ```
 
 `ShardBehaviorConfig` 的 version 必須寫入 WAL 與 Snapshot，歷史版本在相關資料截斷前不可刪除。RuntimeConfig 可以在 restart 後調整，因為它只改變 batching、resource protection 與 operational timing，不改變同一 command 的 logical output。
+
+`wal_prepare_lanes` 是每個 shard 的 bounded WAL preparation lane 數，包含 shard writer caller，
+只接受 1、2、4；預設 1 不建立背景 prepare thread。`wal_parallel_prepare_min_commands` 預設
+4,096，只有當實際 accepted group 達到門檻且 lanes 大於 1 時才啟用平行 prepare。每個 shard 的
+額外背景 thread 數為 `wal_prepare_lanes - 1`，部署時必須依 shard 數與 CPU affinity 評估總量。
+這兩個欄位只在 Engine 啟動時生效，rollback 以停止後改回 W=1 並重啟完成。
 
 ## 6. Domain Model 與資料結構
 

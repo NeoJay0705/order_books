@@ -101,6 +101,15 @@ workload on a real Linux WAL device:
 `submit()` calls that only report `queued=true`. Use a new empty data directory for each
 run; do not use `tmpfs` or an overlay filesystem for a Linux production baseline.
 
+Bounded WAL record preparation is disabled by default (`wal_prepare_lanes=1`). A deployment may
+opt in through `RuntimeConfig` with `wal_prepare_lanes=2` and
+`wal_parallel_prepare_min_commands=4096`; the lane count includes the shard writer caller, so
+each shard adds `lanes - 1` background threads. The threshold must be reached by the actual
+accepted group before parallel preparation is used. Validate the same workload against W=1 first,
+monitor `wal_parallel_prepare_groups`, `wal_prepare_tasks`, `wal_sync_latency_us`, queue depth,
+and publisher lag, and roll back by restarting with W=1 if the documented latency, backlog, or
+CPU gates regress. W=4 remains an explicit experiment, not a default.
+
 To measure the WAL write ceiling independently from Engine, run the dedicated workload on
 the same Linux filesystem used for deployment:
 

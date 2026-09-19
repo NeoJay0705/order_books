@@ -65,7 +65,7 @@ struct BenchmarkOptions {
   std::chrono::microseconds engine_group_delay{200};
   std::size_t engine_producer_lanes{kDurableProducerLanes};
   std::size_t wal_prepare_workers{1};
-  std::size_t wal_parallel_prepare_min_commands{256};
+  std::size_t wal_parallel_prepare_min_commands{4096};
   std::uint64_t writer_profile_sample_every{1};
   benchmark::PipelineStage pipeline_stage{benchmark::PipelineStage::all};
   std::size_t pipeline_batch_size{256};
@@ -1348,6 +1348,9 @@ bool run_engine_durable_single_instrument(const BenchmarkOptions& options) {
   config.runtime.ingress_queue_capacity = kDurableIngressQueueCapacity;
   config.runtime.group_commit_max_commands = options.engine_group_size;
   config.runtime.group_commit_max_delay = options.engine_group_delay;
+  config.runtime.wal_prepare_lanes = options.wal_prepare_workers;
+  config.runtime.wal_parallel_prepare_min_commands =
+      options.wal_parallel_prepare_min_commands;
   config.runtime.snapshot_interval_commands = std::numeric_limits<std::size_t>::max();
   config.runtime.snapshot_interval = std::chrono::hours(24);
   config.runtime.event_replay_snapshot_interval_commands =
@@ -1454,7 +1457,10 @@ bool run_engine_durable_single_instrument(const BenchmarkOptions& options) {
     return false;
   }
   const auto expected_total = expected_warmup + expected_measured;
-  auto reopened_wal_result = storage::Wal::open(wal_directory, 1, config.runtime.wal_segment_size);
+  auto reopened_wal_result = storage::Wal::open(
+      wal_directory, 1, config.runtime.wal_segment_size,
+      storage::WalPrepareOptions{config.runtime.wal_prepare_lanes,
+                                 config.runtime.wal_parallel_prepare_min_commands});
   if (std::holds_alternative<Error>(reopened_wal_result)) {
     report_durable_error("recovery", "wal_reopen_failed",
                          std::get<Error>(reopened_wal_result).message);
@@ -1487,10 +1493,21 @@ bool run_engine_durable_single_instrument(const BenchmarkOptions& options) {
                                                     after_warmup.wal_group_commits);
   const auto measured_group_commands = counter_delta(after_measured.wal_group_commands,
                                                      after_warmup.wal_group_commands);
+  const auto warmup_parallel_groups = counter_delta(
+      after_warmup.wal_parallel_prepare_groups, initial.wal_parallel_prepare_groups);
+  const auto measured_parallel_groups = counter_delta(
+      after_measured.wal_parallel_prepare_groups,
+      after_warmup.wal_parallel_prepare_groups);
+  const auto warmup_prepare_tasks = counter_delta(after_warmup.wal_prepare_tasks,
+                                                   initial.wal_prepare_tasks);
+  const auto measured_prepare_tasks = counter_delta(after_measured.wal_prepare_tasks,
+                                                     after_warmup.wal_prepare_tasks);
   if (!warmup_commands.has_value() || !measured_commands.has_value() ||
       !measured_trades.has_value() || !warmup_group_commits.has_value() ||
       !warmup_group_commands.has_value() || !measured_group_commits.has_value() ||
-      !measured_group_commands.has_value()) {
+      !measured_group_commands.has_value() || !warmup_parallel_groups.has_value() ||
+      !measured_parallel_groups.has_value() || !warmup_prepare_tasks.has_value() ||
+      !measured_prepare_tasks.has_value()) {
     report_durable_error("validation", "counter_delta_invalid");
     cleanup();
     return false;
@@ -1573,8 +1590,15 @@ bool run_engine_durable_single_instrument(const BenchmarkOptions& options) {
             << " active_levels=" << after_measured.active_price_levels
             << " group_size=" << config.runtime.group_commit_max_commands
             << " group_delay_us=" << config.runtime.group_commit_max_delay.count()
+            << " wal_prepare_workers=" << config.runtime.wal_prepare_lanes
+            << " wal_parallel_prepare_min_commands="
+            << config.runtime.wal_parallel_prepare_min_commands
             << " wal_group_commits=" << *measured_group_commits
             << " wal_group_commands=" << *measured_group_commands
+            << " actual_parallel_prepare_groups=" << *measured_parallel_groups
+            << " actual_prepare_tasks=" << *measured_prepare_tasks
+            << " wal_sync_full_run_p99_us="
+            << after_measured.wal_sync_latency.p99_microseconds
             << " actual_commands_per_group=" << actual_commands_per_group
             << " wal_mib_per_second=" << wal_mib_per_second
             << " wal_bytes_delta=" << wal_bytes_delta
@@ -1760,9 +1784,10 @@ int main(const int argc, char** argv) {
   }
   if (options->wal_prepare_options_set &&
       options->workload != WorkloadSelection::wal_write_ceiling &&
-      options->workload != WorkloadSelection::engine_writer_hot_path_profile) {
+      options->workload != WorkloadSelection::engine_writer_hot_path_profile &&
+      options->workload != WorkloadSelection::engine_durable_single_instrument) {
     std::cerr << "workload=" << workload_name(options->workload)
-              << " phase=cli error_code=wal_prepare_options_requires_wal_or_writer_workload\n";
+              << " phase=cli error_code=wal_prepare_options_requires_supported_workload\n";
     print_usage();
     return 2;
   }

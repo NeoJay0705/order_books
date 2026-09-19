@@ -37,6 +37,11 @@ struct MetricsSnapshot {
   HistogramSnapshot wal_commit_latency;
   HistogramSnapshot execution_latency;
   HistogramSnapshot publish_latency;
+  std::uint64_t wal_prepare_lanes{};
+  std::uint64_t wal_parallel_prepare_min_commands{};
+  std::uint64_t wal_parallel_prepare_groups{};
+  std::uint64_t wal_prepare_tasks{};
+  HistogramSnapshot wal_sync_latency;
 };
 
 class MetricsSink {

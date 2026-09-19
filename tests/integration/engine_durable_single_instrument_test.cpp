@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "order_books/engine.hpp"
+#include "persistence/wal.hpp"
 
 namespace order_books {
 namespace {
@@ -134,8 +135,142 @@ TEST(EngineDurableSingleInstrumentTest, CompletesCommittedCrossingPair) {
   EXPECT_EQ(std::get<MetricsSnapshot>(snapshot).active_price_levels, 0U);
   EXPECT_GT(std::get<MetricsSnapshot>(snapshot).wal_group_commits, 0U);
   EXPECT_EQ(std::get<MetricsSnapshot>(snapshot).wal_group_commands, 8U);
+  EXPECT_EQ(std::get<MetricsSnapshot>(snapshot).wal_prepare_lanes, 1U);
+  EXPECT_EQ(std::get<MetricsSnapshot>(snapshot).wal_parallel_prepare_min_commands, 4096U);
+  EXPECT_EQ(std::get<MetricsSnapshot>(snapshot).wal_parallel_prepare_groups, 0U);
+  EXPECT_GT(std::get<MetricsSnapshot>(snapshot).wal_prepare_tasks, 0U);
+  EXPECT_GT(std::get<MetricsSnapshot>(snapshot).wal_sync_latency.count, 0U);
   EXPECT_TRUE(std::holds_alternative<std::monostate>(engine->stop()));
 
+  std::filesystem::remove_all(data_directory, ignored);
+}
+
+TEST(EngineDurableSingleInstrumentTest, AcceptsExplicitParallelPrepareConfiguration) {
+  const auto data_directory = std::filesystem::temp_directory_path() /
+                              "order_books_engine_parallel_prepare_configuration_test";
+  std::error_code ignored;
+  std::filesystem::remove_all(data_directory, ignored);
+
+  AcknowledgingSink sink;
+  NullMetricsSink metrics;
+  EngineConfig config;
+  config.data_directory = data_directory;
+  config.shard_ids = {1};
+  config.instruments = {InstrumentConfig{1, 1, 1, 1}};
+  config.runtime.group_commit_max_commands = 4;
+  config.runtime.group_commit_max_delay = std::chrono::milliseconds(100);
+  config.runtime.wal_prepare_lanes = 2;
+  config.runtime.wal_parallel_prepare_min_commands = 4;
+
+  auto opened = Engine::open(config, sink, metrics);
+  ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Engine>>(opened));
+  auto engine = std::get<std::unique_ptr<Engine>>(std::move(opened));
+
+  std::mutex completion_mutex;
+  std::condition_variable completion_condition;
+  std::vector<CommandResult> completions;
+  for (std::uint64_t index = 0; index < 4; ++index) {
+    ASSERT_TRUE(engine
+                    ->submit(make_command(index + 1U, index + 1U,
+                                           index % 2U == 0U ? Side::sell : Side::buy),
+                             [&completion_mutex, &completion_condition, &completions](
+                                 CommandResult result) {
+                               {
+                                 std::lock_guard lock(completion_mutex);
+                                 completions.push_back(std::move(result));
+                               }
+                               completion_condition.notify_all();
+                             })
+                    .queued);
+  }
+  {
+    std::unique_lock lock(completion_mutex);
+    ASSERT_TRUE(completion_condition.wait_for(lock, std::chrono::seconds(5), [&] {
+      return completions.size() == 4U;
+    }));
+  }
+
+  for (const auto& result : completions) {
+    EXPECT_EQ(result.command_status, CommandStatus::committed);
+    EXPECT_EQ(result.error_code, ErrorCode::none);
+  }
+
+  const auto snapshot = engine->metrics(1);
+  ASSERT_TRUE(std::holds_alternative<MetricsSnapshot>(snapshot));
+  const auto& metrics_snapshot = std::get<MetricsSnapshot>(snapshot);
+  EXPECT_EQ(metrics_snapshot.wal_prepare_lanes, 2U);
+  EXPECT_EQ(metrics_snapshot.wal_parallel_prepare_min_commands, 4U);
+  EXPECT_GT(metrics_snapshot.wal_parallel_prepare_groups, 0U);
+  EXPECT_GE(metrics_snapshot.wal_prepare_tasks, 2U);
+
+  ASSERT_TRUE(std::holds_alternative<std::monostate>(engine->stop()));
+  engine.reset();
+
+  auto reopened = storage::Wal::open(
+      data_directory / "shard-1" / "wal", 1, config.runtime.wal_segment_size,
+      storage::WalPrepareOptions{config.runtime.wal_prepare_lanes,
+                                 config.runtime.wal_parallel_prepare_min_commands});
+  ASSERT_TRUE(std::holds_alternative<std::unique_ptr<storage::Wal>>(reopened));
+  auto wal = std::get<std::unique_ptr<storage::Wal>>(std::move(reopened));
+  auto replayed = wal->replay();
+  ASSERT_TRUE(std::holds_alternative<std::vector<domain::CommittedCommand>>(replayed));
+  EXPECT_EQ(std::get<std::vector<domain::CommittedCommand>>(replayed).size(), 4U);
+  EXPECT_EQ(wal->last_engine_seq(), 4U);
+  std::filesystem::remove_all(data_directory, ignored);
+}
+
+TEST(EngineDurableSingleInstrumentTest, FallsBackBeforeParallelPrepareThreshold) {
+  const auto data_directory = std::filesystem::temp_directory_path() /
+                              "order_books_engine_parallel_prepare_fallback_test";
+  std::error_code ignored;
+  std::filesystem::remove_all(data_directory, ignored);
+
+  AcknowledgingSink sink;
+  NullMetricsSink metrics;
+  EngineConfig config;
+  config.data_directory = data_directory;
+  config.shard_ids = {1};
+  config.instruments = {InstrumentConfig{1, 1, 1, 1}};
+  config.runtime.group_commit_max_commands = 2;
+  config.runtime.group_commit_max_delay = std::chrono::milliseconds(100);
+  config.runtime.wal_prepare_lanes = 2;
+  config.runtime.wal_parallel_prepare_min_commands = 4;
+
+  auto opened = Engine::open(config, sink, metrics);
+  ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Engine>>(opened));
+  auto engine = std::get<std::unique_ptr<Engine>>(std::move(opened));
+
+  std::mutex completion_mutex;
+  std::condition_variable completion_condition;
+  std::size_t completed = 0;
+  for (std::uint64_t index = 0; index < 2; ++index) {
+    ASSERT_TRUE(engine
+                    ->submit(make_command(index + 1U, index + 1U,
+                                           index % 2U == 0U ? Side::sell : Side::buy),
+                             [&completion_mutex, &completion_condition, &completed](
+                                 CommandResult result) {
+                               (void)result;
+                               {
+                                 std::lock_guard lock(completion_mutex);
+                                 ++completed;
+                               }
+                               completion_condition.notify_all();
+                             })
+                    .queued);
+  }
+  {
+    std::unique_lock lock(completion_mutex);
+    ASSERT_TRUE(completion_condition.wait_for(lock, std::chrono::seconds(5), [&] {
+      return completed == 2U;
+    }));
+  }
+
+  const auto snapshot = engine->metrics(1);
+  ASSERT_TRUE(std::holds_alternative<MetricsSnapshot>(snapshot));
+  const auto& metrics_snapshot = std::get<MetricsSnapshot>(snapshot);
+  EXPECT_EQ(metrics_snapshot.wal_parallel_prepare_groups, 0U);
+  EXPECT_GT(metrics_snapshot.wal_prepare_tasks, 0U);
+  EXPECT_TRUE(std::holds_alternative<std::monostate>(engine->stop()));
   std::filesystem::remove_all(data_directory, ignored);
 }
 

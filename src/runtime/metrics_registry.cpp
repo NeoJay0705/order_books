@@ -12,7 +12,7 @@ constexpr std::array<std::uint64_t, 22U> kLatencyUpperBounds{
     500U,     1'000U,   2'500U,   5'000U,   10'000U,  25'000U,  50'000U,  100'000U,
     250'000U, 500'000U, 1'000'000U, 5'000'000U, 10'000'000U, std::numeric_limits<std::uint64_t>::max()};
 
-constexpr std::array<std::string_view, 30U> kMetricNames{
+constexpr std::array<std::string_view, 35U> kMetricNames{
     "active_instruments",
     "active_orders",
     "active_price_levels",
@@ -35,6 +35,10 @@ constexpr std::array<std::string_view, 30U> kMetricNames{
     "queue_depth",
     "queue_latency_us",
     "replayed_records",
+    "wal_parallel_prepare_groups",
+    "wal_parallel_prepare_min_commands",
+    "wal_prepare_lanes",
+    "wal_prepare_tasks",
     "sequence_gaps",
     "stale_epochs",
     "trades",
@@ -42,6 +46,7 @@ constexpr std::array<std::string_view, 30U> kMetricNames{
     "wal_group_commits",
     "wal_group_commands",
     "wal_size_bytes",
+    "wal_sync_latency_us",
     "execution_latency_us",
 };
 
@@ -52,6 +57,7 @@ bool is_known_metric(const std::string_view name) {
 bool is_histogram(const std::string_view name) {
   return name == "queue_latency_us" || name == "end_to_end_latency_us" ||
          name == "wal_commit_latency_us" ||
+         name == "wal_sync_latency_us" ||
          name == "execution_latency_us" || name == "publish_latency_us";
 }
 
@@ -123,7 +129,9 @@ void MetricsRegistry::observe(const std::string_view name, const std::uint64_t v
         if (name == "active_orders" || name == "active_price_levels" ||
             name == "active_instruments" || name == "queue_depth" ||
             name == "wal_size_bytes" || name == "event_publish_lag_events" ||
-            name == "event_publish_lag_bytes" || name == "event_publish_lag_age_ns") {
+            name == "event_publish_lag_bytes" || name == "event_publish_lag_age_ns" ||
+            name == "wal_prepare_lanes" ||
+            name == "wal_parallel_prepare_min_commands") {
           counter = value;
         } else {
           counter = counter > std::numeric_limits<std::uint64_t>::max() - value
@@ -166,6 +174,11 @@ MetricsSnapshot MetricsRegistry::snapshot() const {
   result.active_instruments = read_counter("active_instruments");
   result.queue_depth = read_counter("queue_depth");
   result.wal_size_bytes = read_counter("wal_size_bytes");
+  result.wal_prepare_lanes = read_counter("wal_prepare_lanes");
+  result.wal_parallel_prepare_min_commands =
+      read_counter("wal_parallel_prepare_min_commands");
+  result.wal_parallel_prepare_groups = read_counter("wal_parallel_prepare_groups");
+  result.wal_prepare_tasks = read_counter("wal_prepare_tasks");
   result.wal_group_commits = read_counter("wal_group_commits");
   result.wal_group_commands = read_counter("wal_group_commands");
   result.replayed_records = read_counter("replayed_records");
@@ -175,6 +188,7 @@ MetricsSnapshot MetricsRegistry::snapshot() const {
   result.queue_latency = read_histogram("queue_latency_us");
   result.end_to_end_latency = read_histogram("end_to_end_latency_us");
   result.wal_commit_latency = read_histogram("wal_commit_latency_us");
+  result.wal_sync_latency = read_histogram("wal_sync_latency_us");
   result.execution_latency = read_histogram("execution_latency_us");
   result.publish_latency = read_histogram("publish_latency_us");
   return result;

@@ -34,8 +34,7 @@ class ShardRuntime {
   static Result<std::unique_ptr<ShardRuntime>> open(
       ShardId shard_id, const EngineConfig& config, EventSink& event_sink,
       MetricsSink& metrics_sink, WriterProfileCollector* profile = nullptr,
-      WriterProfileOptions profile_options = {},
-      storage::WalPrepareOptions wal_prepare_options = {});
+      WriterProfileOptions profile_options = {});
 
   ~ShardRuntime();
 
@@ -116,6 +115,7 @@ class ShardRuntime {
   WriterProfileOptions profile_options_{};
   std::atomic<std::uint64_t> profile_groups_seen_{};
   std::atomic<bool> profile_phase_active_{true};
+  storage::WalPrepareStats last_wal_prepare_stats_{};
 
   std::mutex queue_mutex_;
   std::condition_variable_any queue_condition_;

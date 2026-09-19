@@ -47,6 +47,14 @@ Result<std::unique_ptr<Engine>> Engine::open(EngineConfig config,
       config.runtime.max_publish_lag_age.count() <= 0) {
     return config_error("runtime limits must be positive");
   }
+  if (config.runtime.wal_prepare_lanes != 1U &&
+      config.runtime.wal_prepare_lanes != 2U &&
+      config.runtime.wal_prepare_lanes != 4U) {
+    return config_error("wal prepare lanes must be 1, 2, or 4");
+  }
+  if (config.runtime.wal_parallel_prepare_min_commands == 0U) {
+    return config_error("wal parallel prepare threshold must be positive");
+  }
 
   std::unordered_set<ShardId> shard_set;
   for (const auto shard_id : config.shard_ids) {

@@ -227,8 +227,7 @@ class ScopeGuard final {
 Result<std::unique_ptr<ShardRuntime>> ShardRuntime::open(
     const ShardId shard_id, const EngineConfig& config, EventSink& event_sink,
     MetricsSink& metrics_sink, WriterProfileCollector* profile,
-    const WriterProfileOptions profile_options,
-    const storage::WalPrepareOptions wal_prepare_options) {
+    const WriterProfileOptions profile_options) {
   if (config.data_directory.empty()) {
     return invalid_config_error("data directory is empty");
   }
@@ -278,7 +277,9 @@ Result<std::unique_ptr<ShardRuntime>> ShardRuntime::open(
   }
   auto wal_result = storage::Wal::open(shard_directory / "wal", shard_id,
                                        config.runtime.wal_segment_size,
-                                       wal_prepare_options);
+                                       storage::WalPrepareOptions{
+                                           config.runtime.wal_prepare_lanes,
+                                           config.runtime.wal_parallel_prepare_min_commands});
   if (std::holds_alternative<Error>(wal_result)) {
     return std::get<Error>(wal_result);
   }
@@ -380,6 +381,9 @@ Result<std::unique_ptr<ShardRuntime>> ShardRuntime::open(
       std::move(replay_snapshots_result));
   auto metrics_registry = std::make_unique<MetricsRegistry>(metrics_sink);
   auto publisher_metrics = std::make_unique<MetricsRegistry>(metrics_sink);
+  metrics_registry->observe("wal_prepare_lanes", config.runtime.wal_prepare_lanes);
+  metrics_registry->observe("wal_parallel_prepare_min_commands",
+                            config.runtime.wal_parallel_prepare_min_commands);
   metrics_registry->observe("active_instruments", state_machine.state().instruments.size());
   metrics_registry->observe("active_orders", state_machine.state().active_order_count);
   metrics_registry->observe("wal_size_bytes", wal->size_bytes());
@@ -976,17 +980,31 @@ void ShardRuntime::process_command_batch(std::vector<CommandWork> batch,
                                  ? steady_elapsed_ns(wal_append_start,
                                                      std::chrono::steady_clock::now())
                                  : 0U;
-  const auto wal_sync_start = profile_sampled ? std::chrono::steady_clock::now()
-                                                   : std::chrono::steady_clock::time_point{};
+  const auto wal_sync_start = std::chrono::steady_clock::now();
   if (const auto status = wal_->sync(); std::holds_alternative<Error>(status)) {
     reject_batch_pending(ErrorCode::engine_unavailable);
     fail(std::get<Error>(status));
     return;
   }
+  const auto wal_sync_end = std::chrono::steady_clock::now();
   const auto wal_sync_ns = profile_sampled
-                               ? steady_elapsed_ns(wal_sync_start,
-                                                   std::chrono::steady_clock::now())
+                               ? steady_elapsed_ns(wal_sync_start, wal_sync_end)
                                : 0U;
+  metrics_registry_->observe(
+      "wal_sync_latency_us",
+      static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                      wal_sync_end - wal_sync_start)
+                                      .count()));
+  const auto prepare_stats = wal_->prepare_stats();
+  if (prepare_stats.parallel_groups >= last_wal_prepare_stats_.parallel_groups &&
+      prepare_stats.tasks >= last_wal_prepare_stats_.tasks) {
+    metrics_registry_->observe(
+        "wal_parallel_prepare_groups",
+        prepare_stats.parallel_groups - last_wal_prepare_stats_.parallel_groups);
+    metrics_registry_->observe("wal_prepare_tasks",
+                               prepare_stats.tasks - last_wal_prepare_stats_.tasks);
+    last_wal_prepare_stats_ = prepare_stats;
+  }
   const auto wal_latency = std::chrono::duration_cast<std::chrono::microseconds>(
       std::chrono::steady_clock::now() - wal_start);
   metrics_registry_->observe("wal_group_commits", 1);
