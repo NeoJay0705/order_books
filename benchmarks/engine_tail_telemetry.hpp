@@ -38,7 +38,30 @@ enum class TailTelemetryBoundary : std::uint8_t {
     std::chrono::steady_clock::time_point previous_deadline,
     std::chrono::steady_clock::time_point observed_at) noexcept;
 
+struct TailClockAnchor {
+  std::uint64_t realtime_epoch_ns{};
+  std::uint64_t steady_elapsed_ns{};
+  std::uint64_t uncertainty_ns{};
+};
+
+struct TailEpochInterval {
+  std::uint64_t start_epoch_ns{};
+  std::uint64_t end_epoch_ns{};
+};
+
+[[nodiscard]] bool tail_clock_anchors_consistent(
+    const TailClockAnchor& start, const TailClockAnchor& end) noexcept;
+
+[[nodiscard]] std::optional<TailEpochInterval> map_tail_sample_to_epoch_interval_ns(
+    const TailClockAnchor& start, std::uint64_t elapsed_us,
+    std::uint64_t duration_us) noexcept;
+
 struct TailTelemetrySummary {
+  std::optional<std::uint64_t> tail_clock_start_realtime_epoch_ns;
+  std::optional<std::uint64_t> tail_clock_start_uncertainty_ns;
+  std::optional<std::uint64_t> tail_clock_end_realtime_epoch_ns;
+  std::optional<std::uint64_t> tail_clock_end_steady_elapsed_ns;
+  std::optional<std::uint64_t> tail_clock_end_uncertainty_ns;
   std::uint64_t measured_sync_count{};
   std::optional<std::uint64_t> measured_sync_p50_us;
   std::optional<std::uint64_t> measured_sync_p99_us;
@@ -122,6 +145,8 @@ class EngineTailTelemetry final : public order_books::MetricsSink {
 
   std::atomic<TailTelemetryPhase> phase_{TailTelemetryPhase::disabled};
   std::chrono::steady_clock::time_point measured_epoch_{};
+  std::optional<TailClockAnchor> start_clock_anchor_;
+  std::optional<TailClockAnchor> end_clock_anchor_;
   mutable std::mutex mutex_;
   std::vector<Record> records_;
   bool setup_failed_{};

@@ -36,6 +36,21 @@ endif()
 if(NOT STDOUT MATCHES "tail_telemetry=on")
   message(FATAL_ERROR "telemetry summary missing\nstdout:\n${STDOUT}")
 endif()
+foreach(CLOCK_FIELD IN ITEMS
+        tail_clock_start_realtime_epoch_ns
+        tail_clock_end_realtime_epoch_ns
+        tail_clock_end_steady_elapsed_ns)
+  if(NOT STDOUT MATCHES "${CLOCK_FIELD}=[1-9][0-9]*")
+    message(FATAL_ERROR "telemetry clock field ${CLOCK_FIELD} must be non-zero\nstdout:\n${STDOUT}")
+  endif()
+endforeach()
+foreach(CLOCK_FIELD IN ITEMS
+        tail_clock_start_uncertainty_ns
+        tail_clock_end_uncertainty_ns)
+  if(NOT STDOUT MATCHES "${CLOCK_FIELD}=[0-9]+")
+    message(FATAL_ERROR "telemetry clock field ${CLOCK_FIELD} missing\nstdout:\n${STDOUT}")
+  endif()
+endforeach()
 if(NOT STDOUT MATCHES "tail_state_sampling=${state_sampling}")
   message(FATAL_ERROR "state sampling mode missing\nstdout:\n${STDOUT}")
 endif()

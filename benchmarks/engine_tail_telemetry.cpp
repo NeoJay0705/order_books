@@ -1,6 +1,7 @@
 #include "engine_tail_telemetry.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -15,6 +16,57 @@ using order_books::MetricsSnapshot;
 
 constexpr std::string_view kSyncMetric = "wal_sync_latency_us";
 constexpr std::string_view kGroupCommandsMetric = "wal_group_commands";
+constexpr std::uint64_t kClockResolutionAllowanceNs = 1'000U;
+
+struct CapturedClock {
+  std::chrono::steady_clock::time_point steady_at;
+  std::uint64_t realtime_epoch_ns{};
+  std::uint64_t uncertainty_ns{};
+};
+
+std::optional<CapturedClock> capture_clock() noexcept {
+  try {
+    const auto realtime_before = std::chrono::system_clock::now().time_since_epoch();
+    const auto steady_at = std::chrono::steady_clock::now();
+    const auto realtime_after = std::chrono::system_clock::now().time_since_epoch();
+    const auto before_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               realtime_before)
+                               .count();
+    const auto after_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              realtime_after)
+                              .count();
+    if (before_ns < 0 || after_ns < before_ns) {
+      return std::nullopt;
+    }
+    const auto bracket_ns = static_cast<std::uint64_t>(after_ns - before_ns);
+    const auto midpoint_delta = bracket_ns / 2U;
+    if (static_cast<std::uint64_t>(before_ns) >
+        std::numeric_limits<std::uint64_t>::max() - midpoint_delta) {
+      return std::nullopt;
+    }
+    return CapturedClock{steady_at, static_cast<std::uint64_t>(before_ns) + midpoint_delta,
+                         bracket_ns};
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+std::optional<std::uint64_t> steady_elapsed_ns(
+    const std::chrono::steady_clock::time_point base,
+    const std::chrono::steady_clock::time_point observed) noexcept {
+  if (observed < base) {
+    return std::nullopt;
+  }
+  try {
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(observed - base);
+    if (elapsed.count() < 0) {
+      return std::nullopt;
+    }
+    return static_cast<std::uint64_t>(elapsed.count());
+  } catch (...) {
+    return std::nullopt;
+  }
+}
 
 bool checked_add(std::uint64_t& target, const std::uint64_t value) noexcept {
   if (target > std::numeric_limits<std::uint64_t>::max() - value) {
@@ -45,6 +97,49 @@ std::chrono::steady_clock::time_point next_tail_sample_deadline(
     next_deadline = observed_at + EngineTailTelemetry::kStateSampleInterval;
   }
   return next_deadline;
+}
+
+bool tail_clock_anchors_consistent(const TailClockAnchor& start,
+                                   const TailClockAnchor& end) noexcept {
+  if (end.realtime_epoch_ns < start.realtime_epoch_ns ||
+      end.steady_elapsed_ns < start.steady_elapsed_ns) {
+    return false;
+  }
+  const auto realtime_delta = end.realtime_epoch_ns - start.realtime_epoch_ns;
+  const auto steady_delta = end.steady_elapsed_ns - start.steady_elapsed_ns;
+  const auto drift = realtime_delta >= steady_delta
+                         ? realtime_delta - steady_delta
+                         : steady_delta - realtime_delta;
+  if (start.uncertainty_ns > std::numeric_limits<std::uint64_t>::max() -
+                                 end.uncertainty_ns) {
+    return false;
+  }
+  const auto uncertainty = start.uncertainty_ns + end.uncertainty_ns;
+  if (uncertainty > std::numeric_limits<std::uint64_t>::max() -
+                        kClockResolutionAllowanceNs) {
+    return false;
+  }
+  return drift <= uncertainty + kClockResolutionAllowanceNs;
+}
+
+std::optional<TailEpochInterval> map_tail_sample_to_epoch_interval_ns(
+    const TailClockAnchor& start, const std::uint64_t elapsed_us,
+    const std::uint64_t duration_us) noexcept {
+  if (elapsed_us > std::numeric_limits<std::uint64_t>::max() / 1'000U ||
+      duration_us > std::numeric_limits<std::uint64_t>::max() / 1'000U) {
+    return std::nullopt;
+  }
+  const auto elapsed_ns = elapsed_us * 1'000U;
+  const auto duration_ns = duration_us * 1'000U;
+  if (start.realtime_epoch_ns >
+      std::numeric_limits<std::uint64_t>::max() - elapsed_ns) {
+    return std::nullopt;
+  }
+  const auto end_epoch_ns = start.realtime_epoch_ns + elapsed_ns;
+  if (duration_ns > end_epoch_ns) {
+    return std::nullopt;
+  }
+  return TailEpochInterval{end_epoch_ns - duration_ns, end_epoch_ns};
 }
 
 EngineTailTelemetry::EngineTailTelemetry(const std::size_t expected_groups) {
@@ -132,16 +227,48 @@ bool EngineTailTelemetry::begin_measured() noexcept {
   if (phase_.load(std::memory_order_acquire) != TailTelemetryPhase::disabled) {
     return false;
   }
-  measured_epoch_ = std::chrono::steady_clock::now();
+  const auto captured = capture_clock();
+  if (!captured.has_value()) {
+    return false;
+  }
+  measured_epoch_ = captured->steady_at;
+  {
+    std::lock_guard lock(mutex_);
+    start_clock_anchor_ = TailClockAnchor{captured->realtime_epoch_ns, 0U,
+                                          captured->uncertainty_ns};
+    end_clock_anchor_.reset();
+  }
   phase_.store(TailTelemetryPhase::measured, std::memory_order_release);
   return true;
 }
 
 bool EngineTailTelemetry::begin_drain() noexcept {
+  std::lock_guard lock(mutex_);
+  if (phase_.load(std::memory_order_acquire) != TailTelemetryPhase::measured ||
+      !start_clock_anchor_.has_value()) {
+    return false;
+  }
+  const auto captured = capture_clock();
+  if (!captured.has_value()) {
+    return false;
+  }
+  const auto elapsed = steady_elapsed_ns(measured_epoch_, captured->steady_at);
+  if (!elapsed.has_value()) {
+    return false;
+  }
+  const TailClockAnchor end{captured->realtime_epoch_ns, *elapsed,
+                            captured->uncertainty_ns};
+  if (!tail_clock_anchors_consistent(*start_clock_anchor_, end)) {
+    return false;
+  }
   auto expected = TailTelemetryPhase::measured;
-  return phase_.compare_exchange_strong(expected, TailTelemetryPhase::drain,
-                                         std::memory_order_acq_rel,
-                                         std::memory_order_acquire);
+  if (!phase_.compare_exchange_strong(expected, TailTelemetryPhase::drain,
+                                      std::memory_order_acq_rel,
+                                      std::memory_order_acquire)) {
+    return false;
+  }
+  end_clock_anchor_ = end;
+  return true;
 }
 
 bool EngineTailTelemetry::record_drain_snapshot(
@@ -322,11 +449,15 @@ std::string_view EngineTailTelemetry::phase_name(
 
 TailTelemetrySummary EngineTailTelemetry::summary() const {
   std::vector<Record> records;
+  std::optional<TailClockAnchor> start_clock_anchor;
+  std::optional<TailClockAnchor> end_clock_anchor;
   std::uint64_t dropped_samples = 0U;
   bool aggregate_overflow = false;
   {
     std::lock_guard lock(mutex_);
     records = records_;
+    start_clock_anchor = start_clock_anchor_;
+    end_clock_anchor = end_clock_anchor_;
     dropped_samples = dropped_samples_;
     aggregate_overflow = aggregate_overflow_;
   }
@@ -406,6 +537,15 @@ TailTelemetrySummary EngineTailTelemetry::summary() const {
   result.telemetry_dropped_samples = dropped_samples;
   result.sampler_error = sampler_error_.load(std::memory_order_acquire);
   result.aggregate_overflow = result.aggregate_overflow || aggregate_overflow;
+  if (start_clock_anchor.has_value()) {
+    result.tail_clock_start_realtime_epoch_ns = start_clock_anchor->realtime_epoch_ns;
+    result.tail_clock_start_uncertainty_ns = start_clock_anchor->uncertainty_ns;
+  }
+  if (end_clock_anchor.has_value()) {
+    result.tail_clock_end_realtime_epoch_ns = end_clock_anchor->realtime_epoch_ns;
+    result.tail_clock_end_steady_elapsed_ns = end_clock_anchor->steady_elapsed_ns;
+    result.tail_clock_end_uncertainty_ns = end_clock_anchor->uncertainty_ns;
+  }
   return result;
 }
 

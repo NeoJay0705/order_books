@@ -3,6 +3,8 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <optional>
 #include <string>
 #include <unistd.h>
 
@@ -10,6 +12,25 @@
 
 namespace order_books::benchmark {
 namespace {
+
+std::uint64_t realtime_epoch_now_ns() {
+  return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::system_clock::now().time_since_epoch())
+                                         .count());
+}
+
+void expect_anchor_within_bracket(
+    const std::optional<std::uint64_t>& realtime_epoch,
+    const std::optional<std::uint64_t>& uncertainty,
+    const std::uint64_t before, const std::uint64_t after) {
+  if (!realtime_epoch.has_value() || !uncertainty.has_value()) {
+    ADD_FAILURE() << "clock anchor fields are missing";
+    return;
+  }
+  EXPECT_GE(*realtime_epoch, before);
+  EXPECT_LE(*realtime_epoch, after);
+  EXPECT_LE(*uncertainty, after - before);
+}
 
 TEST(EngineTailTelemetryTest, KeepsTheDesignedStateSamplingInterval) {
   EXPECT_EQ(EngineTailTelemetry::kStateSampleInterval,
@@ -27,6 +48,102 @@ TEST(EngineTailTelemetryTest, AdvancesDeadlineWithoutCatchingUpMissedTicks) {
       previous, Clock::time_point{} + std::chrono::milliseconds(125));
   EXPECT_EQ(late, Clock::time_point{} + std::chrono::milliseconds(135));
   EXPECT_GT(late, Clock::time_point{} + std::chrono::milliseconds(125));
+}
+
+TEST(EngineTailTelemetryTest, ChecksClockAnchorsAndMapsElapsedSamples) {
+  const TailClockAnchor start{1'000'000'000U, 0U, 100U};
+  const TailClockAnchor end{1'020'000'100U, 20'000'000U, 100U};
+  EXPECT_TRUE(tail_clock_anchors_consistent(start, end));
+  EXPECT_TRUE(tail_clock_anchors_consistent(
+      TailClockAnchor{1'000'000'000U, 0U, 0U},
+      TailClockAnchor{1'020'000'000U, 20'000'000U, 0U}));
+  const auto interval =
+      map_tail_sample_to_epoch_interval_ns(start, 2'500U, 500U);
+  ASSERT_TRUE(interval.has_value());
+  if (!interval.has_value()) {
+    return;
+  }
+  EXPECT_EQ(interval->start_epoch_ns, 1'002'000'000U);
+  EXPECT_EQ(interval->end_epoch_ns, 1'002'500'000U);
+
+  const auto crossing =
+      map_tail_sample_to_epoch_interval_ns(start, 500U, 1'000U);
+  ASSERT_TRUE(crossing.has_value());
+  EXPECT_EQ(crossing->start_epoch_ns, 999'500'000U);
+  EXPECT_EQ(crossing->end_epoch_ns, 1'000'500'000U);
+
+  const TailClockAnchor stepped{1'020'002'000U, 20'000'000U, 100U};
+  EXPECT_FALSE(tail_clock_anchors_consistent(start, stepped));
+  EXPECT_FALSE(map_tail_sample_to_epoch_interval_ns(
+      TailClockAnchor{0U, 0U, 0U}, 1U, 2U));
+  EXPECT_FALSE(map_tail_sample_to_epoch_interval_ns(
+      start, (std::numeric_limits<std::uint64_t>::max() / 1'000U) + 1U, 0U));
+  EXPECT_FALSE(map_tail_sample_to_epoch_interval_ns(
+      TailClockAnchor{std::numeric_limits<std::uint64_t>::max() - 999U, 0U, 0U},
+      2U, 0U));
+}
+
+TEST(EngineTailTelemetryTest, AllowsEachClockPhaseTransitionOnlyOnce) {
+  EngineTailTelemetry telemetry(1);
+  ASSERT_TRUE(telemetry.reserve());
+  ASSERT_TRUE(telemetry.begin_measured());
+  const auto measured = telemetry.summary();
+  ASSERT_TRUE(measured.tail_clock_start_realtime_epoch_ns.has_value());
+  ASSERT_TRUE(measured.tail_clock_start_uncertainty_ns.has_value());
+  EXPECT_FALSE(telemetry.begin_measured());
+  const auto duplicate_measured = telemetry.summary();
+  EXPECT_EQ(duplicate_measured.tail_clock_start_realtime_epoch_ns,
+            measured.tail_clock_start_realtime_epoch_ns);
+  EXPECT_EQ(duplicate_measured.tail_clock_start_uncertainty_ns,
+            measured.tail_clock_start_uncertainty_ns);
+  ASSERT_TRUE(telemetry.begin_drain());
+  const auto drained = telemetry.summary();
+  ASSERT_TRUE(drained.tail_clock_end_realtime_epoch_ns.has_value());
+  EXPECT_FALSE(telemetry.begin_drain());
+  const auto duplicate_drain = telemetry.summary();
+  EXPECT_EQ(duplicate_drain.tail_clock_end_realtime_epoch_ns,
+            drained.tail_clock_end_realtime_epoch_ns);
+  EXPECT_EQ(duplicate_drain.tail_clock_end_steady_elapsed_ns,
+            drained.tail_clock_end_steady_elapsed_ns);
+  EXPECT_EQ(duplicate_drain.tail_clock_end_uncertainty_ns,
+            drained.tail_clock_end_uncertainty_ns);
+}
+
+TEST(EngineTailTelemetryTest, RejectsDrainBeforeMeasuredWithoutAnchors) {
+  EngineTailTelemetry telemetry(1);
+  ASSERT_TRUE(telemetry.reserve());
+  EXPECT_FALSE(telemetry.begin_drain());
+
+  const auto result = telemetry.summary();
+  EXPECT_FALSE(result.tail_clock_start_realtime_epoch_ns.has_value());
+  EXPECT_FALSE(result.tail_clock_start_uncertainty_ns.has_value());
+  EXPECT_FALSE(result.tail_clock_end_realtime_epoch_ns.has_value());
+  EXPECT_FALSE(result.tail_clock_end_steady_elapsed_ns.has_value());
+  EXPECT_FALSE(result.tail_clock_end_uncertainty_ns.has_value());
+}
+
+TEST(EngineTailTelemetryTest, CapturesClockAnchorsWithinExternalBrackets) {
+  EngineTailTelemetry telemetry(1);
+  ASSERT_TRUE(telemetry.reserve());
+  const auto start_before = realtime_epoch_now_ns();
+  ASSERT_TRUE(telemetry.begin_measured());
+  const auto start_after = realtime_epoch_now_ns();
+  ASSERT_LE(start_before, start_after);
+
+  const auto measured = telemetry.summary();
+  expect_anchor_within_bracket(measured.tail_clock_start_realtime_epoch_ns,
+                               measured.tail_clock_start_uncertainty_ns,
+                               start_before, start_after);
+
+  const auto end_before = realtime_epoch_now_ns();
+  ASSERT_TRUE(telemetry.begin_drain());
+  const auto end_after = realtime_epoch_now_ns();
+  ASSERT_LE(end_before, end_after);
+
+  const auto drained = telemetry.summary();
+  expect_anchor_within_bracket(drained.tail_clock_end_realtime_epoch_ns,
+                               drained.tail_clock_end_uncertainty_ns, end_before,
+                               end_after);
 }
 
 std::filesystem::path unique_artifact_path() {
@@ -58,6 +175,17 @@ TEST(EngineTailTelemetryTest, CollectsMeasuredSamplesAndSeparatesDrain) {
   EXPECT_EQ(result.measured_sync_max_us, 200U);
   EXPECT_EQ(result.measured_group_sample_count, 2U);
   EXPECT_EQ(result.measured_group_sample_commands, 4U);
+  ASSERT_TRUE(result.tail_clock_start_realtime_epoch_ns.has_value());
+  ASSERT_TRUE(result.tail_clock_start_uncertainty_ns.has_value());
+  ASSERT_TRUE(result.tail_clock_end_realtime_epoch_ns.has_value());
+  ASSERT_TRUE(result.tail_clock_end_steady_elapsed_ns.has_value());
+  ASSERT_TRUE(result.tail_clock_end_uncertainty_ns.has_value());
+  EXPECT_TRUE(tail_clock_anchors_consistent(
+      TailClockAnchor{*result.tail_clock_start_realtime_epoch_ns, 0U,
+                      *result.tail_clock_start_uncertainty_ns},
+      TailClockAnchor{*result.tail_clock_end_realtime_epoch_ns,
+                      *result.tail_clock_end_steady_elapsed_ns,
+                      *result.tail_clock_end_uncertainty_ns}));
   EXPECT_EQ(result.telemetry_dropped_samples, 0U);
   EXPECT_FALSE(result.sampler_error);
 }

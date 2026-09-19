@@ -1696,6 +1696,23 @@ bool run_engine_durable_single_instrument(const BenchmarkOptions& options) {
       return false;
     }
     tail_summary = telemetry->summary();
+    const auto tail_clock_valid =
+        tail_summary->tail_clock_start_realtime_epoch_ns.has_value() &&
+        tail_summary->tail_clock_start_uncertainty_ns.has_value() &&
+        tail_summary->tail_clock_end_realtime_epoch_ns.has_value() &&
+        tail_summary->tail_clock_end_steady_elapsed_ns.has_value() &&
+        tail_summary->tail_clock_end_uncertainty_ns.has_value() &&
+        *tail_summary->tail_clock_start_realtime_epoch_ns != 0U &&
+        *tail_summary->tail_clock_end_realtime_epoch_ns != 0U &&
+        *tail_summary->tail_clock_end_steady_elapsed_ns != 0U &&
+        benchmark::tail_clock_anchors_consistent(
+            benchmark::TailClockAnchor{
+                *tail_summary->tail_clock_start_realtime_epoch_ns, 0U,
+                *tail_summary->tail_clock_start_uncertainty_ns},
+            benchmark::TailClockAnchor{
+                *tail_summary->tail_clock_end_realtime_epoch_ns,
+                *tail_summary->tail_clock_end_steady_elapsed_ns,
+                *tail_summary->tail_clock_end_uncertainty_ns});
     const auto full_state_sampling_valid =
         !options.engine_tail_state_sampling ||
         (tail_summary->measured_queue_depth_max.has_value() &&
@@ -1706,7 +1723,10 @@ bool run_engine_durable_single_instrument(const BenchmarkOptions& options) {
          tail_summary->drain_publisher_lag_events_last.has_value() &&
          tail_summary->drain_publisher_lag_bytes_last.has_value() &&
          tail_summary->drain_publisher_lag_age_ns_last.has_value());
-    if (tail_summary->sampler_error || tail_summary->aggregate_overflow ||
+    if (!tail_clock_valid) {
+      report_durable_error("telemetry", "tail_clock_anchor_invalid");
+    }
+    if (!tail_clock_valid || tail_summary->sampler_error || tail_summary->aggregate_overflow ||
         tail_summary->telemetry_dropped_samples != 0U ||
         tail_summary->measured_sync_count != *measured_group_commits ||
         tail_summary->measured_group_sample_count != *measured_group_commits ||
@@ -1772,6 +1792,16 @@ bool run_engine_durable_single_instrument(const BenchmarkOptions& options) {
             << " wal_path=" << wal_path << " wal_bytes=" << after_measured.wal_size_bytes;
   if (tail_summary.has_value()) {
     std::cout << " tail_telemetry=on"
+              << " tail_clock_start_realtime_epoch_ns="
+              << optional_metric_value(tail_summary->tail_clock_start_realtime_epoch_ns)
+              << " tail_clock_start_uncertainty_ns="
+              << optional_metric_value(tail_summary->tail_clock_start_uncertainty_ns)
+              << " tail_clock_end_realtime_epoch_ns="
+              << optional_metric_value(tail_summary->tail_clock_end_realtime_epoch_ns)
+              << " tail_clock_end_steady_elapsed_ns="
+              << optional_metric_value(tail_summary->tail_clock_end_steady_elapsed_ns)
+              << " tail_clock_end_uncertainty_ns="
+              << optional_metric_value(tail_summary->tail_clock_end_uncertainty_ns)
               << " tail_state_sampling="
               << (options.engine_tail_state_sampling ? "on" : "off")
               << " measured_sync_count=" << tail_summary->measured_sync_count
