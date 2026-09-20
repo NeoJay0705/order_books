@@ -388,18 +388,22 @@ profile_bias_percent =
   / profile_off_median_rps × 100%
 ```
 
-只有 baseline 與 candidate、g4096 與 g8192 全部 `bias <= 5%`，才能選用該 N。選定後：
+只有 baseline 與 candidate 的 g4096 bias 全部 `<= 5%`，才能選用該 N。g8192 bias 仍須記錄；若超過
+5%，只將 g8192 phase rows 標為方向性不可解讀，不使 g4096 primary、direct WAL 或 Engine gate 失效。
+選定後：
 
 ```bash
 SAMPLE_EVERY=<8、16 或 32>
 test "$SAMPLE_EVERY" -eq 8 -o "$SAMPLE_EVERY" -eq 16 -o "$SAMPLE_EVERY" -eq 32
 ```
 
-若 N=32 仍不合格，停止 profile-on 正式矩陣並將結果判定為 `inconclusive`；不得用有偏差的 phase
-數據宣稱達到 15% publish reduction。每個正式 profile-on run 還必須有至少 50 個
-`profiled_groups`。
+若 N=32 仍不合格，停止 profile-on 正式矩陣並將結果判定為 `inconclusive`；不得用有偏差的 g4096
+phase 數據宣稱達到 15% publish reduction。g4096 每個正式 profile-on run 必須至少有 50 個
+`profiled_groups`；g8192 profile-on 只有在達到同一門檻時才可列為方向性 phase data，否則保留 raw
+summary 並標示 `directional / insufficient samples`。
 
-以下函式完整執行一個 N；一次只執行一個 N，計算完四組 bias 後才決定是否執行下一個：
+以下函式完整執行一個 N；一次只執行一個 N，計算完兩組 g4096 bias 後才決定是否執行下一個；
+g8192 bias 另行記錄為方向性資料：
 
 ```bash
 run_calibration_n() {
@@ -428,7 +432,7 @@ run_calibration_n() {
 }
 
 run_calibration_n 8
-# 只有任一 artifact/group bias > 5% 時才依序執行：
+# 只有任一 g4096 artifact bias > 5% 時才依序執行：
 # run_calibration_n 16
 # run_calibration_n 32
 ```
@@ -486,7 +490,8 @@ done
 - correctness、WAL replay、EngineSeq continuity、durable callback 或 completion exactly-once 失敗；
 - measured duration 少於 20 秒；
 - source／index／worktree／binary 或固定環境在矩陣中改變；
-- writer profile parent/child accounting 失敗、`profiled_groups < 50` 或 sample denominator 不一致；
+- writer g4096 profile parent/child accounting 失敗、`profiled_groups < 50` 或 sample denominator 不一致；
+- g8192 writer 的 profile sample 不足只使該方向性 rows 不可解讀，不是整體 formal matrix 的 invalid 原因；
 - publisher failure、storage pressure、Completion capacity wait 導致 benchmark 自行報錯。
 
 低 throughput、高 latency、慢 `fsync`、較高 CPU 或較多 context switches 本身不是 invalid reason。
@@ -503,7 +508,27 @@ group_fill_percent = actual_commands_per_group / configured_group_size × 100%
 phase方向性資料。g4096 authoritative Engine 若不足 90%，主要 Engine gate 判為 `inconclusive`，不可
 改用 g8192 或最快輪替代。
 
-### 13.3 每輪必收欄位
+### 13.3 WAL byte-identity control
+
+正式矩陣前後各執行一次 deterministic correctness control；此 control 不取代 formal throughput
+結果，也不與任何正式輪混合。baseline 與 candidate 使用同一組固定 commands、shard、segment size、
+prepare options 與 sync policy，至少涵蓋：
+
+1. 不 rotation 的 batch；
+2. 每個 segment 至少一筆、且 batch 橫跨多個 segment 的 rotation batch。
+
+每個 artifact 完成 append、`sync()`、close/reopen 後，依 segment filename 排序產生 manifest：
+
+```text
+relative_segment_path  file_size  sha256
+```
+
+兩份 manifest 必須以 `diff -u` 完全相同；檔名、size 或 hash 任一不同即為 correctness gate failure。
+同時保留兩份 replay 結果與 command ordering assertion。manifest、diff 與 stdout/status 必須保留在
+`$RUN_ROOT/logs/byte-identity/`，report 記錄 artifact 路徑與結果。不能以 replay 成功且 WAL size 相同
+推定 byte-for-byte 相同。
+
+### 13.4 每輪必收欄位
 
 共同欄位：
 
@@ -570,8 +595,10 @@ Candidate 只有同時符合下列條件才可標為 `pass / retain`：
 4. g4096 direct WAL median RPS regression <= 3%；
 5. g4096 authoritative Engine median RPS regression <= 3%，且非 supply-limited；
 6. g8192 direct WAL median RPS regression <= 3%；
-7. correctness與 identity gate全部通過；
-8. p99／p99.9、CPU seconds/command、context switches/command 或 storage tail沒有同時出現
+7. 每個 g4096 writer profile-on run 至少有 50 個 `profiled_groups`；g8192 writer 僅作方向性資料，
+   不作整體 validity gate；
+8. correctness與 identity gate全部通過；
+9. p99／p99.9、CPU seconds/command、context switches/command 或 storage tail沒有同時出現
    candidate median惡化且五個 paired rounds中至少三輪惡化。
 
 若 correctness／identity失敗，結論是 `invalid`；若 sample bias、有效輪數或 authoritative Engine group
@@ -618,8 +645,8 @@ Report 必須使用以下結構；沒有資料的欄位填 `not measured` 並說
 # WAL append publish bookkeeping 最小化壓測報告
 
 ## 1. 結論
-- result: pass / no material gain / inconclusive / invalid
-- retain candidate: yes / no / undecided
+- result: pass / performance guardrail failed / no material gain / inconclusive / invalid
+- retain candidate: yes / no / provisional / undecided
 - primary reason:
 - publish median reduction:
 - direct WAL regression:
@@ -643,6 +670,7 @@ Report 必須使用以下結構；沒有資料的欄位填 `not measured` 並說
 - Debug／Release／ASan／UBSan結果
 - smoke結果
 - replay／ordering／durability／completion結果
+- deterministic WAL byte-identity manifest、diff與artifact路徑
 - invalid/excluded runs及原因
 - supply-limited runs
 - selected SAMPLE_EVERY與各artifact/group profile bias
@@ -678,6 +706,7 @@ Report 必須使用以下結構；沒有資料的欄位填 `not measured` 並說
 - 若pass：保留candidate，指出剩餘第一個同步ceiling。
 - 若no material gain：不擴大本patch，回到plan/copy/cache insertion attribution。
 - 若inconclusive/invalid：列出必須重測的原因，不下效能結論。
+- 若 correctness byte-identity control 未執行：明確標示 `not measured`，不得宣稱 correctness gate 全部通過。
 
 ## Appendix A. 每輪原始摘要
 | artifact | case | round | RPS | latency | phase | CPU/context | valid |

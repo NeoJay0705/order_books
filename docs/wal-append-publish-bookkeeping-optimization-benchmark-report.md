@@ -2,15 +2,16 @@
 
 ## 1. 結論
 
-- result: `inconclusive`
-- retain candidate: `no`
-- primary reason: correctness 與 identity gate 通過，但 g8192 writer 的五個
-  profile-on formal run 只有 41–45 個 `profiled_groups`，低於程序要求的至少 50；因此整份
-  formal matrix 不能作為可保留結論。另有 g4096 writer 的 p99.9 與 involuntary context
-  switch guardrail 惡化，需在重測前處理／確認。
+- result: `performance guardrail failed / do not retain`
+- candidate status: `provisional, not accepted`
+- primary reason: g4096 primary correctness、calibration、repository/binary identity、direct WAL
+  與 authoritative Engine 資料有效，但 g4096 writer 的 p99.9 與 involuntary context switch
+  guardrail 惡化。g8192
+  writer 的五個 profile-on formal run 只有 41–45 個 `profiled_groups`；依 review 後的 scope，這些
+  rows 只能標為方向性資料不足，不再使整份 formal matrix 變成 `inconclusive`。
 - observed g4096 writer `wal_publish_ns_per_command` median reduction: 80.49%
-  (424.081 → 82.727 ns/command)。這是有效樣本的觀測值，但因上述 validity gate 未通過，
-  不宣稱為可保留的效能結論。
+  (424.081 → 82.727 ns/command)。這是有效樣本的觀測值，但不抵銷 tail/resource guardrail
+  失敗，不能宣稱為可保留的效能結論。
 - direct WAL regression: none observed；g4096 candidate +29.89%、g8192 candidate
   +23.74% median RPS。
 - authoritative Engine regression: none observed；candidate +7.31% median RPS，group
@@ -31,6 +32,9 @@
   round 2/4 為 candidate→baseline。
 - pilot 僅用來決定 iterations，不納入正式結果；profile calibration 依序嘗試 N=8、16，N=16
   通過後使用 `SAMPLE_EVERY=16`。
+- deterministic WAL byte-identity control 已完成；未 rotation 與跨 segment rotation 的 segment
+  path、size、SHA-256 manifest 均一致，artifact 位於
+  `/home/neojhou/wal-publish-bookkeeping-wQgSFDz7/logs/byte-identity/`。
 - 不在範圍：W=1/4、group=16384、Publisher／Completion 獨立 microbenchmark、其他 pipeline
   stage、WAL format 或 runtime default 的修改。
 
@@ -74,6 +78,8 @@
   correctness verified；authoritative Engine g4096 durable/replay/telemetry verified。
 - formal status：70/70 exit status 0；writer `correctness_verified=true`、direct WAL
   `replay_verified=true`；Engine telemetry dropped samples=0。
+- byte-identity control：baseline/candidate 均 replay verified；未 rotation 與跨 segment rotation
+  manifest diff 均為空，WAL bytes 逐位元一致。
 - 沒有因低 throughput、慢 fsync 或高 latency 排除任何 formal run；所有 raw stdout/stderr/status/time/
   telemetry 保留在 RUN_ROOT。
 - profile calibration：
@@ -89,10 +95,12 @@
   | 16 | baseline | 8192 | 171,861 | 165,065 | 3.95% |
   | 16 | candidate | 8192 | 181,290 | 176,718 | 2.52% |
 
-  因此 `SAMPLE_EVERY=16` 通過四組 bias ≤5% 的 calibration gate。
+  因此 `SAMPLE_EVERY=16` 通過 g4096 primary bias ≤5% 的 calibration gate；g8192 bias 僅作方向性
+  phase data 的可解讀性參考。
 - formal profile-on 的 `profiled_groups`：g4096 baseline/candidate 均為 73；g8192 baseline
-  為 41/43/43/43/44、candidate 為 41/43/44/44/45。g8192 低於程序要求的 50，為本報告
-  `inconclusive` 的主要有效性原因。
+  為 41/43/43/43/44、candidate 為 41/43/44/44/45。g8192 writer 只作方向性 phase 資料，
+  因樣本不足標示為 `directional / insufficient samples`；g4096 primary 的 73 個 groups 通過
+  acceptance sample gate。
 - supply-limited：authoritative Engine g4096 的 actual commands/group baseline
   4091.96–4095.61、candidate 4091.96–4095.61；沒有 group-fill 不足的 supply-limited run。
 
@@ -143,6 +151,35 @@ discarded.
 Candidate median RPS delta is +7.31%; group fill shows the comparison is not supply-limited.
 Candidate p99 is +0.53%, while p99.9 and max improve by 6.07% and 9.06% respectively.
 
+### 5.3.1 Corrected g4096 raw rows
+
+The following acceptance-case rows use separate columns for latency max, actual commands/group, CPU
+seconds and context switches. They supersede the compact historical layout in Appendix A for the
+primary writer and Engine cases.
+
+| artifact | case | round | RPS | p50 us | p99 us | p99.9 us | max us | actual commands/group | CPU s | voluntary | involuntary |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| baseline | writer_g4096_on | 1 | 123369 | 45571.7 | 481141 | 1540220 | 2058520 | 4093.98 | 45.66 | 413934 | 14220 |
+| baseline | writer_g4096_on | 2 | 168749 | 45096.9 | 96927.6 | 414024 | 418554 | 4093.98 | 45.87 | 427424 | 9449 |
+| baseline | writer_g4096_on | 3 | 169126 | 45134.3 | 87806.9 | 409695 | 412300 | 4093.98 | 45.89 | 419772 | 13031 |
+| baseline | writer_g4096_on | 4 | 118763 | 45660.1 | 374521 | 498271 | 505873 | 4093.98 | 45.56 | 402169 | 12793 |
+| baseline | writer_g4096_on | 5 | 171107 | 44475.3 | 90175.2 | 355933 | 360087 | 4093.98 | 45.47 | 421318 | 11340 |
+| candidate | writer_g4096_on | 1 | 181537 | 41968.6 | 89164.2 | 359702 | 363084 | 4093.98 | 43.70 | 417219 | 16472 |
+| candidate | writer_g4096_on | 2 | 182628 | 40899.4 | 95689.3 | 424227 | 425567 | 4090.44 | 43.50 | 376104 | 15814 |
+| candidate | writer_g4096_on | 3 | 177804 | 41906.5 | 102066 | 535918 | 536817 | 4093.98 | 43.82 | 399248 | 22358 |
+| candidate | writer_g4096_on | 4 | 181644 | 41244 | 96233.7 | 418753 | 420894 | 4093.98 | 43.93 | 403399 | 13507 |
+| candidate | writer_g4096_on | 5 | 180615 | 41589.4 | 93272.5 | 398479 | 402081 | 4093.98 | 43.73 | 400023 | 18568 |
+| baseline | engine_g4096 | 1 | 170202 | 44737.2 | 101248 | 409451 | 412116 | 4095.61 | 42.76 | 396096 | 17772 |
+| baseline | engine_g4096 | 2 | 173013 | 43681.7 | 97870.3 | 420012 | 424355 | 4091.96 | 41.52 | 335583 | 21111 |
+| baseline | engine_g4096 | 3 | 75663.1 | 44411.8 | 901405 | 1136840 | 1235570 | 4091.96 | 41.45 | 379071 | 11086 |
+| baseline | engine_g4096 | 4 | 116474 | 45450 | 436778 | 846871 | 937399 | 4091.96 | 42.31 | 405739 | 12605 |
+| baseline | engine_g4096 | 5 | 170786 | 44149.7 | 101906 | 460473 | 478488 | 4091.96 | 42.20 | 369027 | 12837 |
+| candidate | engine_g4096 | 1 | 182214 | 41439.1 | 102447 | 403118 | 404992 | 4091.96 | 41.07 | 380384 | 13003 |
+| candidate | engine_g4096 | 2 | 76239.3 | 42165.7 | 747701 | 1224920 | 1236680 | 4091.96 | 40.11 | 367051 | 16795 |
+| candidate | engine_g4096 | 3 | 182646 | 41842.7 | 103299 | 389604 | 393897 | 4095.61 | 41.08 | 420007 | 7433 |
+| candidate | engine_g4096 | 4 | 183704 | 41011.8 | 100836 | 432527 | 435186 | 4091.96 | 40.87 | 377391 | 10753 |
+| candidate | engine_g4096 | 5 | 182779 | 40931.9 | 100366 | 477088 | 478956 | 4091.96 | 40.67 | 370764 | 14241 |
+
 ### 5.4 Writer g8192 方向性資料
 
 | metric | baseline | candidate | delta | supply-limited note |
@@ -153,8 +190,8 @@ Candidate p99 is +0.53%, while p99.9 and max improve by 6.07% and 9.06% respecti
 | `wal_publish_ns_per_command` | 431.438 [412.264–434.908] | 84.2667 [80.789–84.9509] | 80.47% reduction | not primary gate |
 | `wal_append_ns_per_command` | 1,335.60 [1,261.28–2,656.88] | 940.598 [903.834–2,462.88] | 29.54% reduction | not primary gate |
 
-The g8192 profile-on sample count is only 41–45 groups per run, so these rows are directional
-only and cannot repair the inconclusive validity gate.
+The g8192 profile-on sample count is only 41–45 groups per run, so these rows are directional only;
+they neither repair nor invalidate the g4096 primary decision.
 
 ### 5.5 CPU、context switches 與 RSS
 
@@ -223,41 +260,44 @@ authorize changing it in the same patch.
 | --- | --- | --- | --- |
 | primary publish | g4096 writer publish reduction ≥15% | 80.49% observed | pass (not sufficient for retain) |
 | append direction | candidate append median lower | 1,006.59 < 1,705.24 ns/command | pass |
-| calibration bias | all four artifact/group biases ≤5% | N=16: 0.28%–3.95% | pass |
-| profile sample count | every formal profile-on run ≥50 groups | g4096=73; g8192=41–45 | **fail** |
+| calibration bias | both g4096 artifact biases ≤5%; g8192 directional only | N=16 g4096: 0.28%–1.77% | pass for primary |
+| profile sample count | every g4096 formal profile-on run ≥50 groups; g8192 directional only | g4096=73; g8192=41–45 (directional / insufficient samples) | pass for primary; directional unavailable |
 | direct WAL g4096 | regression ≤3% | candidate +29.89% RPS | pass |
 | direct WAL g8192 | regression ≤3% | candidate +23.74% RPS | pass |
 | authoritative Engine | regression ≤3%, non-supply-limited | candidate +7.31%; fill ≈4092/group | pass |
-| correctness/replay/durability | all gates pass | 70/70 status 0; replay/correctness true | pass |
-| tail/resource guardrail | no median worsening with ≥3/5 paired worsening | writer g4096 p99.9 +1.14% (4/5); involuntary context +28.75% (5/5) | **fail** |
+| correctness/replay/durability | all runtime gates pass | 70/70 status 0; replay/correctness true | pass |
+| WAL byte identity | deterministic baseline/candidate segments byte-for-byte equal | no-rotation and rotation manifest/hash diffs empty | pass |
+| tail/resource guardrail | no median worsening with ≥3/5 paired worsening | writer g4096 p99.9 +1.14% (3/5); involuntary context +28.75% (5/5) | **fail** |
 | repository/binary identity | before/after identical | identity and binary diffs empty | pass |
 
-Because the profile sample-count gate fails, the formal performance result is inconclusive even
-though the primary phase and direct WAL guardrails look favorable. The tail/context result is also
-not sufficient to mark the candidate retainable.
+The g4096 primary sample gate passes; g8192 writer rows are directional only and insufficient for
+phase interpretation. The valid performance data still fails the tail/context guardrail, so the
+candidate is not retainable. The deterministic byte-identity control passes and closes the previously
+missing direct correctness evidence.
 
 ## 8. 結論與下一步
 
 - Do not retain the candidate based on this run and do not expand this patch.
-- Re-run the complete affected formal comparison after increasing the g8192 writer command budget
-  enough to produce at least 50 profile groups per profile-on run (the current 2.305M-iteration
-  budget produced only 41–45; recalculate the budget from a fresh pilot rather than multiplying
-  only one artifact). Keep the same A/B alternation and calibration procedure.
-- During that rerun, verify whether the g4096 p99.9 and involuntary-context-switch degradation
-  persists under the same storage state. Do not discard slow fsync tails or rerun only the faster
-  artifact.
-- If the rerun passes validity but still fails the guardrail, return to a separate benchmark-only
-  attribution for plan/copy, cache insertion and terminal position update. Publisher and Completion
-  remain out of scope for this patch.
+- Do not re-run the complete matrix only to increase g8192 writer profile groups; g8192 writer is
+  directional and its 41–45 groups do not invalidate the g4096 primary result.
+- The deterministic WAL byte-identity control passed; retain its manifests as part of the evidence.
+- If a separate confirmatory experiment is authorized for the g4096 p99.9/context-switch result,
+  fix CPU governor and host conditions, preserve all slow fsync tails, and predefine how contradictory
+  evidence is combined. Do not rerun only the faster artifact.
+- If the guardrail remains failed, return to a separate benchmark-only attribution for plan/copy,
+  cache insertion and terminal position update. Publisher and Completion remain out of scope for
+  this patch.
 - No source, staging, group-size, fsync policy, prepare-worker or runtime-default change was made
   as part of this benchmark.
 
 ## Appendix A. 每輪原始摘要
 
-Columns: `RPS` is commands/s; latency is `p50/p99/p99.9` (and direct WAL uses append-group
-latency with group-total max); CPU is process user+system seconds; context columns are raw counts;
-all rows are valid process exits, but g8192 profile-on rows additionally fail the ≥50 profiled-group
-validity rule.
+The compact rows below retain the original raw index. Direct-WAL rows use the value after `p99.9` as
+group-total max latency; writer rows use it as actual commands/group; Engine rows in this historical
+table do not contain an actual-commands/group field. The corrected primary writer and Engine values are in section 5.3.1,
+and raw stdout/time files in RUN_ROOT are authoritative. This historical layout is retained only for
+traceability and must not be used for new gate calculations. g8192 profile-on rows are directional /
+insufficient samples, not invalid primary runs.
 
 | artifact | case | round | RPS | p50 µs | p99 µs | p99.9 µs | max/group fill | CPU s | voluntary | involuntary | valid |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
@@ -350,6 +390,8 @@ under `$RUN_ROOT/logs`.
   `$RUN_ROOT/derived/calibration-cal2-n16.tsv`
 - selected profile sample：`$RUN_ROOT/derived/selected-sample-every-cal2-n.txt`
 - formal raw stdout/stderr/status：`$RUN_ROOT/logs/*formal2*`
+- deterministic WAL byte-identity manifests、hashes、diff與 control stdout/stderr：
+  `$RUN_ROOT/logs/byte-identity/`
 - `/usr/bin/time -v` raw resource files：`$RUN_ROOT/time/*formal2*`
 - Engine tail telemetry CSV：`$RUN_ROOT/telemetry/*formal2-engine*`
 - per-run WAL data：`$RUN_ROOT/data/*formal2*`（未複製進 repository）

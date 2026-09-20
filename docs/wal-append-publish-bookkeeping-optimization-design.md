@@ -241,12 +241,19 @@ affinity、filesystem、per-group `fsync`、group delay與 producer lanes。每 
 3. authoritative Engine：group=4,096、W=2、profile off；
 4. writer group=8,192只作 phase方向性資料；actual commands/group低於90%時仍不得宣稱 frontier。
 
+`g4096` writer profile-on 是本案唯一的 publish／append phase acceptance workload；每個正式
+profile-on run 必須至少有 50 個 `profiled_groups`。`g8192` writer 只作方向性 phase 資料，樣本不足或
+profile bias 超過 5% 時只能標示為 `directional / insufficient samples`，不得使 g4096 primary、direct
+WAL 或 authoritative Engine gate 失效。g8192 direct WAL 仍是獨立的 <=3% regression gate。
+
 Profile-on沿用已校準的 sampling interval；若修改後 off/on median bias超過5%，先調整 sampling並完整
 重測，不得挑選低 bias輪次。
 
 ### 9.2 Correctness gate
 
 - WAL byte-for-byte、replay、EngineSeq continuity、completion exactly-once與 order-book結果全部通過；
+- baseline／candidate 以相同 deterministic commands 產生的未 rotation 與跨 segment rotation WAL，
+  其 segment filename、size 與 SHA-256 manifest 必須逐項相同；
 - 所有正式輪 exit 0，沒有 timeout、publisher failure、storage pressure或資源耗盡；
 - source、index、worktree、baseline／candidate binary identity在各自矩陣內固定；
 - staged changes在整個流程中保持不變。
