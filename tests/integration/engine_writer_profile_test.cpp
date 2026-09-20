@@ -90,7 +90,8 @@ TEST(EngineWriterProfileTest, ShardRuntimeReportsWriterAndCompletionSamples) {
   config.runtime.event_replay_snapshot_interval_commands =
       std::numeric_limits<std::size_t>::max();
 
-  auto opened = ShardRuntime::open(1, config, sink, metrics, &collector);
+  auto opened = ShardRuntime::open(1, config, sink, metrics, &collector,
+                                   WriterProfileOptions{1, true});
   ASSERT_TRUE(std::holds_alternative<std::unique_ptr<ShardRuntime>>(opened));
   auto runtime = std::get<std::unique_ptr<ShardRuntime>>(std::move(opened));
   runtime->start();
@@ -141,6 +142,12 @@ TEST(EngineWriterProfileTest, ShardRuntimeReportsWriterAndCompletionSamples) {
     EXPECT_GE(sample.wal.prepare_task_ns,
               sample.wal.payload_encode_ns + sample.wal.crc_ns + sample.wal.frame_assembly_ns);
     EXPECT_GE(sample.wal.plan_copy_ns, sample.wal.chunk_copy_ns);
+    const auto apply_children = sample.apply.precheck_ns + sample.apply.book_apply_ns +
+                                sample.apply.state_update_ns + sample.apply.output_events_ns +
+                                sample.apply.producer_result_ns +
+                                sample.apply.incremental_validation_ns;
+    EXPECT_GE(sample.apply_ns, apply_children);
+    EXPECT_EQ(sample.apply.commands, sample.accepted_commands);
   }
   EXPECT_EQ(accepted, 2U);
   for (const auto& sample : collector.completions) {
@@ -210,6 +217,7 @@ TEST(EngineWriterProfileTest, SamplingKeepsUnprofiledGroupsOnNormalPath) {
   for (const auto& sample : collector.writer_groups) {
     EXPECT_EQ(sample.input_commands, 1U);
     EXPECT_EQ(sample.accepted_commands, 1U);
+    EXPECT_EQ(sample.apply.commands, 0U);
   }
   for (const auto& sample : collector.completions) {
     EXPECT_EQ(sample.completions, 1U);

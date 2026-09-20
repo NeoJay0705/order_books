@@ -60,6 +60,20 @@ struct ExecutionOutput {
   std::vector<Event> events;
 };
 
+// Internal, opt-in attribution for the StateMachine writer profile.  This
+// type intentionally lives under src/ and is not part of the installed API.
+struct StateMachineApplyProfile {
+  std::uint64_t precheck_ns{};
+  std::uint64_t book_apply_ns{};
+  std::uint64_t state_update_ns{};
+  std::uint64_t output_events_ns{};
+  std::uint64_t producer_result_ns{};
+  std::uint64_t incremental_validation_ns{};
+  std::uint64_t commands{};
+  std::uint64_t events{};
+  std::uint64_t trades{};
+};
+
 [[nodiscard]] std::vector<std::byte> canonical_command_bytes(const Command& command);
 
 class StateMachine {
@@ -70,14 +84,14 @@ class StateMachine {
   [[nodiscard]] ShardState& state() noexcept { return state_; }
 
   Result<ExecutionOutput> apply(const CommittedCommand& command);
+  Result<ExecutionOutput> apply_profiled(const CommittedCommand& command,
+                                          StateMachineApplyProfile& profile);
   Status restore(ShardState state);
 
  private:
-  [[nodiscard]] Result<ExecutionOutput> reject(const CommittedCommand& command,
-                                               ErrorCode code);
-  [[nodiscard]] Result<ExecutionOutput> reject(const CommittedCommand& command,
-                                               ErrorCode code,
-                                               OrderId order_id);
+  [[nodiscard]] Result<ExecutionOutput> reject(
+      const CommittedCommand& command, ErrorCode code, OrderId order_id,
+      StateMachineApplyProfile* profile);
   [[nodiscard]] const InstrumentConfig* instrument_config(
       ConfigurationVersion version, InstrumentId instrument_id) const noexcept;
   [[nodiscard]] const ShardBehaviorConfig* behavior_config(
@@ -103,6 +117,8 @@ class StateMachine {
                      ExecutionOutput& output);
   void save_producer_result(const CommittedCommand& command,
                             const CommandResult& result);
+  Result<ExecutionOutput> apply_impl(const CommittedCommand& command,
+                                     StateMachineApplyProfile* profile);
 
   ShardState state_;
 };

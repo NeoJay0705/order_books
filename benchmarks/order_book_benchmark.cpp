@@ -62,6 +62,7 @@ struct BenchmarkOptions {
   WalSyncMode wal_sync_mode{WalSyncMode::per_group};
   WalPhaseProfileMode wal_phase_profile{WalPhaseProfileMode::off};
   WriterPhaseProfileMode writer_phase_profile{WriterPhaseProfileMode::off};
+  bool writer_apply_subprofile{};
   std::size_t engine_group_size{256};
   std::chrono::microseconds engine_group_delay{200};
   std::size_t engine_producer_lanes{kDurableProducerLanes};
@@ -83,6 +84,8 @@ struct BenchmarkOptions {
   bool wal_phase_profile_option_set{};
   bool writer_phase_profile_parse_error{};
   bool writer_phase_profile_option_set{};
+  bool writer_apply_subprofile_parse_error{};
+  bool writer_apply_subprofile_option_set{};
   bool writer_profile_sample_parse_error{};
   bool writer_profile_sample_option_set{};
   bool engine_tail_telemetry_parse_error{};
@@ -377,6 +380,15 @@ std::optional<BenchmarkOptions> parse_options(const int argc, char** argv) {
         options.writer_phase_profile_parse_error = true;
       } else {
         options.writer_phase_profile = *profile;
+      }
+    } else if (argument.starts_with("--writer-apply-subprofile=")) {
+      options.writer_apply_subprofile_option_set = true;
+      const auto profile = parse_writer_phase_profile(
+          argument.substr(std::string_view("--writer-apply-subprofile=").size()));
+      if (!profile.has_value()) {
+        options.writer_apply_subprofile_parse_error = true;
+      } else {
+        options.writer_apply_subprofile = *profile == WriterPhaseProfileMode::on;
       }
     } else if (argument.starts_with("--writer-profile-sample-every=")) {
       options.writer_profile_sample_option_set = true;
@@ -1868,6 +1880,7 @@ void print_usage() {
                "[--wal-group-size=N] "
                "[--wal-sync=none|per_group] [--wal-phase-profile=off|on] "
                "[--writer-phase-profile=off|on] [--writer-profile-sample-every=N] "
+               "[--writer-apply-subprofile=off|on] "
                "[--engine-group-size=N] "
                "[--engine-group-delay-us=N] [--engine-producer-lanes=N] "
                "[--wal-prepare-workers=1|2|4] "
@@ -1917,6 +1930,12 @@ int main(const int argc, char** argv) {
   if (options->writer_phase_profile_parse_error) {
     std::cerr << "workload=" << workload_name(options->workload)
               << " phase=cli error_code=writer_phase_profile_invalid\n";
+    print_usage();
+    return 2;
+  }
+  if (options->writer_apply_subprofile_parse_error) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=writer_apply_subprofile_invalid\n";
     print_usage();
     return 2;
   }
@@ -2035,10 +2054,25 @@ int main(const int argc, char** argv) {
     print_usage();
     return 2;
   }
+  if (options->writer_apply_subprofile_option_set &&
+      options->workload != WorkloadSelection::engine_writer_hot_path_profile) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=writer_apply_subprofile_requires_writer_profile_workload\n";
+    print_usage();
+    return 2;
+  }
   if (options->writer_profile_sample_option_set &&
       options->workload != WorkloadSelection::engine_writer_hot_path_profile) {
     std::cerr << "workload=" << workload_name(options->workload)
               << " phase=cli error_code=writer_profile_sample_requires_writer_profile_workload\n";
+    print_usage();
+    return 2;
+  }
+  if (options->writer_apply_subprofile_option_set &&
+      (!options->writer_phase_profile_option_set ||
+       options->writer_phase_profile != WriterPhaseProfileMode::on)) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=writer_apply_subprofile_requires_profile_on\n";
     print_usage();
     return 2;
   }
@@ -2136,6 +2170,7 @@ int main(const int argc, char** argv) {
         options->wal_prepare_workers,
         options->wal_parallel_prepare_min_commands,
         options->writer_phase_profile == WriterPhaseProfileMode::on,
+        options->writer_apply_subprofile,
         options->writer_profile_sample_every,
         options->data_directory,
     };

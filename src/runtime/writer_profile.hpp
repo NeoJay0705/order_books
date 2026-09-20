@@ -11,6 +11,9 @@ struct WriterProfileOptions {
   // preserves the original diagnostic behavior; larger values keep the
   // normal unprofiled path for the other groups.
   std::uint64_t sample_every{1};
+  // Apply child timing is a second diagnostic layer.  It remains disabled
+  // unless the benchmark explicitly requests the opt-in subprofile.
+  bool apply_subprofile{false};
 };
 
 // Internal, opt-in diagnostics for the single-shard writer benchmark.  This
@@ -29,6 +32,7 @@ struct WriterGroupProfile {
   std::uint64_t publisher_notify_ns{};
   std::uint64_t post_apply_ns{};
   std::uint64_t completion_enqueue_ns{};
+  domain::StateMachineApplyProfile apply;
   storage::WalAppendProfile wal;
 };
 

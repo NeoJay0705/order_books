@@ -17,6 +17,7 @@ struct WriterProfileBenchmarkOptions {
   std::size_t wal_prepare_workers{1};
   std::size_t wal_parallel_prepare_min_commands{4096};
   bool profile{};
+  bool apply_subprofile{};
   std::uint64_t profile_sample_every{1};
   std::optional<std::filesystem::path> data_directory;
 };

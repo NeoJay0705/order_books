@@ -165,6 +165,45 @@ if(BUILD_TESTING)
   )
 
   add_test(
+    NAME order_books_benchmark_writer_apply_subprofile_invalid
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--workload=engine_writer_hot_path_profile
+            -DCLI_ARGUMENT_2=--writer-apply-subprofile=invalid
+            -DEXPECTED_ERROR=writer_apply_subprofile_invalid
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_writer_apply_subprofile_empty
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--workload=engine_writer_hot_path_profile
+            -DCLI_ARGUMENT_2=--writer-apply-subprofile=
+            -DEXPECTED_ERROR=writer_apply_subprofile_invalid
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_writer_apply_subprofile_requires_profile
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--workload=engine_writer_hot_path_profile
+            -DCLI_ARGUMENT_2=--writer-apply-subprofile=on
+            -DEXPECTED_ERROR=writer_apply_subprofile_requires_profile_on
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_writer_apply_subprofile_requires_writer_workload
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--writer-apply-subprofile=on
+            -DEXPECTED_ERROR=writer_apply_subprofile_requires_writer_profile_workload
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
     NAME order_books_benchmark_wal_prepare_workers_invalid
     COMMAND ${CMAKE_COMMAND}
             "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
@@ -301,6 +340,39 @@ if(BUILD_TESTING)
     PROPERTIES
       PASS_REGULAR_EXPRESSION
       "workload=engine_writer_hot_path_profile phase=profile.*profiled_groups=.*profiled_input_commands=4.*profiled_accepted_commands=4.*wal_lock_wait_ns=.*completion_service_rps=.*completion_max_queue_depth=.*"
+  )
+
+  add_test(
+    NAME order_books_benchmark_writer_apply_subprofile_on_smoke
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT_1=--workload=engine_writer_hot_path_profile
+            -DCLI_ARGUMENT_2=--writer-phase-profile=on
+            -DCLI_ARGUMENT_3=--writer-apply-subprofile=on
+            -DCLI_ARGUMENT_4=--engine-group-size=2
+            -DCLI_ARGUMENT_5=--engine-group-delay-us=0
+            -DCLI_ARGUMENT_6=--engine-producer-lanes=2
+            -DCLI_ARGUMENT_7=--iterations=2
+            -DCLI_ARGUMENT_8=--warmup=8
+            "-DREQUIRED_REGEXES=workload=engine_writer_hot_path_profile phase=profile.*writer_apply_subprofile=on.*apply_precheck_ns=.*apply_book_apply_ns=.*apply_state_update_ns=.*apply_output_events_ns=.*apply_producer_result_ns=.*apply_incremental_validation_ns=.*apply_unattributed_ns=.*apply_unattributed_ns_per_command=.*apply_unattributed_apply_parent_share_percent=.*apply_unattributed_writer_service_share_percent=.*apply_commands=4.*apply_events=.*apply_trades=.*;writer_service_ceiling_observed=true.*writer_service_derived_ceiling_commands_per_second=[0-9]"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_writer_profile_output.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_writer_apply_subprofile_off_smoke
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT_1=--workload=engine_writer_hot_path_profile
+            -DCLI_ARGUMENT_2=--writer-phase-profile=on
+            -DCLI_ARGUMENT_3=--writer-apply-subprofile=off
+            -DCLI_ARGUMENT_4=--engine-group-size=2
+            -DCLI_ARGUMENT_5=--engine-group-delay-us=0
+            -DCLI_ARGUMENT_6=--engine-producer-lanes=2
+            -DCLI_ARGUMENT_7=--iterations=2
+            -DCLI_ARGUMENT_8=--warmup=8
+            "-DREQUIRED_REGEXES=workload=engine_writer_hot_path_profile phase=summary.*commands=4.*wal_group_commits=[1-9][0-9]*.*wal_group_commands=4.*actual_commands_per_group=[0-9].*publisher_lag_events=[0-9][0-9]*.*publisher_lag_bytes=[0-9][0-9]*.*publisher_lag_age_ns=[0-9][0-9]*.*correctness_verified=true;workload=engine_writer_hot_path_profile phase=profile.*writer_apply_subprofile=off.*apply_share_percent=.*wal_rotation_ceiling_observed=false"
+            "-DFORBIDDEN_REGEXES=apply_precheck_ns=;apply_book_apply_ns=;apply_state_update_ns=;apply_output_events_ns=;apply_producer_result_ns=;apply_incremental_validation_ns=;apply_children_ns=;apply_unattributed_ns=;apply_commands=;apply_events=;apply_trades=;wal_rotation_derived_ceiling_commands_per_second=;wal_rotation_headroom_percent="
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_writer_profile_output.cmake"
   )
 
   add_test(

@@ -1018,12 +1018,29 @@ void ShardRuntime::process_command_batch(std::vector<CommandWork> batch,
   const auto execution_start = std::chrono::steady_clock::now();
   std::vector<domain::ExecutionOutput> outputs;
   outputs.reserve(accepted.size());
+  domain::StateMachineApplyProfile apply_profile;
   for (std::size_t index = 0; index < accepted.size(); ++index) {
-    auto execution = state_machine_.apply(accepted[index]);
+    domain::StateMachineApplyProfile command_profile;
+    auto execution = profile_sampled && profile_options_.apply_subprofile
+                         ? state_machine_.apply_profiled(accepted[index], command_profile)
+                         : state_machine_.apply(accepted[index]);
     if (std::holds_alternative<Error>(execution)) {
       reject_batch_pending(ErrorCode::engine_unavailable);
       fail(std::get<Error>(execution));
       return;
+    }
+    if (profile_sampled && profile_options_.apply_subprofile) {
+      saturating_add(apply_profile.precheck_ns, command_profile.precheck_ns);
+      saturating_add(apply_profile.book_apply_ns, command_profile.book_apply_ns);
+      saturating_add(apply_profile.state_update_ns, command_profile.state_update_ns);
+      saturating_add(apply_profile.output_events_ns, command_profile.output_events_ns);
+      saturating_add(apply_profile.producer_result_ns,
+                     command_profile.producer_result_ns);
+      saturating_add(apply_profile.incremental_validation_ns,
+                     command_profile.incremental_validation_ns);
+      saturating_add(apply_profile.commands, command_profile.commands);
+      saturating_add(apply_profile.events, command_profile.events);
+      saturating_add(apply_profile.trades, command_profile.trades);
     }
     outputs.push_back(std::get<domain::ExecutionOutput>(std::move(execution)));
   }
@@ -1108,6 +1125,7 @@ void ShardRuntime::process_command_batch(std::vector<CommandWork> batch,
     profile.publisher_notify_ns = publisher_notify_ns;
     profile.post_apply_ns = post_apply_ns;
     profile.completion_enqueue_ns = completion_enqueue_ns;
+    profile.apply = apply_profile;
     profile.wal = wal_profile;
     profile_->observe_writer_group(profile);
   }

@@ -1,11 +1,13 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <variant>
 #include <utility>
 
 #include "domain/invariant_checker.hpp"
 #include "domain/state_machine.hpp"
+#include "persistence/binary_codec.hpp"
 
 namespace order_books::domain {
 namespace {
@@ -60,6 +62,128 @@ TEST(StateMachineTest, UnknownInstrumentIsDurableBusinessRejection) {
   EXPECT_EQ(output.events.front().event_type, EventType::command_rejected);
   EXPECT_EQ(machine.state().last_committed_engine_seq, 1U);
   EXPECT_TRUE(machine.state().books.empty());
+}
+
+TEST(StateMachineTest, ProfiledApplyPreservesMatchingAndReportsChildren) {
+  StateMachine normal(make_state());
+  StateMachine profiled(make_state());
+
+  auto maker = new_order(1, 7, {4, 1});
+  maker.payload = NewOrderPayload{Side::sell, 100, 5};
+  const auto normal_maker = normal.apply(committed(maker, 1));
+  StateMachineApplyProfile profile;
+  const auto profiled_maker = profiled.apply_profiled(committed(maker, 1), profile);
+  ASSERT_TRUE(std::holds_alternative<ExecutionOutput>(normal_maker));
+  ASSERT_TRUE(std::holds_alternative<ExecutionOutput>(profiled_maker));
+  EXPECT_EQ(std::get<ExecutionOutput>(normal_maker).result,
+            std::get<ExecutionOutput>(profiled_maker).result);
+  EXPECT_EQ(std::get<ExecutionOutput>(normal_maker).events,
+            std::get<ExecutionOutput>(profiled_maker).events);
+  EXPECT_EQ(profile.commands, 1U);
+  EXPECT_EQ(profile.events,
+            static_cast<std::uint64_t>(std::get<ExecutionOutput>(profiled_maker)
+                                           .events.size()));
+
+  auto taker = new_order(2, 7, {4, 2});
+  taker.payload = NewOrderPayload{Side::buy, 100, 5};
+  const auto normal_taker = normal.apply(committed(taker, 2));
+  const auto profiled_taker = profiled.apply_profiled(committed(taker, 2), profile);
+  ASSERT_TRUE(std::holds_alternative<ExecutionOutput>(normal_taker));
+  ASSERT_TRUE(std::holds_alternative<ExecutionOutput>(profiled_taker));
+  EXPECT_EQ(std::get<ExecutionOutput>(normal_taker).result,
+            std::get<ExecutionOutput>(profiled_taker).result);
+  EXPECT_EQ(std::get<ExecutionOutput>(normal_taker).events,
+            std::get<ExecutionOutput>(profiled_taker).events);
+  EXPECT_EQ(profile.commands, 1U);
+  EXPECT_EQ(profile.events,
+            static_cast<std::uint64_t>(std::get<ExecutionOutput>(profiled_taker)
+                                           .events.size()));
+  EXPECT_EQ(profile.trades, 1U);
+  EXPECT_EQ(profiled.state().last_committed_engine_seq, 2U);
+  EXPECT_EQ(profiled.state().active_order_count, normal.state().active_order_count);
+  ASSERT_TRUE(std::holds_alternative<std::monostate>(validate_state(profiled.state())));
+}
+
+TEST(StateMachineTest, ProfiledApplyCoversMutationAndRejectBranches) {
+  StateMachine normal(make_state());
+  StateMachine profiled(make_state());
+
+  const auto expect_equal = [](const Result<ExecutionOutput>& expected,
+                               const Result<ExecutionOutput>& actual) {
+    ASSERT_EQ(expected.index(), actual.index());
+    if (std::holds_alternative<Error>(expected)) {
+      EXPECT_EQ(std::get<Error>(expected), std::get<Error>(actual));
+      return;
+    }
+    EXPECT_EQ(std::get<ExecutionOutput>(expected).result,
+              std::get<ExecutionOutput>(actual).result);
+    EXPECT_EQ(std::get<ExecutionOutput>(expected).events,
+              std::get<ExecutionOutput>(actual).events);
+  };
+
+  const auto apply_pair = [&](Command command, const EngineSeq sequence) {
+    const auto expected = normal.apply(committed(command, sequence));
+    StateMachineApplyProfile profile;
+    const auto actual = profiled.apply_profiled(committed(std::move(command), sequence),
+                                                profile);
+    expect_equal(expected, actual);
+    EXPECT_EQ(profile.commands, 1U);
+    if (const auto* output = std::get_if<ExecutionOutput>(&actual); output != nullptr) {
+      EXPECT_EQ(profile.events, static_cast<std::uint64_t>(output->events.size()));
+      EXPECT_EQ(profile.trades, static_cast<std::uint64_t>(std::count_if(
+                                   output->events.begin(), output->events.end(),
+                                   [](const Event& event) {
+                                     return event.event_type == EventType::trade;
+                                   })));
+    }
+    return profile;
+  };
+
+  auto maker = new_order(1, 7, {6, 1});
+  maker.payload = NewOrderPayload{Side::sell, 100, 5};
+  const auto new_profile = apply_pair(maker, 1);
+  EXPECT_EQ(new_profile.commands, 1U);
+
+  Command amend;
+  amend.identity = CommandIdentity{42, 1, 1, 2};
+  amend.instrument_id = 7;
+  amend.command_type = CommandType::amend_quantity;
+  amend.order_id = {6, 1};
+  amend.payload = AmendQuantityPayload{3};
+  const auto amend_profile = apply_pair(amend, 2);
+  EXPECT_EQ(amend_profile.trades, 0U);
+
+  Command replace;
+  replace.identity = CommandIdentity{42, 1, 1, 3};
+  replace.instrument_id = 7;
+  replace.command_type = CommandType::replace_order;
+  replace.order_id = {6, 1};
+  replace.payload = ReplaceOrderPayload{101, 4};
+  const auto replace_profile = apply_pair(replace, 3);
+  EXPECT_EQ(replace_profile.commands, 1U);
+
+  const auto cancel_profile = apply_pair(cancel_order(4, 7, {6, 1}), 4);
+  EXPECT_EQ(cancel_profile.commands, 1U);
+
+  auto crossing_maker = new_order(5, 7, {6, 2});
+  crossing_maker.payload = NewOrderPayload{Side::sell, 100, 5};
+  apply_pair(crossing_maker, 5);
+  auto crossing_taker = new_order(6, 7, {6, 3});
+  crossing_taker.payload = NewOrderPayload{Side::buy, 100, 5};
+  const auto crossing_profile = apply_pair(crossing_taker, 6);
+  EXPECT_EQ(crossing_profile.trades, 1U);
+
+  auto duplicate = new_order(7, 7, {6, 2});
+  const auto rejected_profile = apply_pair(duplicate, 7);
+  EXPECT_EQ(rejected_profile.events, 1U);
+  EXPECT_EQ(rejected_profile.trades, 0U);
+
+  EXPECT_EQ(profiled.state().last_committed_engine_seq,
+            normal.state().last_committed_engine_seq);
+  EXPECT_EQ(profiled.state().active_order_count, normal.state().active_order_count);
+  EXPECT_EQ(storage::encode_state(normal.state()), storage::encode_state(profiled.state()));
+  ASSERT_TRUE(std::holds_alternative<std::monostate>(validate_state(normal.state())));
+  ASSERT_TRUE(std::holds_alternative<std::monostate>(validate_state(profiled.state())));
 }
 
 TEST(StateMachineTest, AppliesOrderAndRejectsVersionConflict) {

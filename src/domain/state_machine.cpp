@@ -1,6 +1,7 @@
 #include "domain/state_machine.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <string>
 #include <type_traits>
@@ -60,6 +61,46 @@ std::vector<std::byte> make_canonical_command(const Command& command) {
 Error make_error(const ErrorCode code, const char* message) {
   return Error{code, message};
 }
+
+void add_profile_time(std::uint64_t* target,
+                      const std::chrono::steady_clock::time_point start,
+                      const std::chrono::steady_clock::time_point end) noexcept {
+  if (target == nullptr) {
+    return;
+  }
+  const auto elapsed = static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+  if (*target > std::numeric_limits<std::uint64_t>::max() - elapsed) {
+    *target = std::numeric_limits<std::uint64_t>::max();
+    return;
+  }
+  *target += elapsed;
+}
+
+class ProfilePhase final {
+ public:
+  explicit ProfilePhase(std::uint64_t* target) noexcept
+      : target_(target), start_(target == nullptr ? std::chrono::steady_clock::time_point{}
+                                                   : std::chrono::steady_clock::now()) {}
+
+  ProfilePhase(const ProfilePhase&) = delete;
+  ProfilePhase& operator=(const ProfilePhase&) = delete;
+
+  void stop() noexcept {
+    if (target_ == nullptr || stopped_) {
+      return;
+    }
+    add_profile_time(target_, start_, std::chrono::steady_clock::now());
+    stopped_ = true;
+  }
+
+  ~ProfilePhase() { stop(); }
+
+ private:
+  std::uint64_t* target_{};
+  std::chrono::steady_clock::time_point start_{};
+  bool stopped_{};
+};
 
 bool is_active_order(const OrderStatus status) noexcept {
   return status == OrderStatus::active || status == OrderStatus::partially_filled;
@@ -744,14 +785,10 @@ void StateMachine::save_producer_result(const CommittedCommand& command,
   producer.last_result = result;
 }
 
-Result<ExecutionOutput> StateMachine::reject(const CommittedCommand& command,
-                                               const ErrorCode code) {
-  return reject(command, code, command.command.order_id);
-}
-
-Result<ExecutionOutput> StateMachine::reject(const CommittedCommand& command,
-                                               const ErrorCode code,
-                                               const OrderId order_id) {
+Result<ExecutionOutput> StateMachine::reject(
+    const CommittedCommand& command, const ErrorCode code, const OrderId order_id,
+    StateMachineApplyProfile* const profile) {
+  ProfilePhase output_events(profile == nullptr ? nullptr : &profile->output_events_ns);
   ExecutionOutput output;
   output.result.identity = command.command.identity;
   output.result.engine_seq = command.engine_seq;
@@ -765,10 +802,17 @@ Result<ExecutionOutput> StateMachine::reject(const CommittedCommand& command,
       EventType::command_rejected,
       command.received_at,
       CommandRejectedEventPayload{command.command.command_type, order_id, code}});
+  output_events.stop();
+  ProfilePhase state_update(profile == nullptr ? nullptr : &profile->state_update_ns);
   state_.last_committed_engine_seq = command.engine_seq;
   state_.logical_retention_time =
       std::max(state_.logical_retention_time, command.received_at);
+  state_update.stop();
+  ProfilePhase producer_result(profile == nullptr ? nullptr : &profile->producer_result_ns);
   save_producer_result(command, output.result);
+  producer_result.stop();
+  ProfilePhase incremental_validation(
+      profile == nullptr ? nullptr : &profile->incremental_validation_ns);
   auto evicted_result = evict_tombstones();
   if (std::holds_alternative<Error>(evicted_result)) {
     return std::get<Error>(std::move(evicted_result));
@@ -781,10 +825,34 @@ Result<ExecutionOutput> StateMachine::reject(const CommittedCommand& command,
       std::holds_alternative<Error>(status)) {
     return std::get<Error>(status);
   }
+  incremental_validation.stop();
   return output;
 }
 
 Result<ExecutionOutput> StateMachine::apply(const CommittedCommand& command) {
+  return apply_impl(command, nullptr);
+}
+
+Result<ExecutionOutput> StateMachine::apply_profiled(
+    const CommittedCommand& command, StateMachineApplyProfile& profile) {
+  profile = {};
+  auto result = apply_impl(command, &profile);
+  if (const auto* output = std::get_if<ExecutionOutput>(&result); output != nullptr) {
+    profile.events = static_cast<std::uint64_t>(output->events.size());
+    profile.trades = static_cast<std::uint64_t>(std::count_if(
+        output->events.begin(), output->events.end(), [](const Event& event) {
+          return event.event_type == EventType::trade;
+        }));
+  }
+  return result;
+}
+
+Result<ExecutionOutput> StateMachine::apply_impl(
+    const CommittedCommand& command, StateMachineApplyProfile* const profile) {
+  if (profile != nullptr) {
+    profile->commands = 1U;
+  }
+  ProfilePhase precheck(profile == nullptr ? nullptr : &profile->precheck_ns);
   if (command.engine_seq == 0 ||
       command.engine_seq != state_.last_committed_engine_seq + 1U) {
     return make_error(ErrorCode::corrupt_wal, "non-contiguous engine sequence");
@@ -821,20 +889,24 @@ Result<ExecutionOutput> StateMachine::apply(const CommittedCommand& command) {
   }
 
   const auto& request = command.command;
+  const auto reject_command = [&](const ErrorCode code) {
+    precheck.stop();
+    return reject(command, code, request.order_id, profile);
+  };
   if (request.payload.valueless_by_exception()) {
-    return reject(command, ErrorCode::invalid_command);
+    return reject_command(ErrorCode::invalid_command);
   }
   if (request.command_type != command_type(request.payload)) {
-    return reject(command, ErrorCode::invalid_command);
+    return reject_command(ErrorCode::invalid_command);
   }
 
   const auto* instrument = instrument_config(command.instrument_configuration_version,
                                              request.instrument_id);
   if (instrument == nullptr) {
-    return reject(command, ErrorCode::unknown_instrument);
+    return reject_command(ErrorCode::unknown_instrument);
   }
   if (instrument->assigned_shard != state_.shard_id) {
-    return reject(command, ErrorCode::wrong_producer_stream);
+    return reject_command(ErrorCode::wrong_producer_stream);
   }
   if (instrument->tick_size <= 0 || instrument->lot_size <= 0) {
     return make_error(ErrorCode::corrupt_snapshot, "invalid instrument configuration");
@@ -843,13 +915,13 @@ Result<ExecutionOutput> StateMachine::apply(const CommittedCommand& command) {
   if (request.command_type == CommandType::new_order) {
     const auto* payload = std::get_if<NewOrderPayload>(&request.payload);
     if (payload == nullptr || !is_valid_side(payload->side)) {
-      return reject(command, ErrorCode::invalid_side);
+      return reject_command(ErrorCode::invalid_side);
     }
     if (payload->price <= 0 || payload->price % instrument->tick_size != 0) {
-      return reject(command, ErrorCode::invalid_price);
+      return reject_command(ErrorCode::invalid_price);
     }
     if (payload->quantity <= 0 || payload->quantity % instrument->lot_size != 0) {
-      return reject(command, ErrorCode::invalid_quantity);
+      return reject_command(ErrorCode::invalid_quantity);
     }
     if (const auto location = state_.order_locations.find(request.order_id);
         location != state_.order_locations.end()) {
@@ -857,20 +929,21 @@ Result<ExecutionOutput> StateMachine::apply(const CommittedCommand& command) {
           std::holds_alternative<Error>(status)) {
         return std::get<Error>(status);
       }
-      return reject(command, ErrorCode::duplicate_order_id);
+      return reject_command(ErrorCode::duplicate_order_id);
     }
     const auto existing_book = state_.books.find(request.instrument_id);
     if (request.order_id == OrderId{} ||
         (existing_book != state_.books.end() &&
          existing_book->second.contains(request.order_id)) ||
         is_known_tombstone(request.order_id)) {
-      return reject(command, ErrorCode::duplicate_order_id);
+      return reject_command(ErrorCode::duplicate_order_id);
     }
     const auto* behavior = behavior_config(command.behavior_configuration_version);
     if (state_.active_order_count >= behavior->max_active_orders) {
-      return reject(command, ErrorCode::shard_capacity_exceeded);
+      return reject_command(ErrorCode::shard_capacity_exceeded);
     }
     const auto active_orders_before = state_.active_order_count;
+    precheck.stop();
     bool inserted_book = false;
     auto book_iterator = state_.books.find(request.instrument_id);
     if (book_iterator == state_.books.end()) {
@@ -889,7 +962,9 @@ Result<ExecutionOutput> StateMachine::apply(const CommittedCommand& command) {
                        OrderStatus::active,
                        1,
                        command.engine_seq};
+    ProfilePhase book_apply(profile == nullptr ? nullptr : &profile->book_apply_ns);
     auto outcome = book.add_new(incoming);
+    book_apply.stop();
     if (outcome.error != ErrorCode::none) {
       if (inserted_book) {
         state_.books.erase(request.instrument_id);
@@ -898,8 +973,9 @@ Result<ExecutionOutput> StateMachine::apply(const CommittedCommand& command) {
           outcome.error == ErrorCode::corrupt_wal) {
         return make_error(outcome.error, "order book transition invariant failed");
       }
-      return reject(command, outcome.error);
+      return reject_command(outcome.error);
     }
+    ProfilePhase output_events(profile == nullptr ? nullptr : &profile->output_events_ns);
     ExecutionOutput output;
     output.result.identity = request.identity;
     output.result.engine_seq = command.engine_seq;
@@ -909,13 +985,22 @@ Result<ExecutionOutput> StateMachine::apply(const CommittedCommand& command) {
     output.result.order_version = outcome.target->version;
     output.result.remaining_quantity = outcome.target->remaining_quantity;
     output.result.filled_quantity = outcome.target->filled_quantity;
+    output_events.stop();
+    ProfilePhase state_update(profile == nullptr ? nullptr : &profile->state_update_ns);
     for (const auto& terminal : outcome.terminal_orders) {
       record_terminal(terminal, command.engine_seq, command.received_at);
     }
     update_locations(outcome);
     state_.last_committed_engine_seq = command.engine_seq;
+    state_update.stop();
+    ProfilePhase events(profile == nullptr ? nullptr : &profile->output_events_ns);
     append_events(command, outcome, output);
+    events.stop();
+    ProfilePhase producer_result(profile == nullptr ? nullptr : &profile->producer_result_ns);
     save_producer_result(command, output.result);
+    producer_result.stop();
+    ProfilePhase incremental_validation(
+        profile == nullptr ? nullptr : &profile->incremental_validation_ns);
     if (const auto status = validate_tombstone_suffix(outcome.terminal_orders);
         std::holds_alternative<Error>(status)) {
       return std::get<Error>(status);
@@ -932,22 +1017,23 @@ Result<ExecutionOutput> StateMachine::apply(const CommittedCommand& command) {
         std::holds_alternative<Error>(status)) {
       return std::get<Error>(status);
     }
+    incremental_validation.stop();
     return output;
   }
 
   const auto location = state_.order_locations.find(request.order_id);
   if (location == state_.order_locations.end()) {
     if (is_known_tombstone(request.order_id)) {
-      return reject(command, ErrorCode::order_already_terminal);
+      return reject_command(ErrorCode::order_already_terminal);
     }
-    return reject(command, ErrorCode::order_not_found);
+    return reject_command(ErrorCode::order_not_found);
   }
   if (location->second != request.instrument_id) {
     if (const auto status = validate_location_entry(request.order_id, location->second);
         std::holds_alternative<Error>(status)) {
       return std::get<Error>(status);
     }
-    return reject(command, ErrorCode::order_not_found);
+    return reject_command(ErrorCode::order_not_found);
   }
   const auto book_iterator = state_.books.find(request.instrument_id);
   if (book_iterator == state_.books.end()) {
@@ -959,40 +1045,53 @@ Result<ExecutionOutput> StateMachine::apply(const CommittedCommand& command) {
     return make_error(ErrorCode::corrupt_snapshot, "order index points to no order");
   }
   if (!expected_version_matches(request, *current)) {
-    return reject(command, ErrorCode::version_conflict);
+    return reject_command(ErrorCode::version_conflict);
   }
 
   const auto active_orders_before = state_.active_order_count;
   OrderBookApplyResult outcome;
+  const auto run_book_apply = [&precheck, profile](auto&& operation) {
+    precheck.stop();
+    ProfilePhase book_apply(profile == nullptr ? nullptr : &profile->book_apply_ns);
+    auto result = operation();
+    book_apply.stop();
+    return result;
+  };
   switch (request.command_type) {
     case CommandType::amend_quantity: {
       const auto* payload = std::get_if<AmendQuantityPayload>(&request.payload);
       if (payload == nullptr) {
-        return reject(command, ErrorCode::invalid_command);
+        return reject_command(ErrorCode::invalid_command);
       }
-      outcome = book.amend_quantity(request.order_id, payload->new_total_quantity,
-                                    command.engine_seq);
+      outcome = run_book_apply([&book, &request, payload, &command] {
+        return book.amend_quantity(request.order_id, payload->new_total_quantity,
+                                   command.engine_seq);
+      });
       break;
     }
     case CommandType::replace_order: {
       const auto* payload = std::get_if<ReplaceOrderPayload>(&request.payload);
       if (payload == nullptr || payload->new_price <= 0 ||
           payload->new_price % instrument->tick_size != 0) {
-        return reject(command, ErrorCode::invalid_price);
+        return reject_command(ErrorCode::invalid_price);
       }
       const auto total = payload->new_total_quantity.value_or(current->total_quantity);
       if (total <= 0 || total % instrument->lot_size != 0) {
-        return reject(command, ErrorCode::invalid_quantity);
+        return reject_command(ErrorCode::invalid_quantity);
       }
-      outcome = book.replace(request.order_id, payload->new_price, total,
-                             command.engine_seq);
+      outcome = run_book_apply([&book, &request, payload, total, &command] {
+        return book.replace(request.order_id, payload->new_price, total,
+                            command.engine_seq);
+      });
       break;
     }
     case CommandType::cancel_order:
       if (!std::holds_alternative<CancelOrderPayload>(request.payload)) {
-        return reject(command, ErrorCode::invalid_command);
+        return reject_command(ErrorCode::invalid_command);
       }
-      outcome = book.cancel(request.order_id);
+      outcome = run_book_apply([&book, &request] {
+        return book.cancel(request.order_id);
+      });
       break;
     case CommandType::new_order:
       return make_error(ErrorCode::corrupt_wal, "new order reached existing-order path");
@@ -1002,9 +1101,10 @@ Result<ExecutionOutput> StateMachine::apply(const CommittedCommand& command) {
         outcome.error == ErrorCode::corrupt_wal) {
       return make_error(outcome.error, "order book transition invariant failed");
     }
-    return reject(command, outcome.error);
+    return reject_command(outcome.error);
   }
 
+  ProfilePhase output_events(profile == nullptr ? nullptr : &profile->output_events_ns);
   ExecutionOutput output;
   output.result.identity = request.identity;
   output.result.engine_seq = command.engine_seq;
@@ -1022,13 +1122,22 @@ Result<ExecutionOutput> StateMachine::apply(const CommittedCommand& command) {
     output.result.remaining_quantity = current->remaining_quantity;
     output.result.filled_quantity = current->filled_quantity;
   }
+  output_events.stop();
+  ProfilePhase state_update(profile == nullptr ? nullptr : &profile->state_update_ns);
   for (const auto& terminal : outcome.terminal_orders) {
     record_terminal(terminal, command.engine_seq, command.received_at);
   }
   update_locations(outcome);
   state_.last_committed_engine_seq = command.engine_seq;
+  state_update.stop();
+  ProfilePhase events(profile == nullptr ? nullptr : &profile->output_events_ns);
   append_events(command, outcome, output);
+  events.stop();
+  ProfilePhase producer_result(profile == nullptr ? nullptr : &profile->producer_result_ns);
   save_producer_result(command, output.result);
+  producer_result.stop();
+  ProfilePhase incremental_validation(
+      profile == nullptr ? nullptr : &profile->incremental_validation_ns);
   if (const auto status = validate_tombstone_suffix(outcome.terminal_orders);
       std::holds_alternative<Error>(status)) {
     return std::get<Error>(status);
@@ -1045,6 +1154,7 @@ Result<ExecutionOutput> StateMachine::apply(const CommittedCommand& command) {
       std::holds_alternative<Error>(status)) {
     return std::get<Error>(status);
   }
+  incremental_validation.stop();
   return output;
 }
 
