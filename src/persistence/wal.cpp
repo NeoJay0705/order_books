@@ -879,14 +879,15 @@ Result<WalPosition> Wal::append_prepared_unlocked(
                                                   : ProfileClock::now();
     for (std::size_t offset = 0; offset < chunk.record_count; ++offset) {
       const auto record_index = chunk.first_record + offset;
-      const auto frame_size = static_cast<std::uint64_t>(records[record_index].frame.size());
-      active_bytes_ += frame_size;
-      size_bytes_ += frame_size;
-      last_position = WalPosition{records[record_index].command.engine_seq,
-                                  active_segment_, active_bytes_};
-      last_appended_position_ = last_position;
       records_.push_back(std::move(cached_records[record_index]));
     }
+    const auto chunk_bytes = static_cast<std::uint64_t>(chunk.bytes.size());
+    active_bytes_ += chunk_bytes;
+    size_bytes_ += chunk_bytes;
+    const auto last_record_index = chunk.first_record + chunk.record_count - 1U;
+    last_position = WalPosition{records[last_record_index].command.engine_seq,
+                                active_segment_, active_bytes_};
+    last_appended_position_ = last_position;
     active_dirty_ = true;
     if (profile != nullptr) {
       add_profile_ns(profile->publish_ns,

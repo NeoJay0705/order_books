@@ -397,12 +397,32 @@ TEST(PersistenceTest, WalBatchAppendRotatesWithoutSplittingFrames) {
   auto opened = Wal::open(wal_directory, 1, segment_size);
   ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Wal>>(opened));
   auto wal = std::get<std::unique_ptr<Wal>>(std::move(opened));
-  ASSERT_TRUE(std::holds_alternative<WalPosition>(wal->append_batch(commands)));
-  ASSERT_TRUE(std::holds_alternative<std::monostate>(wal->sync()));
-  EXPECT_EQ(wal_segments(wal_directory).size(), commands.size());
-  for (const auto& segment : wal_segments(wal_directory)) {
+  const auto appended = wal->append_batch(commands);
+  ASSERT_TRUE(std::holds_alternative<WalPosition>(appended));
+  const auto& position = std::get<WalPosition>(appended);
+  EXPECT_EQ(position.engine_seq, commands.back().engine_seq);
+  EXPECT_EQ(wal->last_engine_seq(), commands.back().engine_seq);
+  // Rotation syncs each completed segment before opening the next one.  The
+  // final chunk remains non-durable until the explicit sync below.
+  EXPECT_EQ(wal->durable_position().engine_seq, commands[1].engine_seq);
+
+  auto segments = wal_segments(wal_directory);
+  sort_segments(segments);
+  EXPECT_EQ(segments.size(), commands.size());
+  ASSERT_FALSE(segments.empty());
+  EXPECT_EQ(position.segment, segments.back());
+  EXPECT_EQ(position.end_offset, std::size_t{22} + frame_bytes);
+  EXPECT_EQ(wal->size_bytes(),
+            commands.size() * (std::size_t{22} + frame_bytes));
+  for (const auto& segment : segments) {
     EXPECT_EQ(std::filesystem::file_size(segment), std::size_t{22} + frame_bytes);
   }
+
+  ASSERT_TRUE(std::holds_alternative<std::monostate>(wal->sync()));
+  const auto durable = wal->durable_position();
+  EXPECT_EQ(durable.engine_seq, position.engine_seq);
+  EXPECT_EQ(durable.segment, position.segment);
+  EXPECT_EQ(durable.end_offset, position.end_offset);
 
   auto replayed = wal->replay();
   ASSERT_TRUE(std::holds_alternative<std::vector<domain::CommittedCommand>>(replayed));
