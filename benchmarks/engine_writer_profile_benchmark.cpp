@@ -9,19 +9,24 @@
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
 #include <stop_token>
 #include <string>
+#include <unistd.h>
 #include <utility>
 #include <variant>
 #include <vector>
 
 #include "order_books/event_sink.hpp"
 #include "order_books/engine.hpp"
+#include "engine_tail_telemetry.hpp"
 #include "persistence/wal.hpp"
 #include "runtime/shard_runtime.hpp"
+#include "support/thread_name.hpp"
+#include "thread_resource_telemetry.hpp"
 
 namespace order_books::benchmark {
 namespace {
@@ -32,6 +37,73 @@ using runtime::WriterProfileCollector;
 
 constexpr auto kPhaseTimeout = std::chrono::seconds(60);
 constexpr std::size_t kIngressCapacity = 65'536;
+
+std::vector<std::string> expected_thread_roles(const std::size_t prepare_workers) {
+  std::vector<std::string> roles{"ob-bench", "ob-wr-1", "ob-cmp-1", "ob-pub-1"};
+  for (std::size_t lane = 1U; lane < prepare_workers; ++lane) {
+    roles.push_back("ob-wp-1-" + std::to_string(lane));
+  }
+  return roles;
+}
+
+bool report_thread_resource_error(const std::string_view phase,
+                                  const ThreadResourceError& error) {
+  std::cerr << "workload=engine_writer_hot_path_profile phase=" << phase
+            << " error_code=" << error.code;
+  if (!error.detail.empty()) {
+    std::cerr << " detail=" << error.detail;
+  }
+  std::cerr << '\n';
+  return false;
+}
+
+bool print_thread_resource_deltas(const std::vector<ThreadResourceDelta>& deltas,
+                                  const std::uint64_t commands) {
+  for (const auto& delta : deltas) {
+    const auto& sample = delta.sample;
+    const auto cpu_per_million = per_million(sample.cpu_runtime_ns, commands);
+    const auto runqueue_per_million = per_million(sample.runqueue_wait_ns, commands);
+    const auto voluntary_per_million = per_million(
+        sample.voluntary_context_switches, commands);
+    const auto involuntary_per_million = per_million(
+        sample.involuntary_context_switches, commands);
+    const auto timeslices_per_million = per_million(sample.sched_timeslices, commands);
+    std::string migrations = "not_measured";
+    std::string migrations_per_million = "not_measured";
+    if (sample.cpu_migrations.has_value()) {
+      const auto normalized_migrations = per_million(*sample.cpu_migrations, commands);
+      if (!normalized_migrations.has_value()) {
+        std::cerr << "workload=engine_writer_hot_path_profile phase=diagnostics "
+                     "error_code=thread_resource_normalization_failed\n";
+        return false;
+      }
+      migrations = std::to_string(*sample.cpu_migrations);
+      migrations_per_million = std::to_string(*normalized_migrations);
+    }
+    if (!cpu_per_million.has_value() || !runqueue_per_million.has_value() ||
+        !voluntary_per_million.has_value() || !involuntary_per_million.has_value() ||
+        !timeslices_per_million.has_value()) {
+      std::cerr << "workload=engine_writer_hot_path_profile phase=diagnostics "
+                   "error_code=thread_resource_normalization_failed\n";
+      return false;
+    }
+    std::cout << "workload=engine_writer_hot_path_profile phase=thread_resource"
+              << " role=" << sample.role << " tid=" << sample.tid
+              << " cpu_runtime_ns=" << sample.cpu_runtime_ns
+              << " runqueue_wait_ns=" << sample.runqueue_wait_ns
+              << " sched_timeslices=" << sample.sched_timeslices
+              << " voluntary_context_switches=" << sample.voluntary_context_switches
+              << " involuntary_context_switches=" << sample.involuntary_context_switches
+              << " cpu_migrations=" << migrations
+              << " migrations_per_million=" << migrations_per_million
+              << " cpu_seconds_per_million=" << *cpu_per_million / 1'000'000'000.0
+              << " runqueue_wait_ns_per_million=" << *runqueue_per_million
+              << " sched_timeslices_per_million=" << *timeslices_per_million
+              << " voluntary_per_million=" << *voluntary_per_million
+              << " involuntary_per_million=" << *involuntary_per_million << '\n';
+  }
+  return true;
+}
 
 class AcknowledgingSink final : public EventSink {
  public:
@@ -757,6 +829,11 @@ bool run_engine_writer_hot_path_profile(const WriterProfileBenchmarkOptions& opt
                  "error_code=invalid_profile_options\n";
     return false;
   }
+  if (options.thread_diagnostics != options.tail_telemetry_output.has_value()) {
+    std::cerr << "workload=engine_writer_hot_path_profile phase=setup "
+                 "error_code=writer_diagnostics_output_mismatch\n";
+    return false;
+  }
   const auto measured_commands = doubled(options.iterations);
   const auto warmup_commands = doubled(options.warmup);
   if (!measured_commands.has_value() || !warmup_commands.has_value()) {
@@ -792,6 +869,28 @@ bool run_engine_writer_hot_path_profile(const WriterProfileBenchmarkOptions& opt
       std::filesystem::remove_all(directory, ignored);
     }
   };
+  if (options.tail_telemetry_output.has_value()) {
+    const auto output_parent = options.tail_telemetry_output->parent_path().empty()
+                                   ? std::filesystem::path(".")
+                                   : options.tail_telemetry_output->parent_path();
+    std::error_code output_error;
+    const auto output_status =
+        std::filesystem::symlink_status(*options.tail_telemetry_output, output_error);
+    if (output_error == std::errc::no_such_file_or_directory) {
+      output_error.clear();
+    }
+    if (output_error || std::filesystem::exists(output_status) ||
+        !std::filesystem::is_directory(output_parent, output_error) || output_error ||
+        ::access(output_parent.c_str(), W_OK | X_OK) != 0) {
+      std::cerr << "workload=engine_writer_hot_path_profile phase=setup "
+                   "error_code=writer_tail_telemetry_output_unavailable\n";
+      cleanup();
+      return false;
+    }
+  }
+  if (options.thread_diagnostics) {
+    support::set_current_thread_name("ob-bench");
+  }
 
   EngineConfig config;
   config.data_directory = directory;
@@ -810,7 +909,31 @@ bool run_engine_writer_hot_path_profile(const WriterProfileBenchmarkOptions& opt
   config.runtime.event_replay_snapshot_interval = std::chrono::hours(24);
 
   AcknowledgingSink event_sink;
-  NullMetricsSink metrics_sink;
+  NullMetricsSink null_metrics_sink;
+  MetricsSink* metrics_sink = &null_metrics_sink;
+  std::unique_ptr<EngineTailTelemetry> tail_telemetry;
+  if (options.thread_diagnostics) {
+    try {
+      const auto measured_groups =
+          (*measured_commands - 1U) / static_cast<std::uint64_t>(options.group_size) + 1U;
+      tail_telemetry = std::make_unique<EngineTailTelemetry>(
+          static_cast<std::size_t>(std::min(measured_groups,
+                                            static_cast<std::uint64_t>(
+                                                EngineTailTelemetry::kMaxMetricSamples))));
+      if (!tail_telemetry->reserve()) {
+        std::cerr << "workload=engine_writer_hot_path_profile phase=setup "
+                     "error_code=writer_tail_telemetry_reserve_failed\n";
+        cleanup();
+        return false;
+      }
+      metrics_sink = tail_telemetry.get();
+    } catch (...) {
+      std::cerr << "workload=engine_writer_hot_path_profile phase=setup "
+                   "error_code=writer_tail_telemetry_reserve_failed\n";
+      cleanup();
+      return false;
+    }
+  }
   ProfileCollector collector;
   if (options.profile) {
     try {
@@ -832,7 +955,7 @@ bool run_engine_writer_hot_path_profile(const WriterProfileBenchmarkOptions& opt
     }
   }
   auto opened = runtime::ShardRuntime::open(
-      1, config, event_sink, metrics_sink, options.profile ? &collector : nullptr,
+      1, config, event_sink, *metrics_sink, options.profile ? &collector : nullptr,
       runtime::WriterProfileOptions{options.profile_sample_every,
                                     options.apply_subprofile});
   if (std::holds_alternative<Error>(opened)) {
@@ -854,6 +977,27 @@ bool run_engine_writer_hot_path_profile(const WriterProfileBenchmarkOptions& opt
     cleanup();
     return false;
   }
+  std::vector<std::string> expected_roles;
+  std::optional<ThreadResourceSnapshot> resource_before;
+  std::optional<ThreadResourceSnapshot> resource_after;
+  if (options.thread_diagnostics) {
+    expected_roles = expected_thread_roles(options.wal_prepare_workers);
+    const auto captured = capture_thread_resources(expected_roles);
+    if (std::holds_alternative<ThreadResourceError>(captured)) {
+      report_thread_resource_error("diagnostics", std::get<ThreadResourceError>(captured));
+      (void)runtime->stop();
+      cleanup();
+      return false;
+    }
+    resource_before = std::get<ThreadResourceSnapshot>(captured);
+  }
+  if (tail_telemetry && !tail_telemetry->begin_measured()) {
+    std::cerr << "workload=engine_writer_hot_path_profile phase=setup "
+                 "error_code=writer_tail_telemetry_begin_failed\n";
+    (void)runtime->stop();
+    cleanup();
+    return false;
+  }
   const auto prepare_stats_before_measured = runtime->wal_prepare_stats();
   if (options.profile) {
     collector.reset();
@@ -866,6 +1010,19 @@ bool run_engine_writer_hot_path_profile(const WriterProfileBenchmarkOptions& opt
     (void)runtime->stop();
     cleanup();
     return false;
+  }
+  if (tail_telemetry) {
+    tail_telemetry->stop_collection();
+  }
+  if (options.thread_diagnostics) {
+    const auto captured = capture_thread_resources(expected_roles);
+    if (std::holds_alternative<ThreadResourceError>(captured)) {
+      report_thread_resource_error("diagnostics", std::get<ThreadResourceError>(captured));
+      (void)runtime->stop();
+      cleanup();
+      return false;
+    }
+    resource_after = std::get<ThreadResourceSnapshot>(captured);
   }
   const auto prepare_stats_after_measured = runtime->wal_prepare_stats();
   const auto actual_prepare_stats =
@@ -897,6 +1054,46 @@ bool run_engine_writer_hot_path_profile(const WriterProfileBenchmarkOptions& opt
     return false;
   }
   runtime.reset();
+
+  std::optional<TailTelemetrySummary> tail_summary;
+  if (tail_telemetry) {
+    tail_summary = tail_telemetry->summary();
+    if (tail_summary->telemetry_dropped_samples != 0U ||
+        tail_summary->aggregate_overflow || tail_summary->sampler_error) {
+      std::cerr << "workload=engine_writer_hot_path_profile phase=diagnostics "
+                   "error_code=writer_tail_telemetry_invalid\n";
+      cleanup();
+      return false;
+    }
+    if (tail_summary->measured_sync_count != *measured_group_commits ||
+        tail_summary->measured_group_sample_count != *measured_group_commits ||
+        tail_summary->measured_group_sample_commands != *measured_group_commands) {
+      std::cerr << "workload=engine_writer_hot_path_profile phase=diagnostics "
+                   "error_code=writer_tail_telemetry_count_mismatch\n";
+      cleanup();
+      return false;
+    }
+    if (!tail_telemetry->write_csv(*options.tail_telemetry_output)) {
+      std::cerr << "workload=engine_writer_hot_path_profile phase=diagnostics "
+                   "error_code=writer_tail_telemetry_invalid\n";
+      cleanup();
+      return false;
+    }
+  }
+  std::optional<std::vector<ThreadResourceDelta>> resource_deltas;
+  if (options.thread_diagnostics) {
+    const auto delta = subtract_thread_resources(*resource_before, *resource_after);
+    if (std::holds_alternative<ThreadResourceError>(delta)) {
+      report_thread_resource_error("diagnostics", std::get<ThreadResourceError>(delta));
+      cleanup();
+      return false;
+    }
+    resource_deltas = std::get<std::vector<ThreadResourceDelta>>(delta);
+    if (!print_thread_resource_deltas(*resource_deltas, *measured_commands)) {
+      cleanup();
+      return false;
+    }
+  }
 
   auto wal_result = storage::Wal::open(directory / "shard-1" / "wal", 1,
                                        config.runtime.wal_segment_size,
@@ -979,8 +1176,37 @@ bool run_engine_writer_hot_path_profile(const WriterProfileBenchmarkOptions& opt
             << " publisher_lag_bytes=" << snapshot.event_publish_lag_bytes
             << " publisher_lag_age_ns=" << snapshot.event_publish_lag_age_ns
             << " wal_size_bytes=" << snapshot.wal_size_bytes
-            << " instrument_count=1 shard_count=1 fsync_mode=per_group"
-            << " correctness_verified=true\n";
+            << " instrument_count=1 shard_count=1 fsync_mode=per_group";
+  if (tail_summary.has_value()) {
+    std::cout << " thread_diagnostics=on"
+              << " writer_tail_telemetry=on"
+              << " writer_sync_count=" << tail_summary->measured_sync_count
+              << " writer_group_sample_count=" << tail_summary->measured_group_sample_count
+              << " writer_group_sample_commands="
+              << tail_summary->measured_group_sample_commands
+              << " writer_sync_p50_us="
+              << (tail_summary->measured_sync_p50_us.has_value()
+                      ? std::to_string(*tail_summary->measured_sync_p50_us)
+                      : std::string("na"))
+              << " writer_sync_p99_us="
+              << (tail_summary->measured_sync_p99_us.has_value()
+                      ? std::to_string(*tail_summary->measured_sync_p99_us)
+                      : std::string("na"))
+              << " writer_sync_p99_9_us="
+              << (tail_summary->measured_sync_p999_us.has_value()
+                      ? std::to_string(*tail_summary->measured_sync_p999_us)
+                      : std::string("na"))
+              << " writer_sync_max_us="
+              << (tail_summary->measured_sync_max_us.has_value()
+                      ? std::to_string(*tail_summary->measured_sync_max_us)
+                      : std::string("na"))
+              << " writer_sync_total_us=" << tail_summary->measured_sync_total_us
+              << " writer_sync_over_25ms=" << tail_summary->measured_sync_over_25ms
+              << " writer_sync_over_100ms=" << tail_summary->measured_sync_over_100ms
+              << " writer_sync_over_250ms=" << tail_summary->measured_sync_over_250ms
+              << " writer_tail_telemetry_file=" << *options.tail_telemetry_output;
+  }
+  std::cout << " correctness_verified=true\n";
   if (options.profile &&
       !print_profile(collector, *measured_commands, measured_elapsed,
                      options.profile_sample_every, options.apply_subprofile)) {

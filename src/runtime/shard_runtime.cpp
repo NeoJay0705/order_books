@@ -11,6 +11,7 @@
 #include "persistence/binary_codec.hpp"
 #include "persistence/config_store.hpp"
 #include "domain/invariant_checker.hpp"
+#include "support/thread_name.hpp"
 
 namespace order_books::runtime {
 namespace {
@@ -622,6 +623,7 @@ Status ShardRuntime::stop() {
 }
 
 void ShardRuntime::run(const std::stop_token stop_token) {
+  support::set_current_thread_name("ob-wr-" + std::to_string(shard_id_));
   for (;;) {
     std::chrono::steady_clock::time_point profile_group_start{};
     bool profile_sampled = false;
@@ -722,6 +724,7 @@ void ShardRuntime::run(const std::stop_token stop_token) {
 }
 
 void ShardRuntime::completion_run(const std::stop_token stop_token) {
+  support::set_current_thread_name("ob-cmp-" + std::to_string(shard_id_));
   for (;;) {
     std::pair<CommandResult, CompletionHandler> completion;
     {

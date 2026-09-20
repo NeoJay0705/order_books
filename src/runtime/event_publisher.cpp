@@ -14,6 +14,7 @@
 #include "persistence/crc32c.hpp"
 #include "persistence/file_ops.hpp"
 #include "domain/invariant_checker.hpp"
+#include "support/thread_name.hpp"
 
 namespace order_books::runtime {
 namespace {
@@ -313,6 +314,8 @@ Status EventPublisher::flush_cursor_if_dirty() {
 }
 
 void EventPublisher::run(const std::stop_token stop_token) {
+  support::set_current_thread_name("ob-pub-" +
+                                   std::to_string(state_machine_.state().shard_id));
   std::vector<Event> pending_events;
   EngineSeq pending_seq = 0;
   auto retry_delay = std::chrono::milliseconds(1);

@@ -209,6 +209,12 @@ void EngineTailTelemetry::observe(const std::string_view name,
       }
       return;
     }
+    if (records_.size() >= records_.capacity()) {
+      if (dropped_samples_ != std::numeric_limits<std::uint64_t>::max()) {
+        ++dropped_samples_;
+      }
+      return;
+    }
     records_.push_back(Record{type, current_phase, elapsed_us(observed_at), value, 0U,
                               0U, 0U, 0U, next_order_++});
     ++sample_count;

@@ -63,6 +63,7 @@ struct BenchmarkOptions {
   WalPhaseProfileMode wal_phase_profile{WalPhaseProfileMode::off};
   WriterPhaseProfileMode writer_phase_profile{WriterPhaseProfileMode::off};
   bool writer_apply_subprofile{};
+  bool writer_thread_diagnostics{};
   std::size_t engine_group_size{256};
   std::chrono::microseconds engine_group_delay{200};
   std::size_t engine_producer_lanes{kDurableProducerLanes};
@@ -88,6 +89,10 @@ struct BenchmarkOptions {
   bool writer_apply_subprofile_option_set{};
   bool writer_profile_sample_parse_error{};
   bool writer_profile_sample_option_set{};
+  bool writer_thread_diagnostics_parse_error{};
+  bool writer_thread_diagnostics_option_set{};
+  bool writer_tail_telemetry_parse_error{};
+  bool writer_tail_telemetry_option_set{};
   bool engine_tail_telemetry_parse_error{};
   bool engine_tail_telemetry_option_set{};
   bool engine_tail_state_sampling{true};
@@ -95,6 +100,7 @@ struct BenchmarkOptions {
   bool engine_tail_state_sampling_option_set{};
   std::optional<std::filesystem::path> data_directory;
   std::optional<std::filesystem::path> engine_tail_telemetry_output;
+  std::optional<std::filesystem::path> writer_tail_telemetry_output;
 };
 
 struct WorkloadDelta {
@@ -390,6 +396,15 @@ std::optional<BenchmarkOptions> parse_options(const int argc, char** argv) {
       } else {
         options.writer_apply_subprofile = *profile == WriterPhaseProfileMode::on;
       }
+    } else if (argument.starts_with("--writer-thread-diagnostics=")) {
+      options.writer_thread_diagnostics_option_set = true;
+      const auto diagnostics = parse_writer_phase_profile(
+          argument.substr(std::string_view("--writer-thread-diagnostics=").size()));
+      if (!diagnostics.has_value()) {
+        options.writer_thread_diagnostics_parse_error = true;
+      } else {
+        options.writer_thread_diagnostics = *diagnostics == WriterPhaseProfileMode::on;
+      }
     } else if (argument.starts_with("--writer-profile-sample-every=")) {
       options.writer_profile_sample_option_set = true;
       const auto sample_every = parse_positive_option(
@@ -413,6 +428,15 @@ std::optional<BenchmarkOptions> parse_options(const int argc, char** argv) {
         options.engine_tail_telemetry_parse_error = true;
       } else {
         options.engine_tail_telemetry_output = std::filesystem::path(path);
+      }
+    } else if (argument.starts_with("--writer-tail-telemetry-output=")) {
+      options.writer_tail_telemetry_option_set = true;
+      const auto path = argument.substr(
+          std::string_view("--writer-tail-telemetry-output=").size());
+      if (path.empty()) {
+        options.writer_tail_telemetry_parse_error = true;
+      } else {
+        options.writer_tail_telemetry_output = std::filesystem::path(path);
       }
     } else if (argument.starts_with("--engine-tail-state-sampling=")) {
       options.engine_tail_state_sampling_option_set = true;
@@ -1881,6 +1905,7 @@ void print_usage() {
                "[--wal-sync=none|per_group] [--wal-phase-profile=off|on] "
                "[--writer-phase-profile=off|on] [--writer-profile-sample-every=N] "
                "[--writer-apply-subprofile=off|on] "
+               "[--writer-thread-diagnostics=off|on] "
                "[--engine-group-size=N] "
                "[--engine-group-delay-us=N] [--engine-producer-lanes=N] "
                "[--wal-prepare-workers=1|2|4] "
@@ -1891,6 +1916,7 @@ void print_usage() {
                "[--publisher-cursor-persist-max-commands=N] "
                "[--publisher-cursor-persist-max-delay-us=N] "
                "[--engine-tail-telemetry-output=PATH] "
+               "[--writer-tail-telemetry-output=PATH] "
                "[--engine-tail-state-sampling=on|off]\n";
 }
 
@@ -1939,6 +1965,12 @@ int main(const int argc, char** argv) {
     print_usage();
     return 2;
   }
+  if (options->writer_thread_diagnostics_parse_error) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=writer_thread_diagnostics_invalid\n";
+    print_usage();
+    return 2;
+  }
   if (options->writer_profile_sample_parse_error ||
       options->writer_profile_sample_every == 0) {
     std::cerr << "workload=" << workload_name(options->workload)
@@ -1949,6 +1981,12 @@ int main(const int argc, char** argv) {
   if (options->engine_tail_telemetry_parse_error) {
     std::cerr << "workload=" << workload_name(options->workload)
               << " phase=cli error_code=engine_tail_telemetry_output_invalid\n";
+    print_usage();
+    return 2;
+  }
+  if (options->writer_tail_telemetry_parse_error) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=writer_tail_telemetry_output_invalid\n";
     print_usage();
     return 2;
   }
@@ -2093,6 +2131,34 @@ int main(const int argc, char** argv) {
     print_usage();
     return 2;
   }
+  if (options->writer_thread_diagnostics_option_set &&
+      options->workload != WorkloadSelection::engine_writer_hot_path_profile) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=writer_thread_diagnostics_requires_writer_profile_workload\n";
+    print_usage();
+    return 2;
+  }
+  if (options->writer_tail_telemetry_option_set &&
+      options->workload != WorkloadSelection::engine_writer_hot_path_profile) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=writer_tail_telemetry_requires_writer_profile_workload\n";
+    print_usage();
+    return 2;
+  }
+  if (options->writer_thread_diagnostics &&
+      !options->writer_tail_telemetry_option_set) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=writer_thread_diagnostics_requires_tail_telemetry\n";
+    print_usage();
+    return 2;
+  }
+  if (options->writer_tail_telemetry_option_set &&
+      !options->writer_thread_diagnostics) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=writer_tail_telemetry_requires_thread_diagnostics\n";
+    print_usage();
+    return 2;
+  }
   if (options->engine_tail_telemetry_option_set &&
       options->workload != WorkloadSelection::engine_durable_single_instrument) {
     std::cerr << "workload=" << workload_name(options->workload)
@@ -2173,6 +2239,8 @@ int main(const int argc, char** argv) {
         options->writer_apply_subprofile,
         options->writer_profile_sample_every,
         options->data_directory,
+        options->writer_thread_diagnostics,
+        options->writer_tail_telemetry_output,
     };
     return benchmark::run_engine_writer_hot_path_profile(writer_options) ? 0 : 1;
   }

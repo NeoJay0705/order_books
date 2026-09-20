@@ -24,6 +24,7 @@ add_library(order_books_core STATIC
   src/domain/invariant_checker.cpp
   src/domain/order_book.cpp
   src/domain/state_machine.cpp
+  src/support/thread_name.cpp
 )
 add_library(order_books::core ALIAS order_books_core)
 target_include_directories(order_books_core

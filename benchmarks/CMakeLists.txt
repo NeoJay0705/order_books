@@ -3,6 +3,7 @@ add_executable(order_books_benchmark
   engine_tail_telemetry.cpp
   engine_writer_profile_benchmark.cpp
   pipeline_ceiling_benchmark.cpp
+  thread_resource_telemetry.cpp
 )
 
 set_target_properties(order_books_benchmark PROPERTIES
@@ -162,6 +163,54 @@ if(BUILD_TESTING)
             -DCLI_ARGUMENT=--writer-phase-profile=on
             -DEXPECTED_ERROR=writer_phase_profile_requires_writer_profile_workload
             -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_writer_thread_diagnostics_invalid
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--workload=engine_writer_hot_path_profile
+            -DCLI_ARGUMENT_2=--writer-thread-diagnostics=invalid
+            -DEXPECTED_ERROR=writer_thread_diagnostics_invalid
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_writer_thread_diagnostics_requires_tail
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--workload=engine_writer_hot_path_profile
+            -DCLI_ARGUMENT_2=--writer-thread-diagnostics=on
+            -DEXPECTED_ERROR=writer_thread_diagnostics_requires_tail_telemetry
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_writer_tail_telemetry_requires_diagnostics
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--workload=engine_writer_hot_path_profile
+            -DCLI_ARGUMENT_2=--writer-tail-telemetry-output=/tmp/order-books-writer-tail.csv
+            -DEXPECTED_ERROR=writer_tail_telemetry_requires_thread_diagnostics
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(
+      NAME order_books_benchmark_writer_thread_diagnostics_smoke
+      COMMAND ${CMAKE_COMMAND}
+              "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+              "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/writer-thread-diagnostics-smoke"
+              -P "${CMAKE_CURRENT_SOURCE_DIR}/check_writer_thread_diagnostics.cmake"
+    )
+  endif()
+
+  add_test(
+    NAME order_books_benchmark_writer_diagnostics_output_unavailable
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/writer-diagnostics-output-unavailable"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_writer_diagnostics_output.cmake"
   )
 
   add_test(
@@ -371,7 +420,7 @@ if(BUILD_TESTING)
             -DCLI_ARGUMENT_7=--iterations=2
             -DCLI_ARGUMENT_8=--warmup=8
             "-DREQUIRED_REGEXES=workload=engine_writer_hot_path_profile phase=summary.*commands=4.*wal_group_commits=[1-9][0-9]*.*wal_group_commands=4.*actual_commands_per_group=[0-9].*publisher_lag_events=[0-9][0-9]*.*publisher_lag_bytes=[0-9][0-9]*.*publisher_lag_age_ns=[0-9][0-9]*.*correctness_verified=true;workload=engine_writer_hot_path_profile phase=profile.*writer_apply_subprofile=off.*apply_share_percent=.*wal_rotation_ceiling_observed=false"
-            "-DFORBIDDEN_REGEXES=apply_precheck_ns=;apply_book_apply_ns=;apply_state_update_ns=;apply_output_events_ns=;apply_producer_result_ns=;apply_incremental_validation_ns=;apply_children_ns=;apply_unattributed_ns=;apply_commands=;apply_events=;apply_trades=;wal_rotation_derived_ceiling_commands_per_second=;wal_rotation_headroom_percent="
+            "-DFORBIDDEN_REGEXES=apply_precheck_ns=;apply_book_apply_ns=;apply_state_update_ns=;apply_output_events_ns=;apply_producer_result_ns=;apply_incremental_validation_ns=;apply_children_ns=;apply_unattributed_ns=;apply_commands=;apply_events=;apply_trades=;wal_rotation_derived_ceiling_commands_per_second=;wal_rotation_headroom_percent=;thread_diagnostics=;phase=thread_resource;writer_tail_telemetry=;writer_sync_;writer_tail_telemetry_file="
             -P "${CMAKE_CURRENT_SOURCE_DIR}/check_writer_profile_output.cmake"
   )
 

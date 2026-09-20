@@ -190,6 +190,22 @@ TEST(EngineTailTelemetryTest, CollectsMeasuredSamplesAndSeparatesDrain) {
   EXPECT_FALSE(result.sampler_error);
 }
 
+TEST(EngineTailTelemetryTest, DropsSamplesAtTheReservedRecordCapacity) {
+  EngineTailTelemetry telemetry(0);
+  ASSERT_TRUE(telemetry.reserve());
+  ASSERT_TRUE(telemetry.begin_measured());
+
+  for (std::size_t index = 0; index < EngineTailTelemetry::kMaxStateSamples; ++index) {
+    telemetry.observe("wal_sync_latency_us", 1);
+  }
+  telemetry.observe("wal_sync_latency_us", 1);
+  telemetry.stop_collection();
+
+  const auto result = telemetry.summary();
+  EXPECT_EQ(result.measured_sync_count, EngineTailTelemetry::kMaxStateSamples);
+  EXPECT_EQ(result.telemetry_dropped_samples, 1U);
+}
+
 TEST(EngineTailTelemetryTest, RecordsDrainBoundarySnapshots) {
   EngineTailTelemetry telemetry(2);
   ASSERT_TRUE(telemetry.reserve());

@@ -16,6 +16,7 @@
 #include "persistence/binary_codec.hpp"
 #include "persistence/crc32c.hpp"
 #include "persistence/file_ops.hpp"
+#include "support/thread_name.hpp"
 
 namespace order_books::storage {
 namespace {
@@ -191,8 +192,9 @@ struct Wal::PrepareWorkers {
     bool profiled{};
   };
 
-  PrepareWorkers(const std::size_t lane_count, const std::size_t segment_size)
-      : lane_count_(lane_count), segment_size_(segment_size) {}
+  PrepareWorkers(const std::size_t lane_count, const std::size_t segment_size,
+                 const ShardId shard_id)
+      : lane_count_(lane_count), segment_size_(segment_size), shard_id_(shard_id) {}
 
   void start() {
     workers_.reserve(lane_count_ - 1U);
@@ -377,6 +379,8 @@ struct Wal::PrepareWorkers {
   }
 
   void worker_loop(const std::size_t lane_index, const std::stop_token token) noexcept {
+    support::set_current_thread_name("ob-wp-" + std::to_string(shard_id_) + "-" +
+                                     std::to_string(lane_index));
     std::uint64_t last_generation = 0;
     for (;;) {
       Job* job = nullptr;
@@ -411,6 +415,7 @@ struct Wal::PrepareWorkers {
 
   std::size_t lane_count_{};
   std::size_t segment_size_{};
+  ShardId shard_id_{};
   std::mutex mutex_;
   std::condition_variable_any job_cv_;
   std::condition_variable completed_cv_;
@@ -509,7 +514,7 @@ Status Wal::initialize_prepare_workers() {
   }
   try {
     prepare_workers_ = std::make_unique<PrepareWorkers>(
-        prepare_options_.lane_count, segment_size_);
+        prepare_options_.lane_count, segment_size_, shard_id_);
     prepare_workers_->start();
   } catch (const std::exception&) {
     return wal_error(ErrorCode::wal_failure,
