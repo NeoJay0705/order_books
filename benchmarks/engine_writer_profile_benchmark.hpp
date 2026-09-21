@@ -20,8 +20,6 @@ struct WriterProfileBenchmarkOptions {
   bool apply_subprofile{};
   std::uint64_t profile_sample_every{1};
   std::optional<std::filesystem::path> data_directory;
-  bool thread_diagnostics{};
-  std::optional<std::filesystem::path> tail_telemetry_output;
 };
 
 [[nodiscard]] bool run_engine_writer_hot_path_profile(

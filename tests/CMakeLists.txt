@@ -14,9 +14,7 @@ add_executable(order_books_tests
   integration/persistence_test.cpp
   integration/wal_write_ceiling_test.cpp
   unit/metrics_registry_test.cpp
-  unit/thread_resource_telemetry_test.cpp
   ../benchmarks/engine_tail_telemetry.cpp
-  ../benchmarks/thread_resource_telemetry.cpp
 )
 
 set_target_properties(order_books_tests PROPERTIES
