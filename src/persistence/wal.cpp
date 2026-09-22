@@ -557,7 +557,8 @@ Status Wal::validate_segment_header(const std::span<const std::byte> bytes,
   return std::monostate{};
 }
 
-Status Wal::create_segment(const EngineSeq first_engine_seq) {
+Status Wal::create_segment(const EngineSeq first_engine_seq,
+                           WalAppendProfile* profile) {
   if (active_descriptor_ >= 0) {
     FileOps::close(active_descriptor_);
     active_descriptor_ = -1;
@@ -569,20 +570,38 @@ Status Wal::create_segment(const EngineSeq first_engine_seq) {
     return std::get<Error>(descriptor);
   }
   const auto descriptor_value = std::get<int>(descriptor);
+  const auto header_write_start = profile == nullptr ? ProfileClock::time_point{}
+                                                     : ProfileClock::now();
   const auto status = FileOps::write_all(descriptor_value, header);
   if (std::holds_alternative<Error>(status)) {
     FileOps::close(descriptor_value);
     return std::get<Error>(status);
   }
+  if (profile != nullptr) {
+    add_profile_ns(profile->rotation_header_write_ns,
+                   profile_elapsed_ns(header_write_start, ProfileClock::now()));
+  }
+  const auto header_sync_start = profile == nullptr ? ProfileClock::time_point{}
+                                                    : ProfileClock::now();
   const auto sync_status = FileOps::sync_file(descriptor_value);
   if (std::holds_alternative<Error>(sync_status)) {
     FileOps::close(descriptor_value);
     return std::get<Error>(sync_status);
   }
+  if (profile != nullptr) {
+    add_profile_ns(profile->rotation_header_sync_ns,
+                   profile_elapsed_ns(header_sync_start, ProfileClock::now()));
+  }
+  const auto directory_sync_start = profile == nullptr ? ProfileClock::time_point{}
+                                                       : ProfileClock::now();
   const auto directory_status = FileOps::sync_directory(directory_);
   if (std::holds_alternative<Error>(directory_status)) {
     FileOps::close(descriptor_value);
     return std::get<Error>(directory_status);
+  }
+  if (profile != nullptr) {
+    add_profile_ns(profile->rotation_directory_sync_ns,
+                   profile_elapsed_ns(directory_sync_start, ProfileClock::now()));
   }
   active_descriptor_ = descriptor_value;
   active_bytes_ = header.size();
@@ -849,12 +868,18 @@ Result<WalPosition> Wal::append_prepared_unlocked(
                                     : ProfileClock::time_point{};
     if (chunk.rotate_before) {
       if (active_dirty_) {
+        const auto rotation_sync_start = profile == nullptr ? ProfileClock::time_point{}
+                                                            : ProfileClock::now();
         auto status = sync_active_unlocked();
         if (std::holds_alternative<Error>(status)) {
           return std::get<Error>(status);
         }
+        if (profile != nullptr) {
+          add_profile_ns(profile->rotation_sync_ns,
+                         profile_elapsed_ns(rotation_sync_start, ProfileClock::now()));
+        }
       }
-      auto status = create_segment(records[chunk.first_record].command.engine_seq);
+      auto status = create_segment(records[chunk.first_record].command.engine_seq, profile);
       if (std::holds_alternative<Error>(status)) {
         return std::get<Error>(status);
       }

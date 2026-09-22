@@ -88,10 +88,20 @@ write_fake_commands() {
     '    count_file="$state/benchmark-count"; count=0; [[ -s "$count_file" ]] && count=$(<"$count_file"); count=$((count + 1)); printf "%s\\n" "$count" >"$count_file"' \
     '    spin_iterations=20000; for ((spin=0; spin<spin_iterations; ++spin)); do :; done' \
     '    printf "%s label=%s %s\\n" "$name" "${RUNNER_CASE_LABEL:-unknown}" "$*" >>"$log"; [[ "$scenario" != benchmark_nonzero || "$count" != 1 ]] || exit 42' \
-    '    iterations=10; workload=""; group=256; tail_output=""; for arg in "$@"; do case "$arg" in --iterations=*) iterations=${arg#*=} ;; --workload=*) workload=${arg#*=} ;; --engine-group-size=*) group=${arg#*=} ;; --engine-tail-telemetry-output=*) tail_output=${arg#*=} ;; esac; done' \
+    '    iterations=10; workload=""; group=256; pipeline_batch=2; pipeline_scenario=new_crossing_pair; wal_sync=none; phase_profile=off; no_rotation_epoch=0; rotation_diagnostic=""; tail_output=""; for arg in "$@"; do case "$arg" in --iterations=*) iterations=${arg#*=} ;; --workload=*) workload=${arg#*=} ;; --engine-group-size=*) group=${arg#*=} ;; --pipeline-batch-size=*) pipeline_batch=${arg#*=} ;; --pipeline-command-scenario=*) pipeline_scenario=${arg#*=} ;; --wal-group-size=*) group=${arg#*=} ;; --wal-sync=*) wal_sync=${arg#*=} ;; --wal-phase-profile=*) phase_profile=${arg#*=} ;; --wal-no-rotation-epoch-commands=*) no_rotation_epoch=${arg#*=} ;; --wal-rotation-diagnostic=*) rotation_diagnostic=${arg#*=} ;; --engine-tail-telemetry-output=*) tail_output=${arg#*=} ;; esac; done' \
     '    : "${RUNNER_CASE_LABEL:?}"' \
-    '    [[ "$scenario" != identity_change ]] || : >"$state/identity-marker"; commands=$((iterations * 2)); elapsed=42; rps=100000' \
-    '    if [[ "$workload" == engine_durable_single_instrument ]]; then' \
+    '    [[ "$scenario" != identity_change ]] || : >"$state/identity-marker"; commands=$((iterations * 2)); elapsed=42; [[ "$RUNNER_CASE_LABEL" != calibration-* ]] || elapsed=1; rps=100000; if [[ "$scenario" == component_profile_bias_2pct ]]; then rps=1e+06; elif [[ "$scenario" == component_rounding_probe ]]; then if [[ "$workload" == engine_pipeline_ceiling ]]; then rps=100001; else rps=81921; fi; elif [[ "$scenario" == component_append_cv_rejected && "$RUNNER_CASE_LABEL" == append-r*-b1 ]]; then case "$RUNNER_CASE_LABEL" in *-r2-*) rps=120000 ;; *) rps=100000 ;; esac; fi' \
+    '    if [[ "$workload" == engine_pipeline_ceiling ]]; then' \
+    '      commands=$((iterations * pipeline_batch)); trades=0; events=$commands; active_orders=0; [[ "$pipeline_scenario" != new_crossing_pair ]] || { trades=$((commands / 2)); events=$((commands * 2)); }' \
+    '      [[ "$pipeline_scenario" != amend_quantity && "$pipeline_scenario" != replace_order ]] || active_orders=1' \
+    '      printf "engine_pipeline_ceiling stage=state_machine scenario=%s measured_commands=%s commands_per_second=%s average_ns_per_command=10 elapsed_ms=%s trades=%s events=%s active_orders=%s active_levels=%s last_engine_seq=%s completion_boundary=state_apply_return latency_scope=run_average correctness_verified=true\n" "$pipeline_scenario" "$commands" "$rps" "$elapsed" "$trades" "$events" "$active_orders" "$active_orders" "$commands"' \
+    '    elif [[ "$workload" == wal_write_ceiling ]]; then' \
+    '      exec 3>&1; wal_output_file="$state/wal-output-$$"; exec >"$wal_output_file"' \
+    '      output_name=wal_write_ceiling; [[ "$no_rotation_epoch" == 0 ]] || output_name=wal_append_no_rotation; [[ -z "$rotation_diagnostic" ]] || output_name=wal_rotation_diagnostic' \
+    '      commands=$((iterations * group)); output_commands=$commands; reported_groups=$iterations; service_rps=$rps; if [[ "$phase_profile" == on && "$scenario" == component_profile_bias ]]; then service_rps=104000; elif [[ "$phase_profile" == on && "$scenario" == component_profile_bias_2pct ]]; then service_rps=1.02e+06; fi; sync_samples=0; [[ "$wal_sync" != per_group ]] || sync_samples=$iterations; [[ "$scenario" != component_sync_counter_mismatch || "$wal_sync" != per_group || "$RUNNER_CASE_LABEL" != fsync-r1-b1 ]] || sync_samples=$((iterations - 1)); [[ "$scenario" != component_sync_counter_overflow || "$wal_sync" != per_group || "$RUNNER_CASE_LABEL" != fsync-r1-b1 ]] || sync_samples=$((iterations + 1)); profiled_groups=$iterations; profiled_commands=$commands; profiled_data_write_calls=$iterations; [[ "$scenario" != component_profile_counter_mismatch ]] || profiled_commands=$((commands - 1)); [[ "$scenario" != component_profile_groups_mismatch || "$phase_profile" != on ]] || profiled_groups=$((iterations - 1)); [[ "$scenario" != component_group_counter_mismatch || "$RUNNER_CASE_LABEL" != append-r1-b1 ]] || reported_groups=$((iterations - 1)); [[ "$scenario" != component_malformed_counter || "$RUNNER_CASE_LABEL" != append-r1-b1 ]] || output_commands=nan; profile_fields=""; [[ "$phase_profile" != on || "$scenario" == component_profile_missing_field ]] || profile_fields=" profiled_groups=$profiled_groups profiled_commands=$profiled_commands profiled_data_write_calls=$profiled_data_write_calls wal_prepare_group_total_us=1 wal_plan_copy_group_total_us=1 wal_write_group_total_us=1 wal_publish_group_total_us=1 wal_rotation_group_total_us=1 rotation_sync_total_us=1 rotation_header_write_total_us=1 rotation_header_sync_total_us=1 rotation_directory_sync_total_us=1"' \
+    '      rotation_scope=rotation_inclusive; [[ "$no_rotation_epoch" == 0 ]] || rotation_scope=no_rotation; rotation_count=0; [[ "$rotation_diagnostic" != trigger ]] || rotation_count=1; [[ "$scenario" != component_rotation_control_nonzero || "$rotation_diagnostic" != control ]] || rotation_count=1; [[ "$scenario" != component_rotation_trigger_zero || "$rotation_diagnostic" != trigger ]] || rotation_count=0; [[ "$scenario" != component_rotation_trigger_multiple || "$rotation_diagnostic" != trigger ]] || rotation_count=2; rotation_triggered=false; [[ "$rotation_count" != 0 ]] && rotation_triggered=true; measured_syscw=$reported_groups; [[ "$rotation_count" == 0 ]] || measured_syscw=1; planned_bytes=$((commands * 100)); [[ "$rotation_diagnostic" != trigger ]] || planned_bytes=$((planned_bytes + 22)); actual_bytes=$planned_bytes; [[ "$scenario" != component_byte_plan_mismatch ]] || actual_bytes=$((actual_bytes + 1)); diagnostic_case=$rotation_diagnostic; [[ "$scenario" != component_rotation_case_mismatch ]] || { [[ "$diagnostic_case" == control ]] && diagnostic_case=trigger || diagnostic_case=control; }; diagnostic_after_id=1; diagnostic_after_offset=122; [[ "$scenario" != component_rotation_position_mismatch ]] || diagnostic_after_offset=123; [[ "$scenario" != component_wrong_no_rotation_name || "$no_rotation_epoch" == 0 ]] || output_name=wal_write_ceiling; [[ "$scenario" != component_rotation_multiple_groups || -z "$rotation_diagnostic" ]] || { reported_groups=2; profiled_groups=2; }; printf "%s case=%s sync_mode=%s completion_boundary=%s groups=%s group_size=%s commands=%s commands_per_second=%s workload_wall_commands_per_second=%s service_commands_per_second=%s target_commands_per_second=1000000 target_attainment_percent=1 workload_wall_target_attainment_percent=1 service_target_attainment_percent=1 wal_mib_per_second=1 workload_wall_wal_mib_per_second=1 service_wal_mib_per_second=1 average_wal_bytes_per_command=100 latency_sample_stride=1 append_latency_sample_count=%s append_group_p50_us=1 append_group_p99_us=1 append_group_p99.9_us=1 append_group_max_us=1 sync_samples=%s sync_latency_sample_count=%s sync_p50_us=1 sync_p99_us=1 sync_p99.9_us=1 sync_max_us=1 group_total_latency_sample_count=%s group_total_p50_us=1 group_total_p99_us=1 group_total_p99.9_us=1 group_total_max_us=1 elapsed_ms=%s workload_wall_elapsed_ms=%s service_elapsed_ms=%s wal_bytes_delta=%s planned_wal_bytes_delta=%s wal_byte_plan_verified=true segment_count=1 measured_segment_rotations=%s rotation_triggered=%s rotation_scope=%s segment_id_before=1 segment_id_after=%s target_sequence=1 segment_offset_before=22 segment_offset_after=%s segment_header_bytes=22 frame_bytes_per_command=100 measured_rusage_valid=true measured_io_valid=true measured_meminfo_valid=true measured_user_seconds=1 measured_system_seconds=1 measured_voluntary_context_switches=1 measured_involuntary_context_switches=1 measured_syscw=%s measured_wchar=1 measured_write_bytes=1 measured_cancelled_write_bytes=0 measured_dirty_bytes_before=1 measured_dirty_bytes_after=2 measured_writeback_bytes_before=3 measured_writeback_bytes_after=4 measured_wal_write_calls=%s measured_wal_sync_calls=%s replay_verified=true phase_profile=%s%s\n" "$output_name" "$diagnostic_case" "$wal_sync" "$([[ "$wal_sync" == none ]] && printf append_batch_return || printf group_fsync)" "$reported_groups" "$group" "$output_commands" "$rps" "$rps" "$service_rps" "$reported_groups" "$sync_samples" "$sync_samples" "$sync_samples" "$elapsed" "$elapsed" "$elapsed" "$actual_bytes" "$planned_bytes" "$rotation_count" "$rotation_triggered" "$rotation_scope" "$diagnostic_after_id" "$diagnostic_after_offset" "$measured_syscw" "$measured_syscw" "$sync_samples" "$phase_profile" "$profile_fields"' \
+    '      exec >&3; if [[ "$RUNNER_CASE_LABEL" == append-r1-b1 ]]; then case "$scenario" in component_resource_missing) sed -i "s/ measured_io_valid=true//" "$wal_output_file" ;; component_resource_duplicate) sed -i "s/ measured_io_valid=true/ measured_io_valid=true measured_io_valid=true/" "$wal_output_file" ;; component_resource_na) sed -i "s/ measured_io_valid=true/ measured_io_valid=na/" "$wal_output_file" ;; component_write_call_mismatch) sed -i "s/ measured_wal_write_calls=[0-9][0-9]*/ measured_wal_write_calls=0/" "$wal_output_file" ;; esac; fi; cat "$wal_output_file"; rm -f "$wal_output_file"' \
+    '    elif [[ "$workload" == engine_durable_single_instrument ]]; then' \
     '      [[ "$scenario" != command_mismatch || "$RUNNER_CASE_LABEL" != engine-calibration-* ]] || commands=$((commands + 1))' \
     '      [[ "$scenario" != duration_short || "$RUNNER_CASE_LABEL" != engine-scan-* ]] || elapsed=1' \
     '      if [[ "$scenario" == cv_over && "$RUNNER_CASE_LABEL" == engine-scan-* ]]; then case "$RUNNER_CASE_LABEL" in *-r1-*) rps=100000 ;; *-r2-*) rps=120000 ;; *) rps=80000 ;; esac; fi' \
@@ -131,6 +141,8 @@ run_runner() {
     ENGINE_WRITER_DIAGNOSTICS_TEST_OBSERVER_BIAS_PERCENT="${ENGINE_WRITER_DIAGNOSTICS_TEST_OBSERVER_BIAS_PERCENT:-100}" \
     ENGINE_WRITER_DIAGNOSTICS_TEST_TAIL_BIAS_PERCENT="${ENGINE_WRITER_DIAGNOSTICS_TEST_TAIL_BIAS_PERCENT:-100}" \
     ENGINE_WRITER_DIAGNOSTICS_TEST_ENGINE_CASES="${ENGINE_WRITER_DIAGNOSTICS_TEST_ENGINE_CASES:-}" \
+    ENGINE_WRITER_DIAGNOSTICS_TEST_PIPELINE_ROUNDS="${ENGINE_WRITER_DIAGNOSTICS_TEST_PIPELINE_ROUNDS:-1}" \
+    ENGINE_WRITER_DIAGNOSTICS_TEST_WAL_ROUNDS="${ENGINE_WRITER_DIAGNOSTICS_TEST_WAL_ROUNDS:-1}" \
     "$RUNNER" --binary="$FAKE_BIN/order_books_benchmark" --fio-bs=4096 \
       --run-parent="$TEST_ROOT/runs" --bench-cpus=2-7 --observer-cpus=0-1 \
       --cpu-list=2,3,4,5,6,7 "$@" >"$output_file" 2>&1
@@ -144,13 +156,49 @@ eval "$(awk '
   in_function { print }
   in_function && /^}$/ { exit }
 ' "$RUNNER")"
+eval "$(awk '
+  /^component_extract_field\(\) \{/ { in_function=1 }
+  in_function { print }
+  in_function && /^component_extract_rate\(\) \{/ { rate_function=1 }
+  rate_function && /^}$/ { exit }
+' "$RUNNER")"
+eval "$(awk '
+  /^component_validate_measured_resources\(\) \{/ { in_function=1 }
+  in_function { print }
+  in_function && /^}$/ { exit }
+' "$RUNNER")"
 [[ "$(decimal_double_u64 10)" == 20 ]] || exit 1
 [[ "$(decimal_double_u64 9223372036854775807)" == 18446744073709551614 ]] || exit 1
 if decimal_double_u64 9223372036854775808 >/dev/null 2>&1; then exit 1; fi
+numeric_fixture="$TEST_ROOT/component-numeric-fields.txt"
+printf 'commands_per_second=1.05e+06\n' >"$numeric_fixture"
+[[ "$(component_extract_rate "$numeric_fixture" state)" == 1.05e+06 ]] || exit 1
+for malformed in nan inf 1e309 -1; do
+  printf 'commands_per_second=%s\n' "$malformed" >"$numeric_fixture"
+  if component_extract_rate "$numeric_fixture" state >/dev/null 2>&1; then exit 1; fi
+done
+printf 'commands_per_second=1 commands_per_second=2\n' >"$numeric_fixture"
+if component_extract_rate "$numeric_fixture" state >/dev/null 2>&1; then exit 1; fi
+printf 'groups=1 groups=2\n' >"$numeric_fixture"
+if component_extract_integer_field "$numeric_fixture" groups >/dev/null 2>&1; then exit 1; fi
+resource_fixture="$TEST_ROOT/component-resource-fields.txt"
+printf '%s\n' \
+  'measured_rusage_valid=true measured_io_valid=true measured_meminfo_valid=true measured_user_seconds=1 measured_system_seconds=2 measured_voluntary_context_switches=3 measured_involuntary_context_switches=4 measured_syscw=5 measured_wchar=6 measured_write_bytes=7 measured_cancelled_write_bytes=0 measured_dirty_bytes_before=8 measured_dirty_bytes_after=9 measured_writeback_bytes_before=10 measured_writeback_bytes_after=11 measured_wal_write_calls=5 measured_wal_sync_calls=0' \
+  >"$resource_fixture"
+component_validate_measured_resources "$resource_fixture" 0
+sed 's/measured_io_valid=true/measured_io_valid=na/' "$resource_fixture" >"$numeric_fixture"
+if component_validate_measured_resources "$numeric_fixture" 0 >/dev/null 2>&1; then exit 1; fi
+sed 's/measured_wal_write_calls=5/measured_wal_write_calls=4/' "$resource_fixture" >"$numeric_fixture"
+if component_validate_measured_resources "$numeric_fixture" 0 >/dev/null 2>&1; then exit 1; fi
 dry_run=$($RUNNER --dry-run --binary=/bin/true --fio-bs=4096)
 printf '%s\n' "$dry_run" | grep -F 'dry_run=true workload=engine_writer_unified_ceiling' >/dev/null
 printf '%s\n' "$dry_run" | grep -F 'calibration_iterations=' >/dev/null
 printf '%s\n' "$dry_run" | grep -F 'tail_attribution' >/dev/null
+component_dry_run=$($RUNNER --scope=component --dry-run --binary=/bin/true)
+printf '%s\n' "$component_dry_run" | grep -F 'scope=component' >/dev/null
+printf '%s\n' "$component_dry_run" | grep -F 'wal_fsync' >/dev/null
+! printf '%s\n' "$component_dry_run" | grep -F 'perf_record' >/dev/null
+! printf '%s\n' "$component_dry_run" | grep -F 'fio' >/dev/null
 
 set +e
 ENGINE_WRITER_DIAGNOSTICS_TEST_SCENARIO=normal \
@@ -181,6 +229,203 @@ grep -F 'reason=initial-preflight-busy' "$preflight_root/logs/result.txt" >/dev/
   printf 'benchmark started after preflight failure\n' >&2
   exit 1
 }
+
+component_output="$TEST_ROOT/component-happy.txt"
+rm -f "$FAKE_STATE/benchmark-count" "$FAKE_STATE/identity-marker" "$FAKE_STATE/invocations.log"
+ENGINE_WRITER_DIAGNOSTICS_TEST_OBSERVER_BIAS_PERCENT=3 \
+  run_runner component_profile_bias_2pct "$component_output" --scope=component
+assert_status 0 "$RUNNER_STATUS"
+component_root=$(grep -o 'run_root=.*' "$component_output" | tail -n 1 | cut -d= -f2)
+grep -F 'collection_status=complete' "$component_output" >/dev/null
+grep -F 'result=valid-component-ceiling' "$component_root/logs/result.txt" >/dev/null
+grep -F 'scope=component' \
+  "$component_root/preflight/component-campaign-state-summary.txt" >/dev/null
+grep -F 'label=calibration-state-new_crossing_pair' "$FAKE_STATE/invocations.log" >/dev/null
+grep -F 'label=calibration-append-1' "$FAKE_STATE/invocations.log" >/dev/null
+grep -F 'label=calibration-fsync-1' "$FAKE_STATE/invocations.log" >/dev/null
+grep -F 'label=state-r1-new_crossing_pair' "$FAKE_STATE/invocations.log" >/dev/null
+grep -F 'label=append-r1-b1' "$FAKE_STATE/invocations.log" >/dev/null
+grep -F 'label=fsync-r1-b1' "$FAKE_STATE/invocations.log" >/dev/null
+grep -F 'label=profile-append-b1' "$FAKE_STATE/invocations.log" >/dev/null
+grep -F 'label=profile-fsync-b1' "$FAKE_STATE/invocations.log" >/dev/null
+grep -F 'label=profile-control-append-b4096' "$FAKE_STATE/invocations.log" >/dev/null
+grep -F 'label=profile-control-append-b4096' "$FAKE_STATE/invocations.log" |
+  grep -F -- '--wal-phase-profile=off' >/dev/null
+grep -F 'label=rotation-control-r1-b1' "$FAKE_STATE/invocations.log" |
+  grep -F -- '--wal-phase-profile=on' >/dev/null
+grep -F 'label=rotation-trigger-r1-b1' "$FAKE_STATE/invocations.log" |
+  grep -F -- '--wal-phase-profile=on' >/dev/null
+grep -F 'label=append-r1-b1' "$FAKE_STATE/invocations.log" |
+  grep -F -- '--wal-no-rotation-epoch-commands=' >/dev/null
+grep -F 'measured_segment_rotations=0' \
+  "$component_root/logs/component-rotation-control-r1-b1.stdout" >/dev/null
+grep -F 'rotation_scope=rotation_inclusive' \
+  "$component_root/logs/component-rotation-control-r1-b1.stdout" >/dev/null
+grep -F 'measured_segment_rotations=1' \
+  "$component_root/logs/component-rotation-trigger-r1-b1.stdout" >/dev/null
+grep -F 'rotation_scope=rotation_inclusive' \
+  "$component_root/logs/component-rotation-trigger-r1-b1.stdout" >/dev/null
+rotation_rows="$component_root/derived/component-rotation-attribution.tsv"
+awk -F '\t' 'NR == 3 && NF == 22 { found=1 } END { exit !found }' "$rotation_rows"
+awk 'BEGIN { ok=1 }
+     /label=calibration-append-8192 / {
+       found=1
+       if ($0 !~ /--warmup=[1-9][0-9]*([[:space:]]|$)/ ||
+           $0 ~ /--warmup=10000([[:space:]]|$)/) ok=0
+     }
+     END { exit !(found && ok != 0) }' "$FAKE_STATE/invocations.log"
+! grep -Eq 'label=(append|fsync)-r[0-9]+-b[0-9]+ .*--wal-phase-profile=on' \
+  "$FAKE_STATE/invocations.log"
+! grep -F 'profile' "$component_root/derived/component-cv.tsv" >/dev/null
+! grep -Eq 'perf|fio|engine_durable|pipeline-stage=(invariant_validation|runtime_handoff)' \
+  "$FAKE_STATE/invocations.log"
+grep -F $'state_machine\tnew_crossing_pair\t' \
+  "$component_root/derived/component-frozen-plan.tsv" >/dev/null
+grep -F $'wal_append\tb4096\t' \
+  "$component_root/derived/component-frozen-plan.tsv" >/dev/null
+grep -F $'wal_fsync\tb4096\t' \
+  "$component_root/derived/component-frozen-plan.tsv" >/dev/null
+grep -F 'case=append-b4096' "$component_root/derived/component-profile-bias.tsv" >/dev/null
+grep -F 'bias_percent=2' "$component_root/derived/component-profile-bias.tsv" >/dev/null
+[[ ! -e "$component_root/data/component-append-r1-b1" ]] || exit 1
+[[ ! -e "$component_root/data/component-rotation-control-r1-b1" ]] || exit 1
+
+for scenario in \
+  component_wrong_no_rotation_name component_resource_missing component_resource_duplicate \
+  component_resource_na component_write_call_mismatch component_byte_plan_mismatch \
+  component_rotation_control_nonzero component_rotation_trigger_zero \
+  component_rotation_trigger_multiple component_rotation_multiple_groups \
+  component_rotation_case_mismatch component_rotation_position_mismatch; do
+  rm -f "$FAKE_STATE/benchmark-count" "$FAKE_STATE/identity-marker" "$FAKE_STATE/invocations.log"
+  failure_output="$TEST_ROOT/${scenario}.txt"
+  run_runner "$scenario" "$failure_output" --scope=component
+  assert_status 4 "$RUNNER_STATUS"
+  failure_root=$(grep -o 'run_root=.*' "$failure_output" | tail -n 1 | cut -d= -f2)
+  grep -F 'result=invalid-run' "$failure_root/logs/result.txt" >/dev/null
+  ! grep -F 'result=valid-component-ceiling' "$failure_root/logs/result.txt" >/dev/null
+  expected_reason=append-counter-1-1
+  failed_label=append-r1-b1
+  case "$scenario" in
+    component_rotation_trigger_zero|component_rotation_trigger_multiple)
+      failed_label=rotation-trigger-r1-b1
+      expected_reason="rotation-output-${failed_label}"
+      ;;
+    component_rotation_*)
+      failed_label=rotation-control-r1-b1
+      expected_reason="rotation-output-${failed_label}"
+      ;;
+  esac
+  grep -Fx "reason=${expected_reason}" "$failure_root/logs/result.txt" >/dev/null
+  [[ -d "$failure_root/data/component-${failed_label}" ]] || {
+    printf 'failed case data was removed for %s\n' "$scenario" >&2
+    exit 1
+  }
+  ! grep -F 'label=fsync-r1-b1' "$FAKE_STATE/invocations.log" >/dev/null
+done
+
+rm -f "$FAKE_STATE/benchmark-count" "$FAKE_STATE/identity-marker" "$FAKE_STATE/invocations.log"
+component_rounding_output="$TEST_ROOT/component-rounding.txt"
+run_runner component_rounding_probe "$component_rounding_output" --scope=component
+assert_status 0 "$RUNNER_STATUS"
+component_rounding_root=$(grep -o 'run_root=.*' "$component_rounding_output" | tail -n 1 | cut -d= -f2)
+awk -F '\t' '$1 == "state_machine" && $3 == 10002 { found=1 } END { exit !found }' \
+  "$component_rounding_root/derived/component-frozen-plan.tsv"
+awk -F '\t' '$1 == "wal_append" && $2 == "b1" && $3 == 16384 { found=1 } END { exit !found }' \
+  "$component_rounding_root/derived/component-frozen-plan.tsv"
+
+rm -f "$FAKE_STATE/benchmark-count" "$FAKE_STATE/identity-marker" "$FAKE_STATE/invocations.log"
+component_preflight_output="$TEST_ROOT/component-preflight-failure.txt"
+run_runner preflight_failure "$component_preflight_output" --scope=component
+assert_status 3 "$RUNNER_STATUS"
+component_preflight_root=$(grep -o 'run_root=.*' "$component_preflight_output" | tail -n 1 | cut -d= -f2)
+grep -F 'result=preflight-busy' "$component_preflight_root/logs/result.txt" >/dev/null
+grep -F 'reason=initial-component-cpu-preflight' \
+  "$component_preflight_root/logs/result.txt" >/dev/null
+[[ ! -e "$FAKE_STATE/benchmark-count" ]] || exit 1
+
+rm -f "$FAKE_STATE/benchmark-count" "$FAKE_STATE/identity-marker" "$FAKE_STATE/invocations.log"
+component_bias_output="$TEST_ROOT/component-profile-bias.txt"
+ENGINE_WRITER_DIAGNOSTICS_TEST_OBSERVER_BIAS_PERCENT=3 \
+  run_runner component_profile_bias "$component_bias_output" --scope=component
+assert_status 3 "$RUNNER_STATUS"
+component_bias_root=$(grep -o 'run_root=.*' "$component_bias_output" | tail -n 1 | cut -d= -f2)
+grep -F 'result=observer-biased' "$component_bias_root/logs/result.txt" >/dev/null
+grep -F 'reason=component-profile-bias' "$component_bias_root/logs/result.txt" >/dev/null
+! grep -F 'result=valid-component-ceiling' "$component_bias_root/logs/result.txt" >/dev/null
+
+rm -f "$FAKE_STATE/benchmark-count" "$FAKE_STATE/identity-marker" "$FAKE_STATE/invocations.log"
+component_missing_output="$TEST_ROOT/component-profile-missing-field.txt"
+run_runner component_profile_missing_field "$component_missing_output" --scope=component
+assert_status 4 "$RUNNER_STATUS"
+component_missing_root=$(grep -o 'run_root=.*' "$component_missing_output" | tail -n 1 | cut -d= -f2)
+grep -F 'result=invalid-run' "$component_missing_root/logs/result.txt" >/dev/null
+grep -F 'reason=rotation-output-rotation-control-r1-b1' \
+  "$component_missing_root/logs/result.txt" >/dev/null
+! grep -F 'result=valid-component-ceiling' "$component_missing_root/logs/result.txt" >/dev/null
+
+rm -f "$FAKE_STATE/benchmark-count" "$FAKE_STATE/identity-marker" "$FAKE_STATE/invocations.log"
+component_partial_output="$TEST_ROOT/component-partial.txt"
+ENGINE_WRITER_DIAGNOSTICS_TEST_WAL_ROUNDS=3 \
+  run_runner component_append_cv_rejected "$component_partial_output" --scope=component
+assert_status 4 "$RUNNER_STATUS"
+component_partial_root=$(grep -o 'run_root=.*' "$component_partial_output" | tail -n 1 | cut -d= -f2)
+grep -F 'result=collection-complete-results-partial' \
+  "$component_partial_root/logs/result.txt" >/dev/null
+grep -F 'rejected_cases=1' "$component_partial_root/logs/result.txt" >/dev/null
+grep -F 'kind=append key=b1 status=rejected-unstable' \
+  "$component_partial_root/derived/component-case-status.tsv" >/dev/null
+grep -F 'label=fsync-r1-b1' "$FAKE_STATE/invocations.log" >/dev/null
+grep -F 'label=profile-append-b1' "$FAKE_STATE/invocations.log" >/dev/null
+
+rm -f "$FAKE_STATE/benchmark-count" "$FAKE_STATE/identity-marker" "$FAKE_STATE/invocations.log"
+component_counter_output="$TEST_ROOT/component-profile-counter-mismatch.txt"
+run_runner component_profile_counter_mismatch "$component_counter_output" --scope=component
+assert_status 4 "$RUNNER_STATUS"
+component_counter_root=$(grep -o 'run_root=.*' "$component_counter_output" | tail -n 1 | cut -d= -f2)
+grep -F 'result=invalid-run' "$component_counter_root/logs/result.txt" >/dev/null
+grep -F 'reason=rotation-output-rotation-control-r1-b1' \
+  "$component_counter_root/logs/result.txt" >/dev/null
+
+rm -f "$FAKE_STATE/benchmark-count" "$FAKE_STATE/identity-marker" "$FAKE_STATE/invocations.log"
+component_profile_groups_output="$TEST_ROOT/component-profile-groups-mismatch.txt"
+run_runner component_profile_groups_mismatch "$component_profile_groups_output" --scope=component
+assert_status 4 "$RUNNER_STATUS"
+component_profile_groups_root=$(grep -o 'run_root=.*' "$component_profile_groups_output" | tail -n 1 | cut -d= -f2)
+grep -F 'result=invalid-run' "$component_profile_groups_root/logs/result.txt" >/dev/null
+grep -F 'reason=rotation-output-rotation-control-r1-b1' \
+  "$component_profile_groups_root/logs/result.txt" >/dev/null
+
+rm -f "$FAKE_STATE/benchmark-count" "$FAKE_STATE/identity-marker" "$FAKE_STATE/invocations.log"
+component_groups_output="$TEST_ROOT/component-groups-mismatch.txt"
+run_runner component_group_counter_mismatch "$component_groups_output" --scope=component
+assert_status 4 "$RUNNER_STATUS"
+component_groups_root=$(grep -o 'run_root=.*' "$component_groups_output" | tail -n 1 | cut -d= -f2)
+grep -F 'result=invalid-run' "$component_groups_root/logs/result.txt" >/dev/null
+grep -F 'reason=append-counter-1-1' "$component_groups_root/logs/result.txt" >/dev/null
+
+rm -f "$FAKE_STATE/benchmark-count" "$FAKE_STATE/identity-marker" "$FAKE_STATE/invocations.log"
+component_sync_output="$TEST_ROOT/component-sync-counter-mismatch.txt"
+run_runner component_sync_counter_mismatch "$component_sync_output" --scope=component
+assert_status 4 "$RUNNER_STATUS"
+component_sync_root=$(grep -o 'run_root=.*' "$component_sync_output" | tail -n 1 | cut -d= -f2)
+grep -F 'result=invalid-run' "$component_sync_root/logs/result.txt" >/dev/null
+grep -F 'reason=fsync-counter-1-1' "$component_sync_root/logs/result.txt" >/dev/null
+
+rm -f "$FAKE_STATE/benchmark-count" "$FAKE_STATE/identity-marker" "$FAKE_STATE/invocations.log"
+component_sync_overflow_output="$TEST_ROOT/component-sync-counter-overflow.txt"
+run_runner component_sync_counter_overflow "$component_sync_overflow_output" --scope=component
+assert_status 4 "$RUNNER_STATUS"
+component_sync_overflow_root=$(grep -o 'run_root=.*' "$component_sync_overflow_output" | tail -n 1 | cut -d= -f2)
+grep -F 'result=invalid-run' "$component_sync_overflow_root/logs/result.txt" >/dev/null
+grep -F 'reason=fsync-counter-1-1' "$component_sync_overflow_root/logs/result.txt" >/dev/null
+
+rm -f "$FAKE_STATE/benchmark-count" "$FAKE_STATE/identity-marker" "$FAKE_STATE/invocations.log"
+component_malformed_output="$TEST_ROOT/component-malformed-counter.txt"
+run_runner component_malformed_counter "$component_malformed_output" --scope=component
+assert_status 4 "$RUNNER_STATUS"
+component_malformed_root=$(grep -o 'run_root=.*' "$component_malformed_output" | tail -n 1 | cut -d= -f2)
+grep -F 'result=invalid-run' "$component_malformed_root/logs/result.txt" >/dev/null
+grep -F 'reason=append-counter-1-1' "$component_malformed_root/logs/result.txt" >/dev/null
 
 for scenario in benchmark_nonzero benchmark_timeout command_mismatch identity_change observer_early_exit; do
   rm -f "$FAKE_STATE/benchmark-count" "$FAKE_STATE/identity-marker" "$FAKE_STATE/invocations.log"

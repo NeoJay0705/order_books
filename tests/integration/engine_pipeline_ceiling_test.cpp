@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "order_books/engine.hpp"
+#include "pipeline_ceiling_benchmark.hpp"
 
 namespace order_books {
 namespace {
@@ -99,6 +100,20 @@ TEST(EnginePipelineCeilingTest, AdmissionHandoffCompletesExactlyOnce) {
   EXPECT_EQ(std::get<MetricsSnapshot>(snapshot).active_price_levels, 0U);
   EXPECT_TRUE(std::holds_alternative<std::monostate>(engine->stop()));
   std::filesystem::remove_all(data_directory, ignored);
+}
+
+TEST(EnginePipelineCeilingTest, CommandScenariosHaveStableNamesAndParsing) {
+  using benchmark::PipelineCommandScenario;
+  for (const auto scenario : {PipelineCommandScenario::new_crossing_pair,
+                              PipelineCommandScenario::new_resting_cancel,
+                              PipelineCommandScenario::amend_quantity,
+                              PipelineCommandScenario::replace_order}) {
+    const auto name = benchmark::pipeline_command_scenario_name(scenario);
+    const auto parsed = benchmark::parse_pipeline_command_scenario(name);
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(*parsed, scenario);
+  }
+  EXPECT_FALSE(benchmark::parse_pipeline_command_scenario("unknown").has_value());
 }
 
 }  // namespace

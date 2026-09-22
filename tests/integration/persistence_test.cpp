@@ -610,6 +610,11 @@ TEST(PersistenceTest, WalProfiledBatchCountsRotationSeparatelyFromDataWrites) {
       wal->append_batch_profiled(commands, profile)));
   EXPECT_EQ(profile.rotations, 2U);
   EXPECT_EQ(profile.data_write_calls, commands.size());
+  EXPECT_GT(profile.rotation_ns, 0U);
+  EXPECT_GT(profile.rotation_sync_ns, 0U);
+  EXPECT_GT(profile.rotation_header_write_ns, 0U);
+  EXPECT_GT(profile.rotation_header_sync_ns, 0U);
+  EXPECT_GT(profile.rotation_directory_sync_ns, 0U);
   EXPECT_EQ(wal_segments(wal_directory).size(), commands.size());
   ASSERT_TRUE(std::holds_alternative<std::monostate>(wal->sync()));
 

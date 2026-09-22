@@ -15,6 +15,7 @@ add_executable(order_books_tests
   integration/wal_write_ceiling_test.cpp
   unit/metrics_registry_test.cpp
   ../benchmarks/engine_tail_telemetry.cpp
+  ../benchmarks/pipeline_ceiling_benchmark.cpp
 )
 
 set_target_properties(order_books_tests PROPERTIES

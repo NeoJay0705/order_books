@@ -18,6 +18,13 @@ enum class PipelineStage {
   publisher_drain,
 };
 
+enum class PipelineCommandScenario {
+  new_crossing_pair,
+  new_resting_cancel,
+  amend_quantity,
+  replace_order,
+};
+
 struct PipelineBenchmarkOptions {
   std::uint64_t iterations{};
   std::uint64_t warmup{};
@@ -28,12 +35,17 @@ struct PipelineBenchmarkOptions {
   std::size_t producer_lanes{};
   std::size_t publisher_cursor_persist_max_commands{256};
   std::chrono::microseconds publisher_cursor_persist_max_delay{1000};
+  PipelineCommandScenario command_scenario{PipelineCommandScenario::new_crossing_pair};
   std::optional<std::filesystem::path> data_directory;
 };
 
 [[nodiscard]] std::optional<PipelineStage> parse_pipeline_stage(
     std::string_view value);
 [[nodiscard]] std::string_view pipeline_stage_name(PipelineStage stage) noexcept;
+[[nodiscard]] std::optional<PipelineCommandScenario> parse_pipeline_command_scenario(
+    std::string_view value);
+[[nodiscard]] std::string_view pipeline_command_scenario_name(
+    PipelineCommandScenario scenario) noexcept;
 
 [[nodiscard]] bool run_pipeline_ceiling(const PipelineBenchmarkOptions& options,
                                         PipelineStage stage);

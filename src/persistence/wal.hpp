@@ -51,6 +51,10 @@ struct WalAppendProfile {
   std::uint64_t frame_assembly_ns{};
   std::uint64_t chunk_copy_ns{};
   std::uint64_t rotation_ns{};
+  std::uint64_t rotation_sync_ns{};
+  std::uint64_t rotation_header_write_ns{};
+  std::uint64_t rotation_header_sync_ns{};
+  std::uint64_t rotation_directory_sync_ns{};
   std::uint64_t write_ns{};
   std::uint64_t publish_ns{};
   std::uint64_t frame_bytes{};
@@ -90,7 +94,8 @@ class Wal {
   Wal(std::filesystem::path directory, ShardId shard_id, std::size_t segment_size,
       WalPrepareOptions prepare_options);
 
-  Status create_segment(EngineSeq first_engine_seq);
+  Status create_segment(EngineSeq first_engine_seq,
+                        WalAppendProfile* profile = nullptr);
   Status sync_active_unlocked();
   [[nodiscard]] std::filesystem::path segment_path(EngineSeq first_engine_seq) const;
   [[nodiscard]] std::vector<std::byte> segment_header(EngineSeq first_engine_seq) const;

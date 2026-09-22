@@ -4,7 +4,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: run_engine_writer_diagnostics.sh --binary=PATH --fio-bs=BYTES[,BYTES...] [options]
+usage: run_engine_writer_diagnostics.sh --binary=PATH [--fio-bs=BYTES[,BYTES...]] [options]
 
 Runs the bounded, external Engine ceiling/root-cause campaign. All artifacts
 are written outside the repository. The script never changes source files,
@@ -13,6 +13,7 @@ system policy, or the Git index.
 Options:
   --binary=PATH              ReleaseBenchmark order_books_benchmark binary
   --fio-bs=BYTES[,BYTES...]  WAL bytes per selected group for file-backed fio controls
+  --scope=full|component     Full Engine campaign or StateMachine/WAL component campaign
   --run-parent=PATH          Parent directory for the run root (outside repo)
   --bench-cpus=LIST          Benchmark CPUs (default: 2-7)
   --observer-cpus=LIST       Observer CPUs (default: 0-1)
@@ -54,6 +55,7 @@ campaign_fail() {
 REPO_ROOT=$(git rev-parse --show-toplevel)
 BENCHMARK_BINARY=""
 FIO_BLOCK_BYTES=""
+SCOPE=full
 RUN_PARENT="$(dirname "$REPO_ROOT")"
 BENCH_CPU_SET="2-7"
 OBSERVER_CPU_SET="0-1"
@@ -97,6 +99,9 @@ for argument in "$@"; do
   case "$argument" in
     --binary=*) BENCHMARK_BINARY=${argument#*=} ;;
     --fio-bs=*) FIO_BLOCK_BYTES=${argument#*=} ;;
+    --scope=full) SCOPE=full ;;
+    --scope=component) SCOPE=component ;;
+    --scope=*) die "scope must be full or component" ;;
     --run-parent=*) RUN_PARENT=${argument#*=} ;;
     --bench-cpus=*) BENCH_CPU_SET=${argument#*=} ;;
     --observer-cpus=*) OBSERVER_CPU_SET=${argument#*=} ;;
@@ -217,16 +222,20 @@ is_positive_integer "$WAL_ROUNDS" || die "WAL rounds must be a positive integer"
 [[ "$TAIL_BIAS_LIMIT_PERCENT" =~ ^[0-9]+([.][0-9]+)?$ ]] || die \
   "tail bias limit must be a non-negative number"
 if [[ "$PROFILE_ONLY" == 0 ]]; then
-  [[ -n "$FIO_BLOCK_BYTES" ]] || die "--fio-bs is required for a full campaign"
+  if [[ "$SCOPE" == full ]]; then
+    [[ -n "$FIO_BLOCK_BYTES" ]] || die "--fio-bs is required for a full campaign"
+  fi
+  if [[ -n "$FIO_BLOCK_BYTES" ]]; then
   IFS=',' read -r -a FIO_BLOCK_LIST <<<"$FIO_BLOCK_BYTES"
   ((${#FIO_BLOCK_LIST[@]} > 0)) || die "--fio-bs must contain at least one size"
   for fio_block in "${FIO_BLOCK_LIST[@]}"; do
     is_positive_integer "$fio_block" || die "each --fio-bs value must be a positive integer"
   done
+  fi
 fi
 
 if [[ "$DRY_RUN" == 1 ]]; then
-  printf 'dry_run=true workload=engine_writer_unified_ceiling\n'
+  printf 'dry_run=true workload=engine_writer_unified_ceiling scope=%s\n' "$SCOPE"
   printf 'binary=%s\n' "$BENCHMARK_BINARY"
   printf 'bench_cpus=%s observer_cpus=%s cpu_list=%s observer=%s\n' \
     "$BENCH_CPU_SET" "$OBSERVER_CPU_SET" "$CPU_LIST" "$OBSERVER_MODE"
@@ -237,19 +246,27 @@ if [[ "$DRY_RUN" == 1 ]]; then
   if [[ -n "$FIO_BLOCK_BYTES" ]]; then
     printf 'fio_bs=%s\n' "$FIO_BLOCK_BYTES"
   fi
-  printf 'plan=preflight,calibration,observer_gate,component,wal,engine_frontier,tail_attribution,writer_profile,perf_record,fio\n'
+  if [[ "$SCOPE" == component ]]; then
+    printf 'plan=identity,cpu_preflight,state_machine,wal_append_preflight,wal_append,wal_fsync_preflight,wal_fsync,artifacts\n'
+  else
+    printf 'plan=preflight,calibration,observer_gate,component,wal,engine_frontier,tail_attribution,writer_profile,perf_record,fio\n'
+  fi
   exit 0
 fi
 
 [[ -x "$BENCHMARK_BINARY" ]] || classified_die environment-blocked benchmark-binary-unavailable 2
 
-for tool in git sha256sum findmnt lsblk lscpu mpstat iostat jq perf taskset timeout awk realpath ps \
-    cmp cut grep sed sort tee uname xargs mktemp date; do
+COMMON_TOOLS=(git sha256sum findmnt lsblk lscpu mpstat iostat jq taskset timeout awk realpath ps \
+    cmp cut grep sed sort tee uname xargs mktemp date df)
+if [[ "$SCOPE" == full ]]; then
+  COMMON_TOOLS+=(perf)
+fi
+if [[ "$SCOPE" == full && "$PROFILE_ONLY" == 0 ]]; then
+  COMMON_TOOLS+=(fio)
+fi
+for tool in "${COMMON_TOOLS[@]}"; do
   command -v "$tool" >/dev/null || classified_die environment-blocked "tool-unavailable-${tool}" 2
 done
-if [[ "$PROFILE_ONLY" == 0 ]]; then
-  command -v fio >/dev/null || classified_die environment-blocked tool-unavailable-fio 2
-fi
 [[ -x /usr/bin/time ]] || classified_die environment-blocked tool-unavailable-time 2
 
 REPO_REAL=$(realpath "$REPO_ROOT")
@@ -317,7 +334,9 @@ check_perf_capability() {
   rm -f "$stat_output" "$record_output" "$record_data"
 }
 
-check_perf_capability
+if [[ "$SCOPE" == full ]]; then
+  check_perf_capability
+fi
 
 RUN_ROOT=$(mktemp -d "$RUN_PARENT/engine-writer-unified-campaign-XXXXXXXX")
 mkdir -p "$RUN_ROOT"/{data,derived,logs,monitors,perf,preflight,time,fio}
@@ -446,10 +465,12 @@ run_preflight() {
   awk -v value="$disk_aqu_max" 'BEGIN { exit !(value <= 0.25) }' || return 1
 }
 
-if ! run_preflight initial; then
-  printf 'result=preflight-busy\nreason=initial-preflight-busy\n' >"$RUN_ROOT/logs/result.txt"
-  printf 'run_root=%s\n' "$RUN_ROOT"
-  exit 3
+if [[ "$SCOPE" == full ]]; then
+  if ! run_preflight initial; then
+    printf 'result=preflight-busy\nreason=initial-preflight-busy\n' >"$RUN_ROOT/logs/result.txt"
+    printf 'run_root=%s\n' "$RUN_ROOT"
+    exit 3
+  fi
 fi
 
 OBSERVER_PIDS=()
@@ -1466,6 +1487,898 @@ run_fio_control() {
     check_frozen_artifacts
   done
 }
+
+# Component-only campaign -------------------------------------------------
+# This path deliberately does not call any of the full Engine, tail,
+# perf-record, writer-profile, or fio functions above.  It uses the same
+# identity/run-root conventions, but has its own CPU-only and WAL storage
+# gates so a component result cannot be mistaken for an Engine result.
+COMPONENT_COOLDOWN_SECONDS=60
+COMPONENT_TARGET_DURATION_MS=$ENGINE_TARGET_DURATION_MS
+COMPONENT_MIN_DURATION_MS=$MIN_ENGINE_DURATION_MS
+COMPONENT_FSYNC_CALIBRATION_GROUPS=100
+COMPONENT_STATE_COMMANDS=0
+COMPONENT_APPEND_COMMANDS=0
+COMPONENT_APPEND_EPOCH_COMMANDS=0
+COMPONENT_CALIBRATION_COMMANDS=0
+COMPONENT_WAL_WARMUP_COMMANDS=0
+declare -A COMPONENT_APPEND_EPOCH_COMMANDS_BY_BATCH=()
+declare -A COMPONENT_FSYNC_GROUPS_BY_BATCH=()
+declare -A COMPONENT_APPEND_RATES_BY_BATCH=()
+declare -A COMPONENT_APPEND_BYTES_BY_BATCH=()
+declare -A COMPONENT_FSYNC_BYTES_BY_BATCH=()
+declare -A COMPONENT_STATE_RATES_BY_SCENARIO=()
+COMPONENT_MONITOR_PIDS=()
+COMPONENT_REJECTED_CASES=0
+
+# These values mirror the benchmark's production WAL segment geometry.  They
+# are used only to freeze an epoch plan; the benchmark still opens WALs with
+# the production segment size and verifies that each measured epoch rotates 0
+# times.
+COMPONENT_WAL_SEGMENT_BYTES=$((256 * 1024 * 1024))
+COMPONENT_WAL_HEADER_BYTES=22
+COMPONENT_WAL_EPOCH_SAFETY_BYTES=$((1024 * 1024))
+
+if [[ "$TEST_MODE" == 1 ]]; then
+  COMPONENT_COOLDOWN_SECONDS=0
+  COMPONENT_FSYNC_CALIBRATION_GROUPS=2
+fi
+
+component_residual_processes() {
+  ps -eo comm= | awk '
+    $1 == "order_books_benchmark" || $1 == "mpstat" || $1 == "iostat" ||
+    $1 == "fio" || $1 == "perf" { found = 1 }
+    END { exit found ? 0 : 1 }'
+}
+
+component_round_up() {
+  local value=$1
+  local quantum=$2
+  awk -v value="$value" -v quantum="$quantum" \
+    'BEGIN {
+       if (value < 1 || quantum < 1) exit 1
+       printf "%.0f\n", int((value + quantum - 1) / quantum) * quantum
+     }'
+}
+
+component_wal_warmup_groups() {
+  local batch=$1
+  local groups
+  groups=$(component_round_up "$COMPONENT_WAL_WARMUP_COMMANDS" "$batch") || return 1
+  printf '%s\n' "$((groups / batch))"
+}
+
+component_no_rotation_epoch_commands() {
+  local batch=$1
+  local bytes_per_command=$2
+  local warmup_commands=$COMPONENT_WAL_WARMUP_COMMANDS
+  local payload_budget max_commands epoch_commands
+  [[ "$batch" =~ ^[1-9][0-9]*$ ]] || return 1
+  component_is_non_negative_number "$bytes_per_command" || return 1
+  payload_budget=$((COMPONENT_WAL_SEGMENT_BYTES - COMPONENT_WAL_HEADER_BYTES -
+                    COMPONENT_WAL_EPOCH_SAFETY_BYTES))
+  max_commands=$(awk -v budget="$payload_budget" -v bytes="$bytes_per_command" \
+    'BEGIN { if (bytes <= 0) exit 1; printf "%.0f\n", int(budget / bytes) }') || return 1
+  ((max_commands > warmup_commands + batch)) || return 1
+  max_commands=$((max_commands - warmup_commands))
+  epoch_commands=$((max_commands / batch * batch))
+  ((epoch_commands >= batch)) || return 1
+  printf '%s\n' "$epoch_commands"
+}
+
+component_available_bytes() {
+  df -B1 --output=avail "$RUN_ROOT" | awk 'NR == 2 {print $1; exit}'
+}
+
+component_check_disk_budget() {
+  local label=$1
+  local commands=$2
+  local bytes_per_command=$3
+  local available reserve budget estimated
+  available=$(component_available_bytes)
+  [[ "$available" =~ ^[0-9]+$ ]] || campaign_fail environment-blocked "disk-available-invalid-${label}"
+  reserve=$((available / 5))
+  ((reserve > 20 * 1024 * 1024 * 1024)) || reserve=$((20 * 1024 * 1024 * 1024))
+  budget=$((available - reserve))
+  ((budget > 0)) || campaign_fail environment-blocked "disk-budget-empty-${label}"
+  estimated=$(awk -v commands="$commands" -v bytes="$bytes_per_command" \
+    'BEGIN { if (commands < 1 || bytes < 0) exit 1; printf "%.0f\n", commands * bytes }') ||
+    campaign_fail invalid-run "disk-estimate-invalid-${label}"
+  if ((estimated > budget)); then
+    campaign_fail environment-blocked "component-disk-budget-exceeded-${label}"
+  fi
+  printf 'label=%s available_bytes=%s reserve_bytes=%s budget_bytes=%s estimated_case_bytes=%s\n' \
+    "$label" "$available" "$reserve" "$budget" "$estimated" \
+    >>"$RUN_ROOT/derived/component-disk-budget.tsv"
+}
+
+component_validate_estimated_duration() {
+  local label=$1
+  local commands=$2
+  local rate=$3
+  local estimated_ms
+  estimated_ms=$(awk -v commands="$commands" -v rate="$rate" \
+    'BEGIN { if (commands < 1 || rate <= 0) exit 1; printf "%.0f\n", commands / rate * 1000 }') ||
+    campaign_fail invalid-run "duration-estimate-invalid-${label}"
+  awk -v estimated="$estimated_ms" -v timeout="$CASE_TIMEOUT_SECONDS" \
+    'BEGIN { exit !(estimated < timeout * 1000 - 30000) }' ||
+    campaign_fail invalid-run "calibration-exceeds-timeout-${label}"
+  printf 'label=%s rate=%s commands=%s estimated_duration_ms=%s\n' \
+    "$label" "$rate" "$commands" "$estimated_ms" >>"$RUN_ROOT/derived/component-duration-plan.tsv"
+}
+
+component_extract_field() {
+  local output=$1
+  local field=$2
+  grep -oE "(^|[[:space:]])${field}=[^[:space:]]+" "$output" |
+    sed 's/^[[:space:]]*//' | cut -d= -f2
+}
+
+component_extract_integer_field() {
+  local output=$1
+  local field=$2
+  local -a values=()
+  mapfile -t values < <(component_extract_field "$output" "$field")
+  ((${#values[@]} == 1)) || return 1
+  [[ "${values[0]}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "${values[0]}"
+}
+
+component_extract_number() {
+  local output=$1
+  local field=$2
+  local -a values=()
+  mapfile -t values < <(component_extract_field "$output" "$field")
+  ((${#values[@]} == 1)) || return 1
+  component_is_non_negative_number "${values[0]}" || return 1
+  printf '%s\n' "${values[0]}"
+}
+
+component_is_non_negative_number() {
+  [[ "$1" =~ ^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$ ]] || return 1
+  local normalized
+  normalized=$(awk -v value="$1" 'BEGIN {
+    parsed = value + 0
+    if (parsed != parsed || parsed < 0) exit 1
+    printf "%.17g\n", parsed
+  }') || return 1
+  [[ "$normalized" != inf && "$normalized" != +inf && "$normalized" != -inf ]]
+}
+
+component_extract_rate() {
+  local output=$1
+  local kind=${2:-wal}
+  local field=service_commands_per_second
+  [[ "$kind" == state ]] && field=commands_per_second
+  local value
+  value=$(component_extract_number "$output" "$field") || return 1
+  awk -v value="$value" 'BEGIN { exit !(value > 0) }' || return 1
+  printf '%s\n' "$value"
+}
+
+component_validate_measured_resources() {
+  local output=$1
+  local expected_sync_calls=$2
+  local field value syscw wal_write_calls
+  for field in measured_rusage_valid measured_io_valid measured_meminfo_valid; do
+    value=$(component_extract_field "$output" "$field") || return 1
+    [[ "$value" == true ]] || return 1
+  done
+  for field in measured_user_seconds measured_system_seconds; do
+    component_extract_number "$output" "$field" >/dev/null || return 1
+  done
+  for field in measured_voluntary_context_switches measured_involuntary_context_switches \
+    measured_syscw measured_wchar measured_write_bytes measured_cancelled_write_bytes \
+    measured_dirty_bytes_before measured_dirty_bytes_after measured_writeback_bytes_before \
+    measured_writeback_bytes_after measured_wal_write_calls measured_wal_sync_calls; do
+    component_extract_integer_field "$output" "$field" >/dev/null || return 1
+  done
+  syscw=$(component_extract_integer_field "$output" measured_syscw) || return 1
+  wal_write_calls=$(component_extract_integer_field "$output" measured_wal_write_calls) || return 1
+  [[ "$syscw" == "$wal_write_calls" ]] || return 1
+  value=$(component_extract_integer_field "$output" measured_wal_sync_calls) || return 1
+  [[ "$value" == "$expected_sync_calls" ]] || return 1
+}
+
+component_preflight() {
+  local label=$1
+  local storage_gate=$2
+  local cpu_json="$RUN_ROOT/preflight/component-${label}-mpstat.json"
+  local disk_json="$RUN_ROOT/preflight/component-${label}-iostat.json"
+  local summary="$RUN_ROOT/preflight/component-${label}-summary.txt"
+  if component_residual_processes; then
+    printf 'result=preflight-busy\nreason=residual-process\n' >"$summary"
+    return 1
+  fi
+  if [[ "$storage_gate" == 1 ]]; then
+    sleep "$COMPONENT_COOLDOWN_SECONDS"
+  fi
+  taskset -c "$OBSERVER_CPU_SET" mpstat -P "$CPU_LIST" 1 "$PREFLIGHT_SECONDS" \
+    -o JSON >"$cpu_json" &
+  local cpu_pid=$!
+  taskset -c "$OBSERVER_CPU_SET" iostat -y -dx "$BLOCK_DEVICE" 1 "$PREFLIGHT_SECONDS" \
+    -o JSON >"$disk_json" &
+  local disk_pid=$!
+  local cpu_status=0
+  local disk_status=0
+  wait "$cpu_pid" || cpu_status=$?
+  wait "$disk_pid" || disk_status=$?
+  if [[ "$cpu_status" != 0 || "$disk_status" != 0 ]]; then
+    printf 'result=preflight-busy\nmonitor_exit_cpu=%s\nmonitor_exit_disk=%s\n' \
+      "$cpu_status" "$disk_status" >"$summary"
+    return 1
+  fi
+  local cpu_idle_min cpu_iowait_p95 cpu_iowait_max disk_util_avg disk_aqu_p95 disk_aqu_max
+  cpu_idle_min=$(jq -r '
+    [.sysstat.hosts[0].statistics[] | .["cpu-load"][]]
+    | sort_by(.cpu) | group_by(.cpu)
+    | map(map(.idle) | add / length) | min' "$cpu_json")
+  cpu_iowait_p95=$(jq -r '
+    [.sysstat.hosts[0].statistics[] | .["cpu-load"][] | .iowait]
+    | sort | .[((length - 1) * 0.95 | floor)]' "$cpu_json")
+  cpu_iowait_max=$(jq -r '
+    [.sysstat.hosts[0].statistics[] | .["cpu-load"][] | .iowait] | max' "$cpu_json")
+  disk_util_avg=$(jq --arg device "$BLOCK_DEVICE" -r '
+    [.sysstat.hosts[0].statistics[].disk[]
+      | select(.disk_device == $device) | .util]
+    | if length == 0 then null else add / length end' "$disk_json")
+  disk_aqu_p95=$(jq --arg device "$BLOCK_DEVICE" -r '
+    [.sysstat.hosts[0].statistics[].disk[]
+      | select(.disk_device == $device) | .["aqu-sz"]]
+    | if length == 0 then null else sort | .[((length - 1) * 0.95 | floor)] end' "$disk_json")
+  disk_aqu_max=$(jq --arg device "$BLOCK_DEVICE" -r '
+    [.sysstat.hosts[0].statistics[].disk[]
+      | select(.disk_device == $device) | .["aqu-sz"]]
+    | if length == 0 then null else max end' "$disk_json")
+  printf 'scope=component\nstorage_gate=%s\ncpu_idle_min=%s\ncpu_iowait_p95=%s\n' \
+    "$storage_gate" "$cpu_idle_min" "$cpu_iowait_p95" >"$summary"
+  printf 'cpu_iowait_max=%s\ndisk_util_avg=%s\ndisk_aqu_p95=%s\ndisk_aqu_max=%s\n' \
+    "$cpu_iowait_max" "$disk_util_avg" "$disk_aqu_p95" "$disk_aqu_max" >>"$summary"
+  awk -v value="$cpu_idle_min" 'BEGIN { exit !(value != "null" && value >= 90.0) }' || return 1
+  awk -v value="$cpu_iowait_p95" 'BEGIN { exit !(value != "null" && value <= 5.0) }' || return 1
+  if [[ "$storage_gate" == 1 ]]; then
+    awk -v value="$cpu_iowait_max" 'BEGIN { exit !(value != "null" && value <= 10.0) }' || return 1
+    awk -v value="$disk_util_avg" 'BEGIN { exit !(value != "null" && value <= 5.0) }' || return 1
+    awk -v value="$disk_aqu_p95" 'BEGIN { exit !(value != "null" && value <= 0.25) }' || return 1
+    awk -v value="$disk_aqu_max" 'BEGIN { exit !(value != "null" && value <= 0.50) }' || return 1
+  fi
+}
+
+component_start_monitors() {
+  local label=$1
+  taskset -c "$OBSERVER_CPU_SET" mpstat -P "$CPU_LIST" 1 "$MONITOR_SECONDS" \
+    >"$RUN_ROOT/monitors/component-${label}-mpstat.txt" &
+  COMPONENT_MONITOR_PIDS+=("$!")
+  taskset -c "$OBSERVER_CPU_SET" iostat -y -dx -t "$BLOCK_DEVICE" 1 "$MONITOR_SECONDS" \
+    >"$RUN_ROOT/monitors/component-${label}-iostat.txt" &
+  COMPONENT_MONITOR_PIDS+=("$!")
+}
+
+component_stop_monitors() {
+  local pid status failure=0
+  for pid in "${COMPONENT_MONITOR_PIDS[@]}"; do
+    kill "$pid" 2>/dev/null || true
+    status=0
+    wait "$pid" 2>/dev/null || status=$?
+    if [[ "$status" != 0 && "$status" != 143 && "$status" != 130 ]]; then
+      failure=1
+    fi
+  done
+  COMPONENT_MONITOR_PIDS=()
+  return "$failure"
+}
+
+component_safe_remove_data() {
+  local data_dir=$1
+  case "$data_dir" in
+    "$RUN_ROOT/data/component-"*) ;;
+    *) campaign_fail invalid-run "component-data-path-invalid-${data_dir}" ;;
+  esac
+  [[ "$data_dir" != "$RUN_ROOT/data" && -n "$data_dir" ]] ||
+    campaign_fail invalid-run component-data-path-empty
+  rm -rf -- "$data_dir"
+}
+
+component_finalize_case_data() {
+  local label=$1
+  component_safe_remove_data "$RUN_ROOT/data/component-${label}"
+}
+
+component_run_binary() {
+  local label=$1
+  local storage_gate=$2
+  local warmup_groups=$WARMUP
+  shift 2
+  while [[ "${1:-}" == --component-warmup-groups=* ]]; do
+    warmup_groups=${1#*=}
+    shift
+  done
+  is_positive_integer "$warmup_groups" || die "component warmup groups must be positive"
+  local data_dir="$RUN_ROOT/data/component-${label}"
+  local stdout="$RUN_ROOT/logs/component-${label}.stdout"
+  local stderr="$RUN_ROOT/logs/component-${label}.stderr"
+  local time_file="$RUN_ROOT/time/component-${label}.time"
+  component_preflight "$label" "$storage_gate" || {
+    printf 'result=preflight-busy\nfailed_case=%s\n' "$label" >"$RUN_ROOT/logs/result.txt"
+    printf 'run_root=%s\n' "$RUN_ROOT"
+    exit 3
+  }
+  mkdir -p "$data_dir"
+  component_start_monitors "$label"
+  local status=0
+  RUNNER_CASE_LABEL="$label" \
+  /usr/bin/time -v -o "$time_file" taskset -c "$BENCH_CPU_SET" timeout \
+    "${CASE_TIMEOUT_SECONDS}s" "$BENCHMARK_BINARY" --warmup="$warmup_groups" \
+    --data-dir="$data_dir" "$@" >"$stdout" 2>"$stderr" || status=$?
+  local monitor_status=0
+  component_stop_monitors || monitor_status=$?
+  printf '%s\n' "$status" >"$RUN_ROOT/logs/component-${label}.status"
+  [[ "$monitor_status" == 0 ]] || campaign_fail invalid-run "component-observer-${label}"
+  [[ -s "$RUN_ROOT/monitors/component-${label}-mpstat.txt" &&
+     -s "$RUN_ROOT/monitors/component-${label}-iostat.txt" ]] ||
+    campaign_fail invalid-run "component-observer-artifact-${label}"
+  check_frozen_artifacts
+  [[ "$status" == 0 ]] || campaign_fail invalid-run "component-exit-${label}-${status}"
+  [[ -s "$stdout" && -s "$time_file" ]] || campaign_fail invalid-run "component-artifact-${label}"
+  write_normalized_row "component-${label}" "$status" "$stdout"
+}
+
+component_calibrate() {
+  local scenario batch output rate average_bytes warmup_groups
+  local max_state_rate=0
+  local max_append_rate=0
+  local calibration_groups state_iterations raw_state_commands raw_append_commands
+  local estimated_ms estimated_bytes state_warmup_commands
+  local calibration_plan="$RUN_ROOT/derived/component-frozen-plan.tsv"
+  COMPONENT_CALIBRATION_COMMANDS=$(component_round_up "$((CALIBRATION_ITERATIONS * 2))" 8192) ||
+    campaign_fail invalid-run component-calibration-command-overflow
+  COMPONENT_WAL_WARMUP_COMMANDS=$(component_round_up "$((WARMUP * 2))" 8192) ||
+    campaign_fail invalid-run component-warmup-command-overflow
+  : >"$RUN_ROOT/derived/component-duration-plan.tsv"
+  : >"$RUN_ROOT/derived/component-disk-budget.tsv"
+  printf 'kind\tkey\tfixed_commands\twarmup_commands\twarmup_groups\tcalibration_rate\testimated_duration_ms\testimated_case_bytes\tformal_rounds\n' \
+    >"$calibration_plan"
+  state_iterations=$((COMPONENT_CALIBRATION_COMMANDS / 2))
+  state_warmup_commands=$((WARMUP * 2))
+  for scenario in new_crossing_pair new_resting_cancel amend_quantity replace_order; do
+    component_run_binary "calibration-state-${scenario}" 0 \
+      --component-warmup-groups="$WARMUP" \
+      --workload=engine_pipeline_ceiling --pipeline-stage=state_machine \
+      --pipeline-command-scenario="$scenario" --pipeline-batch-size=2 \
+      --pipeline-active-orders=0 --iterations="$state_iterations"
+    output="$RUN_ROOT/logs/component-calibration-state-${scenario}.stdout"
+    component_validate_output "$output" "$COMPONENT_CALIBRATION_COMMANDS" state ||
+      campaign_fail invalid-run "state-calibration-output-${scenario}"
+    state_rate=$(component_extract_rate "$output" state)
+    [[ -n "$state_rate" ]] || campaign_fail invalid-run "state-calibration-rate-${scenario}"
+    COMPONENT_STATE_RATES_BY_SCENARIO[$scenario]=$state_rate
+    if [[ "$max_state_rate" == 0 ]] || awk -v a="$state_rate" -v b="$max_state_rate" 'BEGIN { exit !(a > b) }'; then
+      max_state_rate=$state_rate
+    fi
+    component_finalize_case_data "calibration-state-${scenario}"
+  done
+  raw_state_commands=$(awk -v rate="$max_state_rate" -v duration="$COMPONENT_TARGET_DURATION_MS" \
+    'BEGIN {
+       value = rate * duration / 1000
+       if (value < 2) value = 2
+       value = int(value)
+       if (value < rate * duration / 1000) ++value
+       printf "%.0f\n", value
+     }') ||
+    campaign_fail invalid-run state-command-plan-invalid
+  COMPONENT_STATE_COMMANDS=$(( ((raw_state_commands + 1) / 2) * 2 ))
+  for scenario in new_crossing_pair new_resting_cancel amend_quantity replace_order; do
+    component_validate_estimated_duration "state-${scenario}" "$COMPONENT_STATE_COMMANDS" \
+      "${COMPONENT_STATE_RATES_BY_SCENARIO[$scenario]}"
+    estimated_ms=$(awk -v commands="$COMPONENT_STATE_COMMANDS" \
+      -v rate="${COMPONENT_STATE_RATES_BY_SCENARIO[$scenario]}" \
+      'BEGIN { printf "%.0f\n", commands / rate * 1000 }')
+    printf 'state_machine\t%s\t%s\t%s\t%s\t%s\t%s\tna\t%s\n' \
+      "$scenario" "$COMPONENT_STATE_COMMANDS" "$state_warmup_commands" "$WARMUP" \
+      "${COMPONENT_STATE_RATES_BY_SCENARIO[$scenario]}" "$estimated_ms" "$PIPELINE_ROUNDS" \
+      >>"$calibration_plan"
+  done
+
+  for batch in 1 256 1024 4096 8192; do
+    calibration_groups=$((COMPONENT_CALIBRATION_COMMANDS / batch))
+    warmup_groups=$(component_wal_warmup_groups "$batch") ||
+      campaign_fail invalid-run "warmup-plan-invalid-${batch}"
+    component_run_binary "calibration-append-${batch}" 0 \
+      --component-warmup-groups="$warmup_groups" \
+      --workload=wal_write_ceiling --wal-sync=none --wal-phase-profile=off \
+      --wal-group-size="$batch" --iterations="$calibration_groups"
+    output="$RUN_ROOT/logs/component-calibration-append-${batch}.stdout"
+    component_validate_output "$output" "$((calibration_groups * batch))" wal off \
+      "$calibration_groups" 0 ||
+      campaign_fail invalid-run "append-calibration-output-${batch}"
+    rate=$(component_extract_rate "$output" wal)
+    [[ -n "$rate" ]] || campaign_fail invalid-run "append-calibration-rate-${batch}"
+    average_bytes=$(component_extract_number "$output" average_wal_bytes_per_command)
+    [[ -n "$average_bytes" ]] ||
+      campaign_fail invalid-run "append-calibration-bytes-${batch}"
+    COMPONENT_APPEND_RATES_BY_BATCH[$batch]=$rate
+    COMPONENT_APPEND_BYTES_BY_BATCH[$batch]=$average_bytes
+    if [[ "$max_append_rate" == 0 ]] || awk -v a="$rate" -v b="$max_append_rate" 'BEGIN { exit !(a > b) }'; then
+      max_append_rate=$rate
+    fi
+    component_finalize_case_data "calibration-append-${batch}"
+  done
+  raw_append_commands=$(awk -v rate="$max_append_rate" -v duration="$COMPONENT_TARGET_DURATION_MS" \
+    'BEGIN {
+       value = rate * duration / 1000
+       if (value < 8192) value = 8192
+       value = int(value)
+       if (value < rate * duration / 1000) ++value
+       printf "%.0f\n", value
+     }') ||
+    campaign_fail invalid-run append-command-plan-invalid
+  COMPONENT_APPEND_COMMANDS=$(( ((raw_append_commands + 8191) / 8192) * 8192 ))
+  for batch in 1 256 1024 4096 8192; do
+    warmup_groups=$(component_wal_warmup_groups "$batch")
+    epoch_commands=$(component_no_rotation_epoch_commands "$batch" \
+      "${COMPONENT_APPEND_BYTES_BY_BATCH[$batch]}") ||
+      campaign_fail invalid-run "no-rotation-epoch-plan-invalid-${batch}"
+    COMPONENT_APPEND_EPOCH_COMMANDS_BY_BATCH[$batch]=$epoch_commands
+    component_validate_estimated_duration "append-b${batch}" "$COMPONENT_APPEND_COMMANDS" \
+      "${COMPONENT_APPEND_RATES_BY_BATCH[$batch]}"
+    component_check_disk_budget "append-b${batch}" \
+      "$((COMPONENT_APPEND_COMMANDS + COMPONENT_WAL_WARMUP_COMMANDS))" \
+      "${COMPONENT_APPEND_BYTES_BY_BATCH[$batch]}"
+    estimated_ms=$(awk -v commands="$COMPONENT_APPEND_COMMANDS" \
+      -v rate="${COMPONENT_APPEND_RATES_BY_BATCH[$batch]}" \
+      'BEGIN { printf "%.0f\n", commands / rate * 1000 }')
+    estimated_bytes=$(awk -v commands="$((COMPONENT_APPEND_COMMANDS + COMPONENT_WAL_WARMUP_COMMANDS))" \
+      -v bytes="${COMPONENT_APPEND_BYTES_BY_BATCH[$batch]}" \
+      'BEGIN { printf "%.0f\n", commands * bytes }')
+    printf 'wal_append\tb%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tepoch_commands=%s\tepochs=%s\n' \
+      "$batch" "$COMPONENT_APPEND_COMMANDS" "$COMPONENT_WAL_WARMUP_COMMANDS" "$warmup_groups" \
+      "${COMPONENT_APPEND_RATES_BY_BATCH[$batch]}" "$estimated_ms" "$estimated_bytes" "$WAL_ROUNDS" \
+      "$epoch_commands" "$(( (COMPONENT_APPEND_COMMANDS + epoch_commands - 1) / epoch_commands ))" \
+      >>"$calibration_plan"
+  done
+  for batch in 1 256 1024 4096 8192; do
+    warmup_groups=$(component_wal_warmup_groups "$batch") ||
+      campaign_fail invalid-run "warmup-plan-invalid-fsync-${batch}"
+    component_run_binary "calibration-fsync-${batch}" 0 \
+      --component-warmup-groups="$warmup_groups" \
+      --workload=wal_write_ceiling --wal-sync=per_group --wal-phase-profile=off \
+      --wal-group-size="$batch" --iterations="$COMPONENT_FSYNC_CALIBRATION_GROUPS"
+    output="$RUN_ROOT/logs/component-calibration-fsync-${batch}.stdout"
+    component_validate_output "$output" \
+      "$((COMPONENT_FSYNC_CALIBRATION_GROUPS * batch))" wal off \
+      "$COMPONENT_FSYNC_CALIBRATION_GROUPS" "$COMPONENT_FSYNC_CALIBRATION_GROUPS" ||
+      campaign_fail invalid-run "fsync-calibration-output-${batch}"
+    rate=$(component_extract_rate "$output" wal)
+    [[ -n "$rate" ]] || campaign_fail invalid-run "fsync-calibration-rate-${batch}"
+    average_bytes=$(component_extract_number "$output" average_wal_bytes_per_command)
+    [[ -n "$average_bytes" ]] ||
+      campaign_fail invalid-run "fsync-calibration-bytes-${batch}"
+    COMPONENT_FSYNC_BYTES_BY_BATCH[$batch]=$average_bytes
+    component_finalize_case_data "calibration-fsync-${batch}"
+    local groups
+    groups=$(awk -v rate="$rate" -v duration="$COMPONENT_TARGET_DURATION_MS" -v batch="$batch" \
+      'BEGIN {
+         value = rate * duration / 1000 / batch
+         if (value < 1000) value = 1000
+         value = int(value)
+         if (value < rate * duration / 1000 / batch) ++value
+         printf "%.0f\n", value
+       }') || campaign_fail invalid-run "fsync-command-plan-invalid-${batch}"
+    COMPONENT_FSYNC_GROUPS_BY_BATCH[$batch]=$groups
+    component_validate_estimated_duration "fsync-b${batch}" "$((groups * batch))" "$rate"
+    component_check_disk_budget "fsync-b${batch}" \
+      "$((groups * batch + COMPONENT_WAL_WARMUP_COMMANDS))" \
+      "$average_bytes"
+    estimated_ms=$(awk -v commands="$((groups * batch))" -v rate="$rate" \
+      'BEGIN { printf "%.0f\n", commands / rate * 1000 }')
+    estimated_bytes=$(awk -v commands="$((groups * batch + COMPONENT_WAL_WARMUP_COMMANDS))" \
+      -v bytes="$average_bytes" 'BEGIN { printf "%.0f\n", commands * bytes }')
+    printf 'wal_fsync\tb%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$batch" "$((groups * batch))" "$COMPONENT_WAL_WARMUP_COMMANDS" "$warmup_groups" \
+      "$rate" "$estimated_ms" "$estimated_bytes" "$WAL_ROUNDS" >>"$calibration_plan"
+  done
+}
+
+component_validate_duration() {
+  local output=$1
+  local elapsed
+  elapsed=$(grep -o 'elapsed_ms=[^ ]*' "$output" | tail -n 1 | cut -d= -f2)
+  [[ -n "$elapsed" ]] || return 1
+  awk -v value="$elapsed" -v minimum="$COMPONENT_MIN_DURATION_MS" \
+    'BEGIN { exit !(value >= minimum) }'
+}
+
+component_validate_output() {
+  local output=$1
+  local expected_commands=$2
+  local kind=$3
+  local profile_mode=${4:-off}
+  local expected_groups=${5:-}
+  local expected_sync_samples=${6:-}
+  local expected_rotation_scope=${7:-}
+  local expected_rotation_count=${8:-}
+  local expected_rotation_triggered=${9:-}
+  local expected_rotation_case=${10:-}
+  local actual
+  grep -Eq 'correctness_verified=true|replay_verified=true' "$output" || return 1
+  if [[ "$kind" == state ]]; then
+    grep -Eq "measured_commands=${expected_commands}([[:space:]]|$)" "$output"
+  else
+    [[ -n "$expected_groups" && -n "$expected_sync_samples" ]] || return 1
+    actual=$(component_extract_integer_field "$output" commands) || return 1
+    [[ "$actual" == "$expected_commands" ]] || return 1
+    actual=$(component_extract_integer_field "$output" groups) || return 1
+    [[ "$actual" == "$expected_groups" ]] || return 1
+    grep -Eq "(^|[[:space:]])phase_profile=${profile_mode}([[:space:]]|$)" "$output" ||
+      return 1
+    actual=$(component_extract_integer_field "$output" sync_samples) || return 1
+    [[ "$actual" == "$expected_sync_samples" ]] || return 1
+    local sample_stride append_sample_count sync_sample_count
+    sample_stride=$(component_extract_integer_field "$output" latency_sample_stride) || return 1
+    ((sample_stride > 0)) || return 1
+    append_sample_count=$(component_extract_integer_field "$output" append_latency_sample_count) ||
+      return 1
+    ((append_sample_count > 0 && append_sample_count <= expected_groups)) || return 1
+    sync_sample_count=$(component_extract_integer_field "$output" sync_latency_sample_count) ||
+      return 1
+    if ((expected_sync_samples == 0)); then
+      ((sync_sample_count == 0)) || return 1
+    else
+      ((sync_sample_count > 0 && sync_sample_count <= expected_sync_samples)) || return 1
+    fi
+    component_validate_measured_resources "$output" "$expected_sync_samples" || return 1
+    local expected_name=wal_write_ceiling
+    [[ "$expected_rotation_scope" == no_rotation ]] && expected_name=wal_append_no_rotation
+    [[ "$expected_rotation_scope" == rotation_inclusive &&
+       "$expected_rotation_count" != "" ]] && expected_name=wal_rotation_diagnostic
+    grep -Eq "^${expected_name}([[:space:]]|$)" "$output" || return 1
+    if [[ "$expected_rotation_scope" == no_rotation ]]; then
+      grep -Eq 'wal_byte_plan_verified=true([[:space:]]|$)' "$output" || return 1
+      local planned actual_bytes
+      planned=$(component_extract_integer_field "$output" planned_wal_bytes_delta) || return 1
+      actual_bytes=$(component_extract_integer_field "$output" wal_bytes_delta) || return 1
+      [[ "$planned" == "$actual_bytes" ]] || return 1
+    fi
+    if [[ -n "$expected_rotation_case" ]]; then
+      grep -Eq '^wal_rotation_diagnostic([[:space:]]|$)' "$output" || return 1
+      actual=$(component_extract_field "$output" case) || return 1
+      [[ "$actual" == "$expected_rotation_case" ]] || return 1
+      [[ "$sample_stride" == 1 && "$append_sample_count" == 1 ]] || return 1
+      [[ "$(component_extract_field "$output" wal_byte_plan_verified)" == true ]] || return 1
+      local planned actual_bytes frame_bytes header_bytes before_id after_id target_id
+      planned=$(component_extract_integer_field "$output" planned_wal_bytes_delta) || return 1
+      actual_bytes=$(component_extract_integer_field "$output" wal_bytes_delta) || return 1
+      [[ "$planned" == "$actual_bytes" ]] || return 1
+      frame_bytes=$(component_extract_integer_field "$output" frame_bytes_per_command) || return 1
+      header_bytes=$(component_extract_integer_field "$output" segment_header_bytes) || return 1
+      ((frame_bytes > 0 && header_bytes > 0)) || return 1
+      before_id=$(component_extract_integer_field "$output" segment_id_before) || return 1
+      after_id=$(component_extract_integer_field "$output" segment_id_after) || return 1
+      local before_offset after_offset
+      before_offset=$(component_extract_integer_field "$output" segment_offset_before) || return 1
+      after_offset=$(component_extract_integer_field "$output" segment_offset_after) || return 1
+      if [[ "$expected_rotation_case" == control ]]; then
+        [[ "$before_id" == "$after_id" ]] || return 1
+        awk -v before="$before_offset" -v frame="$frame_bytes" -v after="$after_offset" \
+          'BEGIN { exit !(before + frame == after) }' || return 1
+      else
+        target_id=$(component_extract_integer_field "$output" target_sequence) || return 1
+        [[ "$after_id" == "$target_id" ]] || return 1
+        awk -v header="$header_bytes" -v frame="$frame_bytes" -v after="$after_offset" \
+          'BEGIN { exit !(header + frame == after) }' || return 1
+      fi
+      for field in wal_prepare_group_total_us wal_plan_copy_group_total_us \
+        wal_rotation_group_total_us wal_write_group_total_us wal_publish_group_total_us \
+        rotation_sync_total_us rotation_header_write_total_us rotation_header_sync_total_us \
+        rotation_directory_sync_total_us; do
+        component_extract_number "$output" "$field" >/dev/null || return 1
+      done
+      [[ "$(component_extract_field "$output" replay_verified)" == true ]] || return 1
+    fi
+    if [[ -n "$expected_rotation_scope" ]]; then
+      grep -Eq "(^|[[:space:]])rotation_scope=${expected_rotation_scope}([[:space:]]|$)" \
+        "$output" || return 1
+    fi
+    if [[ -n "$expected_rotation_count" ]]; then
+      actual=$(component_extract_integer_field "$output" measured_segment_rotations) || return 1
+      [[ "$actual" == "$expected_rotation_count" ]] || return 1
+    fi
+    if [[ -n "$expected_rotation_triggered" ]]; then
+      actual=$(component_extract_field "$output" rotation_triggered) || return 1
+      [[ "$actual" == "$expected_rotation_triggered" ]] || return 1
+    fi
+    if [[ "$profile_mode" == on ]]; then
+      actual=$(component_extract_integer_field "$output" profiled_groups) || return 1
+      [[ "$actual" == "$expected_groups" ]] || return 1
+      actual=$(component_extract_integer_field "$output" profiled_commands) || return 1
+      [[ "$actual" == "$expected_commands" ]] || return 1
+      actual=$(component_extract_integer_field "$output" profiled_data_write_calls) || return 1
+      awk -v actual="$actual" -v expected="$expected_groups" \
+        'BEGIN { exit !(actual >= expected) }' || return 1
+      grep -Eq 'wal_prepare_group_total_us=' "$output" || return 1
+      grep -Eq 'wal_write_group_total_us=' "$output" || return 1
+    fi
+  fi
+}
+
+component_validate_cv() {
+  local kind=$1
+  local key=$2
+  local rounds=$3
+  local round output rate cv
+  cv=$(for ((round=1; round<=rounds; ++round)); do
+    output="$RUN_ROOT/logs/component-${kind}-r${round}-${key}.stdout"
+    rate=$(component_extract_rate "$output" "$kind")
+    [[ -n "$rate" ]] || return 1
+    printf '%s\n' "$rate"
+  done | awk '
+    { sum += $1; values[NR] = $1 }
+    END {
+      if (NR == 0 || sum <= 0) exit 1
+      mean = sum / NR
+      for (i = 1; i <= NR; ++i) variance += (values[i] - mean) ^ 2
+      printf "%.9f\n", sqrt(variance / NR) / mean * 100
+    }') || return 1
+  printf 'kind=%s key=%s rounds=%s cv_percent=%s\n' "$kind" "$key" "$rounds" "$cv" \
+    >>"$RUN_ROOT/derived/component-cv.tsv"
+  awk -v value="$cv" 'BEGIN { exit !(value <= 5.0) }'
+}
+
+component_record_cv_status() {
+  local kind=$1
+  local key=$2
+  local rounds=$3
+  local round output
+  for ((round=1; round<=rounds; ++round)); do
+    output="$RUN_ROOT/logs/component-${kind}-r${round}-${key}.stdout"
+    [[ -s "$output" ]] || campaign_fail invalid-run "cv-artifact-${kind}-${key}-r${round}"
+    component_extract_rate "$output" "$kind" >/dev/null ||
+      campaign_fail invalid-run "cv-counter-${kind}-${key}-r${round}"
+  done
+  if component_validate_cv "$kind" "$key" "$rounds"; then
+    printf 'kind=%s key=%s status=accepted\n' "$kind" "$key" \
+      >>"$RUN_ROOT/derived/component-case-status.tsv"
+  else
+    COMPONENT_REJECTED_CASES=$((COMPONENT_REJECTED_CASES + 1))
+    printf 'kind=%s key=%s status=rejected-unstable\n' "$kind" "$key" \
+      >>"$RUN_ROOT/derived/component-case-status.tsv"
+  fi
+}
+
+component_run_rotation_attribution() {
+  local round output actual_rotations rotation_triggered replay_verified
+  local rotation_rows="$RUN_ROOT/derived/component-rotation-attribution.tsv"
+  printf 'case\tround\trotation_triggered\texpected_rotations\tmeasured_rotations\tsegment_id_before\tsegment_id_after\tsegment_offset_before\tsegment_offset_after\tdirty_bytes_before\tdirty_bytes_after\twriteback_bytes_before\twriteback_bytes_after\tappend_p50_us\tappend_p99_us\tappend_max_us\trotation_total_us\told_segment_sync_us\theader_write_us\theader_sync_us\tdirectory_sync_us\treplay_verified\n' \
+    >"$rotation_rows"
+  for ((round=1; round<=WAL_ROUNDS; ++round)); do
+    for mode in control trigger; do
+      local label="rotation-${mode}-r${round}-b1"
+      local expected_rotations=0
+      [[ "$mode" == trigger ]] && expected_rotations=1
+      component_check_disk_budget "$label" 1 "$((COMPONENT_WAL_SEGMENT_BYTES + COMPONENT_WAL_HEADER_BYTES))"
+      component_run_binary "$label" 1 \
+        --workload=wal_write_ceiling --wal-sync=none --wal-phase-profile=on \
+        --wal-rotation-diagnostic="$mode" --wal-group-size=1 --iterations=1
+      output="$RUN_ROOT/logs/component-${label}.stdout"
+      component_validate_output "$output" 1 wal on 1 0 rotation_inclusive \
+        "$expected_rotations" "$([[ "$mode" == trigger ]] && printf true || printf false)" \
+        "$mode" ||
+        campaign_fail invalid-run "rotation-output-${label}"
+      actual_rotations=$(component_extract_integer_field "$output" measured_segment_rotations) ||
+        campaign_fail invalid-run "rotation-counter-${label}"
+      [[ "$actual_rotations" == "$expected_rotations" ]] ||
+        campaign_fail invalid-run "rotation-count-${label}-${actual_rotations}"
+      rotation_triggered=$(component_extract_field "$output" rotation_triggered) ||
+        campaign_fail invalid-run "rotation-triggered-${label}"
+      if [[ "$mode" == trigger ]]; then
+        [[ "$rotation_triggered" == true ]] ||
+          campaign_fail invalid-run "rotation-not-triggered-${label}"
+      else
+        [[ "$rotation_triggered" == false ]] ||
+          campaign_fail invalid-run "rotation-control-triggered-${label}"
+      fi
+      replay_verified=$(component_extract_field "$output" replay_verified) ||
+        campaign_fail invalid-run "rotation-replay-${label}"
+      [[ "$replay_verified" == true ]] ||
+        campaign_fail invalid-run "rotation-replay-invalid-${label}"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$label" "$round" "$rotation_triggered" "$expected_rotations" "$actual_rotations" \
+        "$(component_extract_integer_field "$output" segment_id_before)" \
+        "$(component_extract_integer_field "$output" segment_id_after)" \
+        "$(component_extract_integer_field "$output" segment_offset_before)" \
+        "$(component_extract_integer_field "$output" segment_offset_after)" \
+        "$(component_extract_field "$output" measured_dirty_bytes_before)" \
+        "$(component_extract_field "$output" measured_dirty_bytes_after)" \
+        "$(component_extract_field "$output" measured_writeback_bytes_before)" \
+        "$(component_extract_field "$output" measured_writeback_bytes_after)" \
+        "$(component_extract_number "$output" append_group_p50_us)" \
+        "$(component_extract_number "$output" append_group_p99_us)" \
+        "$(component_extract_number "$output" append_group_max_us)" \
+        "$(component_extract_number "$output" wal_rotation_group_total_us)" \
+        "$(component_extract_number "$output" rotation_sync_total_us)" \
+        "$(component_extract_number "$output" rotation_header_write_total_us)" \
+        "$(component_extract_number "$output" rotation_header_sync_total_us)" \
+        "$(component_extract_number "$output" rotation_directory_sync_total_us)" \
+        "$replay_verified" \
+        >>"$rotation_rows"
+      component_finalize_case_data "$label"
+    done
+  done
+}
+
+component_run_profile_rounds() {
+  local batch warmup_groups groups output rate median bias
+  for batch in 1 256 1024 4096 8192; do
+    warmup_groups=$(component_wal_warmup_groups "$batch") ||
+      campaign_fail invalid-run "profile-warmup-invalid-${batch}"
+    component_check_disk_budget "profile-append-b${batch}" \
+      "$((COMPONENT_APPEND_COMMANDS + COMPONENT_WAL_WARMUP_COMMANDS))" \
+      "${COMPONENT_APPEND_BYTES_BY_BATCH[$batch]}"
+    component_run_binary "profile-append-b${batch}" 1 \
+      --component-warmup-groups="$warmup_groups" \
+      --workload=wal_write_ceiling --wal-sync=none --wal-phase-profile=on \
+      --wal-group-size="$batch" --iterations="$((COMPONENT_APPEND_COMMANDS / batch))"
+    output="$RUN_ROOT/logs/component-profile-append-b${batch}.stdout"
+    component_validate_output "$output" "$COMPONENT_APPEND_COMMANDS" wal on \
+      "$((COMPONENT_APPEND_COMMANDS / batch))" 0 ||
+      campaign_fail invalid-run "profile-append-output-${batch}"
+    component_validate_duration "$output" || campaign_fail invalid-run "profile-append-duration-${batch}"
+    component_finalize_case_data "profile-append-b${batch}"
+
+    groups=${COMPONENT_FSYNC_GROUPS_BY_BATCH[$batch]}
+    component_check_disk_budget "profile-fsync-b${batch}" \
+      "$((groups * batch + COMPONENT_WAL_WARMUP_COMMANDS))" \
+      "${COMPONENT_FSYNC_BYTES_BY_BATCH[$batch]}"
+    component_run_binary "profile-fsync-b${batch}" 1 \
+      --component-warmup-groups="$warmup_groups" \
+      --workload=wal_write_ceiling --wal-sync=per_group --wal-phase-profile=on \
+      --wal-group-size="$batch" --iterations="$groups"
+    output="$RUN_ROOT/logs/component-profile-fsync-b${batch}.stdout"
+    component_validate_output "$output" "$((groups * batch))" wal on "$groups" "$groups" ||
+      campaign_fail invalid-run "profile-fsync-output-${batch}"
+    component_validate_duration "$output" || campaign_fail invalid-run "profile-fsync-duration-${batch}"
+    component_finalize_case_data "profile-fsync-b${batch}"
+  done
+
+  warmup_groups=$(component_wal_warmup_groups 4096) ||
+    campaign_fail invalid-run profile-control-warmup-invalid
+  component_check_disk_budget "profile-control-append-b4096" \
+    "$((COMPONENT_APPEND_COMMANDS + COMPONENT_WAL_WARMUP_COMMANDS))" \
+    "${COMPONENT_APPEND_BYTES_BY_BATCH[4096]}"
+  component_run_binary "profile-control-append-b4096" 1 \
+    --component-warmup-groups="$warmup_groups" \
+    --workload=wal_write_ceiling --wal-sync=none --wal-phase-profile=off \
+    --wal-group-size=4096 --iterations="$((COMPONENT_APPEND_COMMANDS / 4096))"
+  output="$RUN_ROOT/logs/component-profile-control-append-b4096.stdout"
+  component_validate_output "$output" "$COMPONENT_APPEND_COMMANDS" wal off \
+    "$((COMPONENT_APPEND_COMMANDS / 4096))" 0 ||
+    campaign_fail invalid-run profile-control-output
+  component_validate_duration "$output" || campaign_fail invalid-run profile-control-duration
+  median=$(component_extract_rate "$output" wal) ||
+    campaign_fail invalid-run profile-control-rate-missing
+  component_finalize_case_data profile-control-append-b4096
+
+  output="$RUN_ROOT/logs/component-profile-append-b4096.stdout"
+  rate=$(component_extract_rate "$output" wal) || campaign_fail invalid-run profile-rate-missing
+  bias=$(awk -v profile="$rate" -v baseline="$median" \
+    'BEGIN { if (baseline <= 0) exit 1; value = (profile - baseline) / baseline * 100; if (value < 0) value = -value; print value }') ||
+    campaign_fail invalid-run profile-bias-invalid
+  printf 'case=append-b4096\nprofile_off_median=%s\nprofile_on_rate=%s\nbias_percent=%s\n' \
+    "$median" "$rate" "$bias" >"$RUN_ROOT/derived/component-profile-bias.tsv"
+  if ! awk -v value="$bias" -v limit="$OBSERVER_BIAS_LIMIT_PERCENT" \
+      'BEGIN { exit !(value <= limit) }'; then
+    printf 'result=observer-biased\nreason=component-profile-bias\nrun_root=%s\n' "$RUN_ROOT" \
+      | tee "$RUN_ROOT/logs/result.txt"
+    exit 3
+  fi
+}
+
+run_component_campaign() {
+  [[ "$PROFILE_ONLY" == 0 ]] || die '--profile-only is not valid with --scope=component'
+  [[ "$OBSERVER_MODE" == on ]] || die '--observer=off is not valid with --scope=component'
+  component_preflight campaign-state 0 || {
+    printf 'result=preflight-busy\nreason=initial-component-cpu-preflight\n' >"$RUN_ROOT/logs/result.txt"
+    printf 'run_root=%s\n' "$RUN_ROOT"
+    exit 3
+  }
+  component_calibrate
+  local scenario round batch groups
+  local -a scenarios=(new_crossing_pair new_resting_cancel amend_quantity replace_order)
+  : >"$RUN_ROOT/derived/component-case-status.tsv"
+  for ((round=1; round<=PIPELINE_ROUNDS; ++round)); do
+    if ((round % 2 == 1)); then
+      for scenario in "${scenarios[@]}"; do
+        component_run_binary "state-r${round}-${scenario}" 0 \
+          --workload=engine_pipeline_ceiling --pipeline-stage=state_machine \
+          --pipeline-command-scenario="$scenario" --pipeline-batch-size=2 \
+          --pipeline-active-orders=0 --iterations="$((COMPONENT_STATE_COMMANDS / 2))"
+        component_validate_output "$RUN_ROOT/logs/component-state-r${round}-${scenario}.stdout" \
+          "$COMPONENT_STATE_COMMANDS" state || campaign_fail invalid-run "state-counter-${round}-${scenario}"
+        component_validate_duration "$RUN_ROOT/logs/component-state-r${round}-${scenario}.stdout" ||
+          campaign_fail invalid-run "state-duration-${round}-${scenario}"
+        component_finalize_case_data "state-r${round}-${scenario}"
+      done
+    else
+      for ((scenario=${#scenarios[@]} - 1; scenario>=0; --scenario)); do
+        component_run_binary "state-r${round}-${scenarios[scenario]}" 0 \
+          --workload=engine_pipeline_ceiling --pipeline-stage=state_machine \
+          --pipeline-command-scenario="${scenarios[scenario]}" --pipeline-batch-size=2 \
+          --pipeline-active-orders=0 --iterations="$((COMPONENT_STATE_COMMANDS / 2))"
+        component_validate_output "$RUN_ROOT/logs/component-state-r${round}-${scenarios[scenario]}.stdout" \
+          "$COMPONENT_STATE_COMMANDS" state || campaign_fail invalid-run "state-counter-${round}-${scenarios[scenario]}"
+        component_validate_duration "$RUN_ROOT/logs/component-state-r${round}-${scenarios[scenario]}.stdout" ||
+          campaign_fail invalid-run "state-duration-${round}-${scenarios[scenario]}"
+        component_finalize_case_data "state-r${round}-${scenarios[scenario]}"
+      done
+    fi
+  done
+  : >"$RUN_ROOT/derived/component-cv.tsv"
+  for scenario in "${scenarios[@]}"; do
+    component_record_cv_status state "$scenario" "$PIPELINE_ROUNDS"
+  done
+  for batch in 1 256 1024 4096 8192; do
+    warmup_groups=$(component_wal_warmup_groups "$batch") ||
+      campaign_fail invalid-run "formal-append-warmup-invalid-${batch}"
+    for ((round=1; round<=WAL_ROUNDS; ++round)); do
+      component_check_disk_budget "append-r${round}-b${batch}" \
+        "$((COMPONENT_APPEND_COMMANDS + COMPONENT_WAL_WARMUP_COMMANDS))" \
+        "${COMPONENT_APPEND_BYTES_BY_BATCH[$batch]}"
+      component_run_binary "append-r${round}-b${batch}" 1 \
+        --component-warmup-groups="$warmup_groups" \
+        --workload=wal_write_ceiling --wal-sync=none --wal-phase-profile=off \
+        --wal-group-size="$batch" --iterations="$((COMPONENT_APPEND_COMMANDS / batch))" \
+        --wal-no-rotation-epoch-commands="${COMPONENT_APPEND_EPOCH_COMMANDS_BY_BATCH[$batch]}"
+      component_validate_output "$RUN_ROOT/logs/component-append-r${round}-b${batch}.stdout" \
+        "$COMPONENT_APPEND_COMMANDS" wal off "$((COMPONENT_APPEND_COMMANDS / batch))" 0 \
+        no_rotation 0 false ||
+        campaign_fail invalid-run "append-counter-${round}-${batch}"
+      component_validate_duration "$RUN_ROOT/logs/component-append-r${round}-b${batch}.stdout" ||
+        campaign_fail invalid-run "append-duration-${round}-${batch}"
+      component_finalize_case_data "append-r${round}-b${batch}"
+    done
+    component_record_cv_status append "b${batch}" "$WAL_ROUNDS"
+  done
+  component_run_rotation_attribution
+  for batch in 1 256 1024 4096 8192; do
+    groups=${COMPONENT_FSYNC_GROUPS_BY_BATCH[$batch]}
+    warmup_groups=$(component_wal_warmup_groups "$batch") ||
+      campaign_fail invalid-run "formal-fsync-warmup-invalid-${batch}"
+    for ((round=1; round<=WAL_ROUNDS; ++round)); do
+      component_check_disk_budget "fsync-r${round}-b${batch}" \
+        "$((groups * batch + COMPONENT_WAL_WARMUP_COMMANDS))" \
+        "${COMPONENT_FSYNC_BYTES_BY_BATCH[$batch]}"
+      component_run_binary "fsync-r${round}-b${batch}" 1 \
+        --component-warmup-groups="$warmup_groups" \
+        --workload=wal_write_ceiling --wal-sync=per_group --wal-phase-profile=off \
+        --wal-group-size="$batch" --iterations="$groups"
+      component_validate_output "$RUN_ROOT/logs/component-fsync-r${round}-b${batch}.stdout" \
+        "$((groups * batch))" wal off "$groups" "$groups" ||
+        campaign_fail invalid-run "fsync-counter-${round}-${batch}"
+      component_validate_duration "$RUN_ROOT/logs/component-fsync-r${round}-b${batch}.stdout" ||
+        campaign_fail invalid-run "fsync-duration-${round}-${batch}"
+      component_finalize_case_data "fsync-r${round}-b${batch}"
+    done
+    component_record_cv_status fsync "b${batch}" "$WAL_ROUNDS"
+  done
+  component_run_profile_rounds
+  capture_cpu_policy >"$RUN_ROOT/logs/cpu-policy-after.txt"
+  record_identity "$RUN_ROOT/logs/repository-identity-after.txt"
+  sha256sum "$BENCHMARK_BINARY" >"$RUN_ROOT/logs/binary-sha256-after.txt"
+  check_frozen_artifacts
+  if ((COMPONENT_REJECTED_CASES != 0)); then
+    printf 'collection_status=complete\nresult=collection-complete-results-partial\nrejected_cases=%s\nrun_root=%s\n' \
+      "$COMPONENT_REJECTED_CASES" "$RUN_ROOT" \
+      | tee "$RUN_ROOT/logs/result.txt"
+    return 4
+  fi
+  printf 'collection_status=complete\nresult=valid-component-ceiling\nrun_root=%s\n' \
+    "$RUN_ROOT" | tee "$RUN_ROOT/logs/result.txt"
+}
+
+if [[ "$SCOPE" == component ]]; then
+  run_component_campaign
+  exit $?
+fi
 
 if [[ "$PROFILE_ONLY" == 1 ]]; then
   profile_case="g${PROFILE_GROUP_SIZE}-d${PROFILE_DELAY_US}"

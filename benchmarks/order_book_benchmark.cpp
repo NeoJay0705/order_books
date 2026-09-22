@@ -5,6 +5,7 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -18,6 +19,7 @@
 #include <utility>
 #include <variant>
 #include <vector>
+#include <sys/resource.h>
 #include <unistd.h>
 
 #include "domain/order_book.hpp"
@@ -27,6 +29,7 @@
 #include "engine_tail_telemetry.hpp"
 #include "engine_writer_profile_benchmark.hpp"
 #include "pipeline_ceiling_benchmark.hpp"
+#include "wal_latency_sampler.hpp"
 #include "persistence/snapshot_store.hpp"
 #include "persistence/wal.hpp"
 
@@ -53,14 +56,17 @@ enum class WorkloadSelection {
 enum class WalSyncMode { none, per_group };
 enum class WalPhaseProfileMode { off, on };
 enum class WriterPhaseProfileMode { off, on };
+enum class WalRotationDiagnosticMode { control, trigger };
 
 struct BenchmarkOptions {
   std::uint64_t iterations{kIterations};
   std::uint64_t warmup{kWarmup};
   WorkloadSelection workload{WorkloadSelection::all};
   std::uint64_t wal_group_size{256};
+  std::uint64_t wal_no_rotation_epoch_commands{};
   WalSyncMode wal_sync_mode{WalSyncMode::per_group};
   WalPhaseProfileMode wal_phase_profile{WalPhaseProfileMode::off};
+  std::optional<WalRotationDiagnosticMode> wal_rotation_diagnostic;
   WriterPhaseProfileMode writer_phase_profile{WriterPhaseProfileMode::off};
   bool writer_apply_subprofile{};
   std::size_t engine_group_size{256};
@@ -70,18 +76,25 @@ struct BenchmarkOptions {
   std::size_t wal_parallel_prepare_min_commands{4096};
   std::uint64_t writer_profile_sample_every{1};
   benchmark::PipelineStage pipeline_stage{benchmark::PipelineStage::all};
+  benchmark::PipelineCommandScenario pipeline_command_scenario{
+      benchmark::PipelineCommandScenario::new_crossing_pair};
   std::size_t pipeline_batch_size{256};
   std::size_t pipeline_active_orders{};
   std::size_t pipeline_producer_lanes{kPipelineProducerLanes};
   std::size_t publisher_cursor_persist_max_commands{256};
   std::chrono::microseconds publisher_cursor_persist_max_delay{1000};
   bool pipeline_options_set{};
+  bool pipeline_command_scenario_parse_error{};
   bool engine_producer_lanes_parse_error{};
   bool wal_prepare_workers_parse_error{};
   bool wal_prepare_min_commands_parse_error{};
   bool wal_prepare_options_set{};
   bool wal_phase_profile_parse_error{};
   bool wal_phase_profile_option_set{};
+  bool wal_rotation_diagnostic_parse_error{};
+  bool wal_rotation_diagnostic_option_set{};
+  bool wal_no_rotation_epoch_parse_error{};
+  bool wal_no_rotation_epoch_option_set{};
   bool writer_phase_profile_parse_error{};
   bool writer_phase_profile_option_set{};
   bool writer_apply_subprofile_parse_error{};
@@ -270,6 +283,17 @@ std::optional<WalPhaseProfileMode> parse_wal_phase_profile(
   return std::nullopt;
 }
 
+std::optional<WalRotationDiagnosticMode> parse_wal_rotation_diagnostic(
+    const std::string_view value) {
+  if (value == "control") {
+    return WalRotationDiagnosticMode::control;
+  }
+  if (value == "trigger") {
+    return WalRotationDiagnosticMode::trigger;
+  }
+  return std::nullopt;
+}
+
 std::optional<WriterPhaseProfileMode> parse_writer_phase_profile(
     const std::string_view value) {
   if (value == "off") {
@@ -291,6 +315,24 @@ std::optional<BenchmarkOptions> parse_options(const int argc, char** argv) {
       options.warmup = *warmup;
     } else if (const auto group_size = parse_positive_option(argument, "--wal-group-size=")) {
       options.wal_group_size = *group_size;
+    } else if (argument.starts_with("--wal-no-rotation-epoch-commands=")) {
+      options.wal_no_rotation_epoch_option_set = true;
+      const auto epoch_commands = parse_positive_option(
+          argument, "--wal-no-rotation-epoch-commands=");
+      if (!epoch_commands.has_value()) {
+        options.wal_no_rotation_epoch_parse_error = true;
+      } else {
+        options.wal_no_rotation_epoch_commands = *epoch_commands;
+      }
+    } else if (argument.starts_with("--wal-rotation-diagnostic=")) {
+      options.wal_rotation_diagnostic_option_set = true;
+      const auto diagnostic = parse_wal_rotation_diagnostic(
+          argument.substr(std::string_view("--wal-rotation-diagnostic=").size()));
+      if (!diagnostic.has_value()) {
+        options.wal_rotation_diagnostic_parse_error = true;
+      } else {
+        options.wal_rotation_diagnostic = *diagnostic;
+      }
     } else if (const auto group_size = parse_positive_option(argument, "--engine-group-size=")) {
       options.engine_group_size = static_cast<std::size_t>(*group_size);
     } else if (const auto delay =
@@ -350,6 +392,15 @@ std::optional<BenchmarkOptions> parse_options(const int argc, char** argv) {
       }
       options.pipeline_stage = *stage;
       options.pipeline_options_set = true;
+    } else if (argument.starts_with("--pipeline-command-scenario=")) {
+      const auto scenario = benchmark::parse_pipeline_command_scenario(
+          argument.substr(std::string_view("--pipeline-command-scenario=").size()));
+      if (!scenario.has_value()) {
+        options.pipeline_command_scenario_parse_error = true;
+      } else {
+        options.pipeline_command_scenario = *scenario;
+        options.pipeline_options_set = true;
+      }
     } else if (argument.starts_with("--workload=")) {
       const auto workload = parse_workload(argument.substr(std::string_view("--workload=").size()));
       if (!workload.has_value()) {
@@ -560,6 +611,67 @@ std::optional<std::uint64_t> count_wal_segments(const std::filesystem::path& dir
   return count;
 }
 
+struct WalSegmentSnapshot {
+  std::uint64_t count{};
+  std::uint64_t first_engine_seq{};
+  std::uint64_t active_engine_seq{};
+  std::uint64_t active_offset{};
+};
+
+std::optional<WalSegmentSnapshot> inspect_wal_segments(
+    const std::filesystem::path& directory) {
+  std::error_code error;
+  std::filesystem::directory_iterator iterator(directory, error);
+  if (error) {
+    return std::nullopt;
+  }
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> segments;
+  const std::filesystem::directory_iterator end;
+  for (; iterator != end; iterator.increment(error)) {
+    if (error) {
+      return std::nullopt;
+    }
+    std::error_code entry_error;
+    const auto& path = iterator->path();
+    if (!iterator->is_regular_file(entry_error) || entry_error) {
+      if (entry_error) {
+        return std::nullopt;
+      }
+      continue;
+    }
+    if (path.extension() != ".wal") {
+      continue;
+    }
+    const auto stem = path.stem().string();
+    std::size_t consumed = 0;
+    std::uint64_t sequence = 0;
+    try {
+      sequence = std::stoull(stem, &consumed);
+    } catch (...) {
+      return std::nullopt;
+    }
+    if (sequence == 0U || consumed != stem.size()) {
+      return std::nullopt;
+    }
+    const auto size = std::filesystem::file_size(path, entry_error);
+    if (entry_error) {
+      return std::nullopt;
+    }
+    segments.emplace_back(sequence, size);
+  }
+  if (segments.empty()) {
+    return std::nullopt;
+  }
+  std::sort(segments.begin(), segments.end());
+  if (segments.size() > std::numeric_limits<std::uint64_t>::max()) {
+    return std::nullopt;
+  }
+  return WalSegmentSnapshot{static_cast<std::uint64_t>(segments.size()),
+                            segments.front().first,
+                            segments.back().first,
+                            segments.back().second};
+}
+
 std::string error_code_message(const ErrorCode code) {
   return "engine_error_code=" + std::to_string(static_cast<unsigned int>(code));
 }
@@ -752,6 +864,10 @@ std::optional<std::string_view> prepare_data_directory(
 
 constexpr std::size_t kWalCeilingSegmentSize = 256U * 1024U * 1024U;
 
+using benchmark_wal::LatencyAggregate;
+using benchmark_wal::latency_sample_stride;
+using benchmark_wal::observe_latency;
+
 struct WalGroupSamples {
   std::vector<std::uint64_t> append_ns;
   std::vector<std::uint64_t> sync_ns;
@@ -763,8 +879,29 @@ struct WalGroupSamples {
   std::vector<std::uint64_t> prepare_task_ns;
   std::vector<std::uint64_t> plan_copy_ns;
   std::vector<std::uint64_t> rotation_ns;
+  std::vector<std::uint64_t> rotation_sync_ns;
+  std::vector<std::uint64_t> rotation_header_write_ns;
+  std::vector<std::uint64_t> rotation_header_sync_ns;
+  std::vector<std::uint64_t> rotation_directory_sync_ns;
   std::vector<std::uint64_t> write_ns;
   std::vector<std::uint64_t> publish_ns;
+  LatencyAggregate append;
+  LatencyAggregate sync;
+  LatencyAggregate total;
+  LatencyAggregate fixture_build;
+  LatencyAggregate wal_append_call;
+  LatencyAggregate lock_wait;
+  LatencyAggregate prepare;
+  LatencyAggregate prepare_task;
+  LatencyAggregate plan_copy;
+  LatencyAggregate rotation;
+  LatencyAggregate rotation_sync;
+  LatencyAggregate rotation_header_write;
+  LatencyAggregate rotation_header_sync;
+  LatencyAggregate rotation_directory_sync;
+  LatencyAggregate write;
+  LatencyAggregate publish;
+  std::uint64_t sample_stride{1};
   std::uint64_t profiled_groups{};
   std::uint64_t profiled_commands{};
   std::uint64_t profiled_frame_bytes{};
@@ -782,6 +919,10 @@ struct WalProfileTotals {
   std::uint64_t prepare_task{};
   std::uint64_t plan_copy{};
   std::uint64_t rotation{};
+  std::uint64_t rotation_sync{};
+  std::uint64_t rotation_header_write{};
+  std::uint64_t rotation_header_sync{};
+  std::uint64_t rotation_directory_sync{};
   std::uint64_t write{};
   std::uint64_t publish{};
   std::uint64_t sync{};
@@ -814,45 +955,176 @@ std::optional<std::uint64_t> checked_multiply(const std::uint64_t lhs,
   return lhs * rhs;
 }
 
-std::optional<std::uint64_t> sum_samples(
-    const std::vector<std::uint64_t>& samples) {
-  std::uint64_t total = 0;
-  for (const auto sample : samples) {
-    if (!checked_add(total, sample)) {
-      return std::nullopt;
-    }
+std::optional<std::uint64_t> checked_sum(const std::uint64_t lhs,
+                                         const std::uint64_t rhs) {
+  if (rhs > std::numeric_limits<std::uint64_t>::max() - lhs) {
+    return std::nullopt;
   }
-  return total;
+  return lhs + rhs;
 }
 
 std::optional<WalProfileTotals> profile_totals(const WalGroupSamples& samples) {
-  const auto fixture_build = sum_samples(samples.fixture_build_ns);
-  const auto wal_append_call = sum_samples(samples.wal_append_call_ns);
-  const auto lock_wait = sum_samples(samples.lock_wait_ns);
-  const auto prepare = sum_samples(samples.prepare_ns);
-  const auto prepare_task = sum_samples(samples.prepare_task_ns);
-  const auto plan_copy = sum_samples(samples.plan_copy_ns);
-  const auto rotation = sum_samples(samples.rotation_ns);
-  const auto write = sum_samples(samples.write_ns);
-  const auto publish = sum_samples(samples.publish_ns);
-  const auto sync = sum_samples(samples.sync_ns);
-  const auto group_total = sum_samples(samples.total_ns);
-  if (!fixture_build.has_value() || !wal_append_call.has_value() || !lock_wait.has_value() ||
-      !prepare.has_value() || !prepare_task.has_value() || !plan_copy.has_value() ||
-      !rotation.has_value() ||
-      !write.has_value() || !publish.has_value() || !sync.has_value() ||
-      !group_total.has_value()) {
-    return std::nullopt;
-  }
-  return WalProfileTotals{*fixture_build, *wal_append_call, *lock_wait, *prepare,
-                          *prepare_task, *plan_copy, *rotation, *write, *publish, *sync,
-                          *group_total};
+  return WalProfileTotals{samples.fixture_build.total_ns,
+                          samples.wal_append_call.total_ns,
+                          samples.lock_wait.total_ns,
+                          samples.prepare.total_ns,
+                          samples.prepare_task.total_ns,
+                          samples.plan_copy.total_ns,
+                          samples.rotation.total_ns,
+                          samples.rotation_sync.total_ns,
+                          samples.rotation_header_write.total_ns,
+                          samples.rotation_header_sync.total_ns,
+                          samples.rotation_directory_sync.total_ns,
+                          samples.write.total_ns,
+                          samples.publish.total_ns,
+                          samples.sync.total_ns,
+                          samples.total.total_ns};
 }
 
 std::uint64_t elapsed_ns(const std::chrono::steady_clock::time_point start,
                          const std::chrono::steady_clock::time_point end) {
   return static_cast<std::uint64_t>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+}
+
+struct ProcessCounters {
+  double user_seconds{};
+  double system_seconds{};
+  std::uint64_t voluntary_context_switches{};
+  std::uint64_t involuntary_context_switches{};
+  std::uint64_t syscw{};
+  std::uint64_t wchar{};
+  std::uint64_t write_bytes{};
+  std::uint64_t cancelled_write_bytes{};
+  std::uint64_t dirty_bytes{};
+  std::uint64_t writeback_bytes{};
+  bool rusage_valid{};
+  bool io_valid{};
+  bool meminfo_valid{};
+  bool aggregate_initialized{};
+};
+
+ProcessCounters capture_process_counters() {
+  ProcessCounters counters;
+  struct rusage usage {};
+  if (::getrusage(RUSAGE_SELF, &usage) == 0) {
+    counters.rusage_valid = true;
+    counters.user_seconds = static_cast<double>(usage.ru_utime.tv_sec) +
+                            static_cast<double>(usage.ru_utime.tv_usec) / 1'000'000.0;
+    counters.system_seconds = static_cast<double>(usage.ru_stime.tv_sec) +
+                              static_cast<double>(usage.ru_stime.tv_usec) / 1'000'000.0;
+    counters.voluntary_context_switches = usage.ru_nvcsw;
+    counters.involuntary_context_switches = usage.ru_nivcsw;
+  }
+#if defined(__linux__)
+  std::ifstream input("/proc/self/io");
+  std::string name;
+  std::uint64_t value = 0;
+  bool has_syscw = false;
+  bool has_wchar = false;
+  bool has_write_bytes = false;
+  bool has_cancelled_write_bytes = false;
+  while (input >> name >> value) {
+    if (name == "syscw:") {
+      counters.syscw = value;
+      has_syscw = true;
+    } else if (name == "wchar:") {
+      counters.wchar = value;
+      has_wchar = true;
+    } else if (name == "write_bytes:") {
+      counters.write_bytes = value;
+      has_write_bytes = true;
+    } else if (name == "cancelled_write_bytes:") {
+      counters.cancelled_write_bytes = value;
+      has_cancelled_write_bytes = true;
+    }
+  }
+  counters.io_valid = has_syscw && has_wchar && has_write_bytes && has_cancelled_write_bytes;
+  std::ifstream meminfo("/proc/meminfo");
+  bool has_dirty = false;
+  bool has_writeback = false;
+  while (meminfo >> name >> value) {
+    std::string unit;
+    meminfo >> unit;
+    if (name == "Dirty:") {
+      counters.dirty_bytes = value * 1024U;
+      has_dirty = true;
+    } else if (name == "Writeback:") {
+      counters.writeback_bytes = value * 1024U;
+      has_writeback = true;
+    }
+  }
+  counters.meminfo_valid = has_dirty && has_writeback;
+#endif
+  return counters;
+}
+
+ProcessCounters subtract_process_counters(const ProcessCounters& after,
+                                           const ProcessCounters& before) {
+  ProcessCounters delta;
+  delta.rusage_valid = after.rusage_valid && before.rusage_valid;
+  if (delta.rusage_valid) {
+    delta.user_seconds = after.user_seconds - before.user_seconds;
+    delta.system_seconds = after.system_seconds - before.system_seconds;
+  }
+  delta.voluntary_context_switches = after.voluntary_context_switches >=
+                                             before.voluntary_context_switches
+                                         ? after.voluntary_context_switches -
+                                               before.voluntary_context_switches
+                                         : 0;
+  delta.involuntary_context_switches = after.involuntary_context_switches >=
+                                               before.involuntary_context_switches
+                                           ? after.involuntary_context_switches -
+                                                 before.involuntary_context_switches
+                                           : 0;
+  delta.io_valid = after.io_valid && before.io_valid;
+  if (delta.io_valid) {
+    delta.syscw = after.syscw >= before.syscw ? after.syscw - before.syscw : 0;
+    delta.wchar = after.wchar >= before.wchar ? after.wchar - before.wchar : 0;
+    delta.write_bytes = after.write_bytes >= before.write_bytes
+                            ? after.write_bytes - before.write_bytes
+                            : 0;
+    delta.cancelled_write_bytes = after.cancelled_write_bytes >=
+                                          before.cancelled_write_bytes
+                                      ? after.cancelled_write_bytes -
+                                            before.cancelled_write_bytes
+                                      : 0;
+  }
+  delta.dirty_bytes = after.dirty_bytes;
+  delta.writeback_bytes = after.writeback_bytes;
+  delta.meminfo_valid = after.meminfo_valid && before.meminfo_valid;
+  return delta;
+}
+
+bool add_process_counters(ProcessCounters& target, const ProcessCounters& value) {
+  if (!target.aggregate_initialized) {
+    target = value;
+    target.aggregate_initialized = true;
+    return true;
+  }
+  target.user_seconds += value.user_seconds;
+  target.system_seconds += value.system_seconds;
+  if (!checked_add(target.voluntary_context_switches, value.voluntary_context_switches) ||
+      !checked_add(target.involuntary_context_switches,
+                   value.involuntary_context_switches)) {
+    return false;
+  }
+  target.rusage_valid = target.rusage_valid && value.rusage_valid;
+  target.io_valid = target.io_valid && value.io_valid;
+  if (value.io_valid) {
+    if (!checked_add(target.syscw, value.syscw) ||
+        !checked_add(target.wchar, value.wchar) ||
+        !checked_add(target.write_bytes, value.write_bytes) ||
+        !checked_add(target.cancelled_write_bytes, value.cancelled_write_bytes)) {
+      return false;
+    }
+  }
+  target.meminfo_valid = target.meminfo_valid && value.meminfo_valid;
+  if (value.meminfo_valid) {
+    target.dirty_bytes = value.dirty_bytes;
+    target.writeback_bytes = value.writeback_bytes;
+  }
+  return true;
 }
 
 std::string_view wal_sync_mode_name(const WalSyncMode mode) {
@@ -890,7 +1162,11 @@ bool run_wal_groups(storage::Wal& wal, const std::uint64_t group_count,
     }
     const auto fixture_end = phase_profile ? std::chrono::steady_clock::now()
                                            : std::chrono::steady_clock::time_point{};
-    const auto append_start = group_start;
+    // The fixture is benchmark bookkeeping.  Keep it in process wall time, but
+    // start the component service clock only once the prepared command batch is
+    // complete so append/sync group samples describe the WAL path itself.
+    const auto service_start = std::chrono::steady_clock::now();
+    const auto append_start = service_start;
     storage::WalAppendProfile profile;
     const auto wal_call_start = phase_profile ? std::chrono::steady_clock::now()
                                               : std::chrono::steady_clock::time_point{};
@@ -916,23 +1192,99 @@ bool run_wal_groups(storage::Wal& wal, const std::uint64_t group_count,
     }
     const auto group_end = std::chrono::steady_clock::now();
     if (samples != nullptr) {
-      samples->append_ns.push_back(elapsed_ns(append_start, append_end));
-      if (sync_mode == WalSyncMode::per_group) {
-        samples->sync_ns.push_back(sync_duration);
+      const auto append_duration = elapsed_ns(append_start, append_end);
+      const auto sample_index = samples->append.observed;
+      if (!observe_latency(samples->append_ns, samples->append, append_duration,
+                           sample_index, samples->sample_stride)) {
+        report_wal_error(phase, "latency_counter_overflow");
+        return false;
       }
-      samples->total_ns.push_back(elapsed_ns(group_start, group_end));
-      if (phase_profile) {
-        samples->fixture_build_ns.push_back(elapsed_ns(fixture_start, fixture_end));
-        samples->wal_append_call_ns.push_back(elapsed_ns(wal_call_start, append_end));
-        samples->lock_wait_ns.push_back(profile.lock_wait_ns);
-        samples->prepare_ns.push_back(profile.prepare_ns);
-        samples->prepare_task_ns.push_back(profile.prepare_task_ns);
-        samples->plan_copy_ns.push_back(profile.plan_copy_ns);
-        if (profile.rotations != 0U) {
-          samples->rotation_ns.push_back(profile.rotation_ns);
+      if (sync_mode == WalSyncMode::per_group) {
+        if (!observe_latency(samples->sync_ns, samples->sync, sync_duration, sample_index,
+                             samples->sample_stride)) {
+          report_wal_error(phase, "latency_counter_overflow");
+          return false;
         }
-        samples->write_ns.push_back(profile.write_ns);
-        samples->publish_ns.push_back(profile.publish_ns);
+      }
+      // For append-return runs, append_ns is the service boundary and the
+      // duplicate total sample only adds memory pressure.  Keep group-total
+      // samples for durable runs and diagnostic/profile rounds where the
+      // append/sync composition is part of the report.
+      if (sync_mode == WalSyncMode::per_group || phase_profile) {
+        if (!observe_latency(samples->total_ns, samples->total,
+                             elapsed_ns(service_start, group_end), sample_index,
+                             samples->sample_stride)) {
+          report_wal_error(phase, "latency_counter_overflow");
+          return false;
+        }
+      }
+      if (phase_profile) {
+        if (!observe_latency(samples->fixture_build_ns, samples->fixture_build,
+                             elapsed_ns(fixture_start, fixture_end), sample_index,
+                             samples->sample_stride) ||
+            !observe_latency(samples->wal_append_call_ns, samples->wal_append_call,
+                             elapsed_ns(wal_call_start, append_end), sample_index,
+                             samples->sample_stride) ||
+            !observe_latency(samples->lock_wait_ns, samples->lock_wait, profile.lock_wait_ns,
+                             sample_index, samples->sample_stride) ||
+            !observe_latency(samples->prepare_ns, samples->prepare, profile.prepare_ns,
+                             sample_index, samples->sample_stride) ||
+            !observe_latency(samples->prepare_task_ns, samples->prepare_task,
+                             profile.prepare_task_ns, sample_index, samples->sample_stride) ||
+            !observe_latency(samples->plan_copy_ns, samples->plan_copy, profile.plan_copy_ns,
+                             sample_index, samples->sample_stride)) {
+          report_wal_error(phase, "latency_counter_overflow");
+          return false;
+        }
+        if (profile.rotations != 0U) {
+          if (!observe_latency(samples->rotation_ns, samples->rotation, profile.rotation_ns,
+                               sample_index, samples->sample_stride)) {
+            report_wal_error(phase, "latency_counter_overflow");
+            return false;
+          }
+        }
+        if (profile.rotation_sync_ns != 0U) {
+          if (!observe_latency(samples->rotation_sync_ns, samples->rotation_sync,
+                               profile.rotation_sync_ns, sample_index,
+                               samples->sample_stride)) {
+            report_wal_error(phase, "latency_counter_overflow");
+            return false;
+          }
+        }
+        if (profile.rotation_header_write_ns != 0U) {
+          if (!observe_latency(samples->rotation_header_write_ns,
+                               samples->rotation_header_write,
+                               profile.rotation_header_write_ns, sample_index,
+                               samples->sample_stride)) {
+            report_wal_error(phase, "latency_counter_overflow");
+            return false;
+          }
+        }
+        if (profile.rotation_header_sync_ns != 0U) {
+          if (!observe_latency(samples->rotation_header_sync_ns,
+                               samples->rotation_header_sync,
+                               profile.rotation_header_sync_ns, sample_index,
+                               samples->sample_stride)) {
+            report_wal_error(phase, "latency_counter_overflow");
+            return false;
+          }
+        }
+        if (profile.rotation_directory_sync_ns != 0U) {
+          if (!observe_latency(samples->rotation_directory_sync_ns,
+                               samples->rotation_directory_sync,
+                               profile.rotation_directory_sync_ns, sample_index,
+                               samples->sample_stride)) {
+            report_wal_error(phase, "latency_counter_overflow");
+            return false;
+          }
+        }
+        if (!observe_latency(samples->write_ns, samples->write, profile.write_ns, sample_index,
+                             samples->sample_stride) ||
+            !observe_latency(samples->publish_ns, samples->publish, profile.publish_ns,
+                             sample_index, samples->sample_stride)) {
+          report_wal_error(phase, "latency_counter_overflow");
+          return false;
+        }
         if (!checked_add(samples->profiled_groups, 1U) ||
             !checked_add(samples->profiled_commands,
                          static_cast<std::uint64_t>(commands.size())) ||
@@ -971,7 +1323,772 @@ bool validate_wal_replay(const std::vector<domain::CommittedCommand>& records,
   return true;
 }
 
+// Append-return ceiling variant used by the component campaign.  A fresh WAL
+// epoch is kept below one segment so rotation durability is not mixed into the
+// append-return measurement.  The production segment size and WAL semantics
+// remain unchanged; only the benchmark's workload partitioning differs.
+bool run_wal_write_ceiling_no_rotation(const BenchmarkOptions& options) {
+  if (options.wal_group_size == 0U || options.wal_no_rotation_epoch_commands == 0U ||
+      options.wal_no_rotation_epoch_commands < options.wal_group_size ||
+      options.wal_no_rotation_epoch_commands % options.wal_group_size != 0U ||
+      options.wal_phase_profile != WalPhaseProfileMode::off) {
+    report_wal_error("setup", "invalid_no_rotation_epoch_options");
+    return false;
+  }
+  if (options.iterations > std::numeric_limits<std::uint64_t>::max() /
+                           options.wal_group_size) {
+    report_wal_error("setup", "command_count_overflow");
+    return false;
+  }
+  const auto total_commands = options.iterations * options.wal_group_size;
+  const auto run_id = std::to_string(
+                          std::chrono::steady_clock::now().time_since_epoch().count()) +
+                      "-" + std::to_string(static_cast<unsigned long long>(::getpid()));
+  const bool owned_data_directory = !options.data_directory.has_value();
+  const auto data_directory = options.data_directory.value_or(
+      std::filesystem::temp_directory_path() / ("order_books_benchmark_wal-" + run_id));
+  if (const auto error = prepare_data_directory(data_directory); error.has_value()) {
+    report_wal_error("setup", *error, data_directory.string());
+    return false;
+  }
+  const auto cleanup = [&] {
+    if (owned_data_directory) {
+      std::error_code ignored;
+      std::filesystem::remove_all(data_directory, ignored);
+    }
+  };
+
+  const auto epoch_commands = options.wal_no_rotation_epoch_commands;
+  std::uint64_t remaining_commands = total_commands;
+  std::uint64_t measured_commands = 0;
+  std::uint64_t measured_groups = 0;
+  std::uint64_t measured_elapsed = 0;
+  std::uint64_t measured_wal_bytes = 0;
+  std::uint64_t planned_wal_bytes = 0;
+  std::uint64_t frame_bytes_per_command = 0;
+  bool frame_plan_initialized = false;
+  std::uint64_t epoch_count = 0;
+  std::uint64_t prepare_parallel_groups = 0;
+  std::uint64_t prepare_tasks = 0;
+  std::uint64_t segment_id_before = 0;
+  std::uint64_t segment_id_after = 0;
+  std::uint64_t segment_offset_before = 0;
+  std::uint64_t segment_offset_after = 0;
+  ProcessCounters measured_process_before;
+  ProcessCounters measured_process_after;
+  ProcessCounters measured_process_counters;
+  WalGroupSamples samples;
+  samples.sample_stride = latency_sample_stride(options.iterations);
+  const auto sample_count = options.iterations / samples.sample_stride +
+                            (options.iterations % samples.sample_stride == 0U ? 0U : 1U);
+  samples.append_ns.reserve(static_cast<std::size_t>(sample_count));
+
+  while (remaining_commands != 0U) {
+    const auto this_epoch_commands = std::min(epoch_commands, remaining_commands);
+    if (this_epoch_commands % options.wal_group_size != 0U) {
+      report_wal_error("setup", "epoch_command_count_not_batch_aligned");
+      cleanup();
+      return false;
+    }
+    if (options.warmup >
+        std::numeric_limits<std::uint64_t>::max() / options.wal_group_size) {
+      report_wal_error("setup", "warmup_command_count_overflow");
+      cleanup();
+      return false;
+    }
+    const auto warmup_commands = options.warmup * options.wal_group_size;
+    if (warmup_commands > std::numeric_limits<std::uint64_t>::max() -
+                             this_epoch_commands) {
+      report_wal_error("setup", "epoch_command_count_overflow");
+      cleanup();
+      return false;
+    }
+    const auto epoch_total_commands = warmup_commands + this_epoch_commands;
+    const auto epoch_path = data_directory / ("epoch-" + std::to_string(epoch_count + 1U));
+    if (const auto error = prepare_data_directory(epoch_path); error.has_value()) {
+      report_wal_error("setup", *error, epoch_path.string());
+      cleanup();
+      return false;
+    }
+    auto wal_result = storage::Wal::open(
+        epoch_path, 1, kWalCeilingSegmentSize,
+        storage::WalPrepareOptions{options.wal_prepare_workers,
+                                   options.wal_parallel_prepare_min_commands});
+    if (!std::holds_alternative<std::unique_ptr<storage::Wal>>(wal_result)) {
+      report_wal_error("open", "wal_open_failed",
+                       std::get<Error>(wal_result).message);
+      cleanup();
+      return false;
+    }
+    auto wal = std::get<std::unique_ptr<storage::Wal>>(std::move(wal_result));
+    std::uint64_t epoch_remaining = epoch_total_commands;
+    EngineSeq next_sequence = 1;
+    const auto warmup_start_wal_bytes = wal->size_bytes();
+    const auto warmup_start_segments = inspect_wal_segments(epoch_path);
+    if (!warmup_start_segments.has_value()) {
+      report_wal_error("warmup", "segment_snapshot_failed", epoch_path.string());
+      cleanup();
+      return false;
+    }
+    if (!run_wal_groups(*wal, options.warmup, options.wal_group_size, WalSyncMode::none,
+                        next_sequence, epoch_remaining, "warmup", nullptr, false)) {
+      cleanup();
+      return false;
+    }
+    const auto warmup_end_wal_bytes = wal->size_bytes();
+    const auto warmup_end_segments = inspect_wal_segments(epoch_path);
+    if (!warmup_end_segments.has_value() ||
+        warmup_end_segments->count != warmup_start_segments->count ||
+        warmup_end_wal_bytes < warmup_start_wal_bytes || options.warmup == 0U) {
+      report_wal_error("warmup", "warmup_rotation_or_snapshot_invalid", epoch_path.string());
+      cleanup();
+      return false;
+    }
+    const auto warmup_frame_bytes = warmup_end_wal_bytes - warmup_start_wal_bytes;
+    if (warmup_frame_bytes == 0U || warmup_frame_bytes % warmup_commands != 0U) {
+      report_wal_error("warmup", "frame_byte_plan_invalid");
+      cleanup();
+      return false;
+    }
+    const auto measured_frame_bytes = warmup_frame_bytes / warmup_commands;
+    if (!frame_plan_initialized) {
+      frame_bytes_per_command = measured_frame_bytes;
+      frame_plan_initialized = true;
+    } else if (frame_bytes_per_command != measured_frame_bytes) {
+      report_wal_error("warmup", "frame_byte_plan_changed");
+      cleanup();
+      return false;
+    }
+    if (const auto status = wal->sync(); std::holds_alternative<Error>(status)) {
+      report_wal_error("warmup", "final_sync_failed", std::get<Error>(status).message);
+      cleanup();
+      return false;
+    }
+    const auto starting_wal_bytes = wal->size_bytes();
+    const auto starting_segments = inspect_wal_segments(epoch_path);
+    if (!starting_segments.has_value()) {
+      report_wal_error("warmup", "segment_snapshot_failed", epoch_path.string());
+      cleanup();
+      return false;
+    }
+    segment_id_before = starting_segments->active_engine_seq;
+    segment_offset_before = starting_segments->active_offset;
+    const auto epoch_prepare_before = wal->prepare_stats();
+    const auto epoch_groups = this_epoch_commands / options.wal_group_size;
+    const auto planned_epoch_bytes = checked_multiply(this_epoch_commands,
+                                                      frame_bytes_per_command);
+    if (!planned_epoch_bytes.has_value()) {
+      report_wal_error("measured", "frame_byte_plan_overflow");
+      cleanup();
+      return false;
+    }
+    const auto process_counters_before_measured = capture_process_counters();
+    if (epoch_count == 0U) {
+      measured_process_before = process_counters_before_measured;
+    }
+    const auto measured_start = std::chrono::steady_clock::now();
+    if (!run_wal_groups(*wal, epoch_groups, options.wal_group_size, WalSyncMode::none,
+                        next_sequence, epoch_remaining, "measured", &samples, false)) {
+      cleanup();
+      return false;
+    }
+    const auto measured_end = std::chrono::steady_clock::now();
+    const auto process_counters_after_measured = capture_process_counters();
+    if (!add_process_counters(
+            measured_process_counters,
+            subtract_process_counters(process_counters_after_measured,
+                                       process_counters_before_measured))) {
+      report_wal_error("measured", "process_counter_overflow");
+      cleanup();
+      return false;
+    }
+    measured_process_after = process_counters_after_measured;
+    const auto ending_wal_bytes = wal->size_bytes();
+    const auto ending_segments = inspect_wal_segments(epoch_path);
+    if (!ending_segments.has_value() || ending_segments->count < starting_segments->count ||
+        ending_wal_bytes < starting_wal_bytes ||
+        ending_segments->count != starting_segments->count ||
+        ending_segments->active_engine_seq != starting_segments->active_engine_seq ||
+        ending_wal_bytes - starting_wal_bytes != *planned_epoch_bytes) {
+      report_wal_error("measured", "no_rotation_observation_failed", epoch_path.string());
+      cleanup();
+      return false;
+    }
+    segment_id_after = ending_segments->active_engine_seq;
+    segment_offset_after = ending_segments->active_offset;
+    if (epoch_remaining != 0U) {
+      report_wal_error("measured", "epoch_command_count_mismatch");
+      cleanup();
+      return false;
+    }
+    const auto epoch_prepare_after = wal->prepare_stats();
+    const auto epoch_prepare_delta = prepare_stats_delta(epoch_prepare_before,
+                                                          epoch_prepare_after);
+    if (!epoch_prepare_delta.has_value()) {
+      report_wal_error("measured", "wal_prepare_stats_regressed");
+      cleanup();
+      return false;
+    }
+    if (const auto status = wal->sync(); std::holds_alternative<Error>(status)) {
+      report_wal_error("finalize", "final_sync_failed", std::get<Error>(status).message);
+      cleanup();
+      return false;
+    }
+    wal.reset();
+    auto reopened_result = storage::Wal::open(
+        epoch_path, 1, kWalCeilingSegmentSize,
+        storage::WalPrepareOptions{options.wal_prepare_workers,
+                                   options.wal_parallel_prepare_min_commands});
+    if (!std::holds_alternative<std::unique_ptr<storage::Wal>>(reopened_result)) {
+      report_wal_error("reopen", "wal_reopen_failed",
+                       std::get<Error>(reopened_result).message);
+      cleanup();
+      return false;
+    }
+    auto reopened = std::get<std::unique_ptr<storage::Wal>>(std::move(reopened_result));
+    auto replayed_result = reopened->replay();
+    if (!std::holds_alternative<std::vector<domain::CommittedCommand>>(replayed_result) ||
+        !validate_wal_replay(
+            std::get<std::vector<domain::CommittedCommand>>(replayed_result),
+            epoch_total_commands)) {
+      if (std::holds_alternative<Error>(replayed_result)) {
+        report_wal_error("replay", "wal_replay_failed",
+                         std::get<Error>(replayed_result).message);
+      }
+      cleanup();
+      return false;
+    }
+    const auto epoch_elapsed = elapsed_ns(measured_start, measured_end);
+    if (!checked_add(measured_elapsed, epoch_elapsed) ||
+        !checked_add(measured_commands, this_epoch_commands) ||
+        !checked_add(measured_groups, epoch_groups) ||
+        !checked_add(prepare_parallel_groups, epoch_prepare_delta->parallel_groups) ||
+        !checked_add(prepare_tasks, epoch_prepare_delta->tasks)) {
+      report_wal_error("report", "measurement_counter_overflow");
+      cleanup();
+      return false;
+    }
+    if (!checked_add(measured_wal_bytes, ending_wal_bytes - starting_wal_bytes) ||
+        !checked_add(planned_wal_bytes, *planned_epoch_bytes)) {
+      report_wal_error("report", "wal_byte_plan_overflow");
+      cleanup();
+      return false;
+    }
+    ++epoch_count;
+    remaining_commands -= this_epoch_commands;
+  }
+
+  if (measured_commands != total_commands || measured_elapsed == 0U ||
+      samples.append_ns.empty() || !frame_plan_initialized ||
+      measured_wal_bytes != planned_wal_bytes) {
+    report_wal_error("report", "no_rotation_measurement_invalid");
+    cleanup();
+    return false;
+  }
+  std::sort(samples.append_ns.begin(), samples.append_ns.end());
+  const auto service_elapsed = samples.append.total_ns;
+  if (service_elapsed == 0U) {
+    report_wal_error("report", "service_elapsed_invalid");
+    cleanup();
+    return false;
+  }
+  const auto commands_per_second = static_cast<double>(measured_commands) * 1'000'000'000.0 /
+                                   static_cast<double>(measured_elapsed);
+  const auto service_commands_per_second =
+      static_cast<double>(measured_commands) * 1'000'000'000.0 /
+      static_cast<double>(service_elapsed);
+  const auto wal_mib_per_second = static_cast<double>(measured_wal_bytes) * 1'000'000'000.0 /
+                                  static_cast<double>(measured_elapsed) / (1024.0 * 1024.0);
+  const auto service_wal_mib_per_second =
+      static_cast<double>(measured_wal_bytes) * 1'000'000'000.0 /
+      static_cast<double>(service_elapsed) / (1024.0 * 1024.0);
+  const auto average_wal_bytes = static_cast<double>(measured_wal_bytes) /
+                                static_cast<double>(measured_commands);
+  const auto print_percentile = [](const std::vector<std::uint64_t>& values,
+                                   const std::size_t numerator,
+                                   const std::size_t denominator) {
+    return values.empty() ? std::string("na")
+                           : std::to_string(percentile_ns(values, numerator, denominator) /
+                                            1'000.0);
+  };
+  std::error_code path_error;
+  const auto resolved_path = std::filesystem::weakly_canonical(data_directory, path_error);
+  if (path_error) {
+    report_wal_error("report", "wal_path_resolution_failed", data_directory.string());
+    cleanup();
+    return false;
+  }
+  std::cout << "wal_append_no_rotation sync_mode=none completion_boundary=append_batch_return"
+            << " warmup_groups=" << options.warmup << " groups=" << measured_groups
+            << " group_size=" << options.wal_group_size
+            << " epochs=" << epoch_count
+            << " epoch_commands=" << epoch_commands
+            << " commands=" << measured_commands
+            << " commands_per_second=" << commands_per_second
+            << " workload_wall_commands_per_second=" << commands_per_second
+            << " service_commands_per_second=" << service_commands_per_second
+            << " target_commands_per_second=1000000"
+            << " target_attainment_percent=" << commands_per_second / 1'000'000.0 * 100.0
+            << " workload_wall_target_attainment_percent="
+            << commands_per_second / 1'000'000.0 * 100.0
+            << " service_target_attainment_percent="
+            << service_commands_per_second / 1'000'000.0 * 100.0
+            << " wal_mib_per_second=" << wal_mib_per_second
+            << " workload_wall_wal_mib_per_second=" << wal_mib_per_second
+            << " service_wal_mib_per_second=" << service_wal_mib_per_second
+            << " measured_rusage_valid="
+            << (measured_process_counters.rusage_valid ? "true" : "false")
+            << " measured_io_valid="
+            << (measured_process_counters.io_valid ? "true" : "false")
+            << " measured_meminfo_valid="
+            << (measured_process_counters.meminfo_valid ? "true" : "false")
+            << " measured_user_seconds=" << measured_process_counters.user_seconds
+            << " measured_system_seconds=" << measured_process_counters.system_seconds
+            << " measured_voluntary_context_switches="
+            << measured_process_counters.voluntary_context_switches
+            << " measured_involuntary_context_switches="
+            << measured_process_counters.involuntary_context_switches
+            << " measured_syscw="
+            << (measured_process_counters.io_valid
+                    ? std::to_string(measured_process_counters.syscw)
+                    : std::string("na"))
+            << " measured_wchar="
+            << (measured_process_counters.io_valid
+                    ? std::to_string(measured_process_counters.wchar)
+                    : std::string("na"))
+            << " measured_write_bytes="
+            << (measured_process_counters.io_valid
+                    ? std::to_string(measured_process_counters.write_bytes)
+                    : std::string("na"))
+            << " measured_cancelled_write_bytes="
+            << (measured_process_counters.io_valid
+                    ? std::to_string(measured_process_counters.cancelled_write_bytes)
+                    : std::string("na"))
+            << " average_wal_bytes_per_command=" << average_wal_bytes
+            << " latency_sample_stride=" << samples.sample_stride
+            << " append_latency_sample_count=" << samples.append_ns.size()
+            << " append_group_p50_us=" << print_percentile(samples.append_ns, 50, 100)
+            << " append_group_p99_us=" << print_percentile(samples.append_ns, 99, 100)
+            << " append_group_p99.9_us=" << print_percentile(samples.append_ns, 999, 1000)
+            << " append_group_max_us=" << samples.append.max_ns / 1'000.0
+            << " sync_samples=0 sync_latency_sample_count=0 sync_p50_us=na sync_p99_us=na sync_p99.9_us=na sync_max_us=na"
+            << " group_total_p50_us=na group_total_p99_us=na group_total_p99.9_us=na group_total_max_us=na"
+            << " elapsed_ms=" << measured_elapsed / 1'000'000.0
+            << " workload_wall_elapsed_ms=" << measured_elapsed / 1'000'000.0
+            << " service_elapsed_ms=" << service_elapsed / 1'000'000.0
+            << " wal_bytes_delta=" << measured_wal_bytes
+            << " wal_bytes=" << measured_wal_bytes
+            << " frame_bytes_per_command=" << frame_bytes_per_command
+            << " planned_wal_bytes_delta=" << planned_wal_bytes
+            << " wal_byte_plan_verified=true"
+            << " measured_wal_write_calls="
+            << (measured_process_counters.io_valid
+                    ? std::to_string(measured_process_counters.syscw)
+                    : std::string("na"))
+            << " measured_wal_sync_calls=0"
+            << " segment_size_bytes=" << kWalCeilingSegmentSize
+            << " segment_count_before=1 segment_count_after=1"
+            << " segment_id_before=" << segment_id_before
+            << " segment_id_after=" << segment_id_after
+            << " segment_offset_before=" << segment_offset_before
+            << " segment_offset_after=" << segment_offset_after
+            << " measured_segment_rotations=0 rotation_scope=no_rotation"
+            << " rotation_triggered=false"
+            << " measured_dirty_bytes_before="
+            << (measured_process_before.meminfo_valid
+                    ? std::to_string(measured_process_before.dirty_bytes)
+                    : std::string("na"))
+            << " measured_dirty_bytes_after="
+            << (measured_process_after.meminfo_valid
+                    ? std::to_string(measured_process_after.dirty_bytes)
+                    : std::string("na"))
+            << " measured_writeback_bytes_before="
+            << (measured_process_before.meminfo_valid
+                    ? std::to_string(measured_process_before.writeback_bytes)
+                    : std::string("na"))
+            << " measured_writeback_bytes_after="
+            << (measured_process_after.meminfo_valid
+                    ? std::to_string(measured_process_after.writeback_bytes)
+                    : std::string("na"))
+            << " actual_parallel_prepare_groups=" << prepare_parallel_groups
+            << " actual_prepare_tasks=" << prepare_tasks
+            << " wal_path=" << resolved_path << " replay_verified=true phase_profile=off\n";
+  cleanup();
+  return true;
+}
+
 bool run_wal_write_ceiling(const BenchmarkOptions& options) {
+  if (options.wal_rotation_diagnostic.has_value()) {
+    // The diagnostic is deliberately kept separate from both the no-rotation
+    // ceiling and the durable frontier.  Its measured window contains one
+    // profiled target group only.
+    const auto mode = *options.wal_rotation_diagnostic;
+    const auto mode_name = mode == WalRotationDiagnosticMode::control ? "control" : "trigger";
+    const auto run_id = std::to_string(
+                            std::chrono::steady_clock::now().time_since_epoch().count()) +
+                        "-" + std::to_string(static_cast<unsigned long long>(::getpid()));
+    const bool owned_data_directory = !options.data_directory.has_value();
+    const auto data_directory = options.data_directory.value_or(
+        std::filesystem::temp_directory_path() /
+        (std::string("order_books_benchmark_wal-rotation-") + mode_name + "-" + run_id));
+    if (const auto error = prepare_data_directory(data_directory); error.has_value()) {
+      report_wal_error("setup", *error, data_directory.string());
+      return false;
+    }
+    const auto cleanup = [&] {
+      if (owned_data_directory) {
+        std::error_code ignored;
+        std::filesystem::remove_all(data_directory, ignored);
+      }
+    };
+    auto wal_result = storage::Wal::open(
+        data_directory, 1, kWalCeilingSegmentSize,
+        storage::WalPrepareOptions{options.wal_prepare_workers,
+                                   options.wal_parallel_prepare_min_commands});
+    if (!std::holds_alternative<std::unique_ptr<storage::Wal>>(wal_result)) {
+      report_wal_error("open", "wal_open_failed",
+                       std::get<Error>(wal_result).message);
+      cleanup();
+      return false;
+    }
+    auto wal = std::get<std::unique_ptr<storage::Wal>>(std::move(wal_result));
+    const auto initial_wal_bytes = wal->size_bytes();
+    const auto initial_segments = inspect_wal_segments(data_directory);
+    if (!initial_segments.has_value() || initial_segments->count != 1U ||
+        initial_wal_bytes == 0U) {
+      report_wal_error("setup", "initial_segment_snapshot_invalid");
+      cleanup();
+      return false;
+    }
+
+    EngineSeq next_sequence = 1;
+    std::uint64_t warmup_remaining = options.warmup;
+    if (!run_wal_groups(*wal, options.warmup, 1U, WalSyncMode::none, next_sequence,
+                        warmup_remaining, "rotation_warmup", nullptr, false) ||
+        warmup_remaining != 0U) {
+      cleanup();
+      return false;
+    }
+    if (const auto status = wal->sync(); std::holds_alternative<Error>(status)) {
+      report_wal_error("rotation_warmup", "final_sync_failed",
+                       std::get<Error>(status).message);
+      cleanup();
+      return false;
+    }
+    const auto sequence_after_warmup = checked_sum(options.warmup, 1U);
+    if (!sequence_after_warmup.has_value() ||
+        *sequence_after_warmup > std::numeric_limits<EngineSeq>::max()) {
+      report_wal_error("rotation_setup", "sequence_overflow");
+      cleanup();
+      return false;
+    }
+    next_sequence = static_cast<EngineSeq>(*sequence_after_warmup);
+
+    const auto probe_start_bytes = wal->size_bytes();
+    const auto probe_start_segments = inspect_wal_segments(data_directory);
+    std::uint64_t probe_remaining = 1;
+    if (!run_wal_groups(*wal, 1U, 1U, WalSyncMode::none, next_sequence,
+                        probe_remaining, "rotation_setup", nullptr, false) ||
+        probe_remaining != 0U) {
+      cleanup();
+      return false;
+    }
+    const auto probe_end_bytes = wal->size_bytes();
+    const auto probe_end_segments = inspect_wal_segments(data_directory);
+    if (!probe_start_segments.has_value() || !probe_end_segments.has_value() ||
+        probe_end_segments->count != probe_start_segments->count ||
+        probe_end_bytes <= probe_start_bytes) {
+      report_wal_error("rotation_setup", "frame_size_probe_rotated");
+      cleanup();
+      return false;
+    }
+    const auto frame_bytes = probe_end_bytes - probe_start_bytes;
+    const auto setup_snapshot = probe_end_segments.value();
+    if (setup_snapshot.active_offset > kWalCeilingSegmentSize ||
+        frame_bytes > kWalCeilingSegmentSize) {
+      report_wal_error("rotation_setup", "frame_size_invalid");
+      cleanup();
+      return false;
+    }
+    const auto sequence_after_probe = checked_sum(*sequence_after_warmup, 1U);
+    if (!sequence_after_probe.has_value() ||
+        *sequence_after_probe > std::numeric_limits<EngineSeq>::max()) {
+      report_wal_error("rotation_setup", "sequence_overflow");
+      cleanup();
+      return false;
+    }
+    next_sequence = static_cast<EngineSeq>(*sequence_after_probe);
+    const auto available = kWalCeilingSegmentSize - setup_snapshot.active_offset;
+    std::uint64_t setup_fill_commands = 0;
+    if (mode == WalRotationDiagnosticMode::control) {
+      if (available < frame_bytes) {
+        report_wal_error("rotation_setup", "control_target_has_no_capacity");
+        cleanup();
+        return false;
+      }
+      setup_fill_commands = (available - frame_bytes) / frame_bytes;
+    } else {
+      setup_fill_commands = available / frame_bytes;
+    }
+    const auto target_sequence = checked_sum(*sequence_after_probe, setup_fill_commands);
+    if (!target_sequence.has_value() ||
+        *target_sequence > std::numeric_limits<EngineSeq>::max()) {
+      report_wal_error("rotation_setup", "sequence_overflow");
+      cleanup();
+      return false;
+    }
+
+    // Fill outside the measured boundary.  Large setup groups reduce the
+    // preparation overhead, while a final singleton handles the exact tail.
+    constexpr std::uint64_t kSetupGroupSize = 8'192U;
+    const auto large_groups = setup_fill_commands / kSetupGroupSize;
+    const auto tail_commands = setup_fill_commands % kSetupGroupSize;
+    std::uint64_t setup_remaining = setup_fill_commands;
+    if (!run_wal_groups(*wal, large_groups, kSetupGroupSize, WalSyncMode::none,
+                        next_sequence, setup_remaining, "rotation_setup", nullptr, false) ||
+        !run_wal_groups(*wal, tail_commands, 1U, WalSyncMode::none, next_sequence,
+                        setup_remaining, "rotation_setup", nullptr, false) ||
+        setup_remaining != 0U) {
+      cleanup();
+      return false;
+    }
+    next_sequence = static_cast<EngineSeq>(*target_sequence);
+    const auto before_target = inspect_wal_segments(data_directory);
+    if (!before_target.has_value()) {
+      report_wal_error("rotation_setup", "target_segment_snapshot_failed");
+      cleanup();
+      return false;
+    }
+    const auto target_available = kWalCeilingSegmentSize - before_target->active_offset;
+    const bool target_fits = target_available >= frame_bytes;
+    if ((mode == WalRotationDiagnosticMode::control && !target_fits) ||
+        (mode == WalRotationDiagnosticMode::trigger && target_fits)) {
+      report_wal_error("rotation_setup", "target_position_invalid");
+      cleanup();
+      return false;
+    }
+
+    WalGroupSamples samples;
+    samples.sample_stride = 1U;
+    samples.append_ns.reserve(1U);
+    samples.total_ns.reserve(1U);
+    samples.fixture_build_ns.reserve(1U);
+    samples.wal_append_call_ns.reserve(1U);
+    samples.lock_wait_ns.reserve(1U);
+    samples.prepare_ns.reserve(1U);
+    samples.prepare_task_ns.reserve(1U);
+    samples.plan_copy_ns.reserve(1U);
+    samples.rotation_ns.reserve(1U);
+    samples.rotation_sync_ns.reserve(1U);
+    samples.rotation_header_write_ns.reserve(1U);
+    samples.rotation_header_sync_ns.reserve(1U);
+    samples.rotation_directory_sync_ns.reserve(1U);
+    samples.write_ns.reserve(1U);
+    samples.publish_ns.reserve(1U);
+    const auto process_before = capture_process_counters();
+    const auto target_start_bytes = wal->size_bytes();
+    const auto target_start = std::chrono::steady_clock::now();
+    std::uint64_t target_remaining = 1;
+    if (!run_wal_groups(*wal, 1U, 1U, WalSyncMode::none, next_sequence,
+                        target_remaining, "rotation_measured", &samples, true) ||
+        target_remaining != 0U) {
+      cleanup();
+      return false;
+    }
+    const auto target_end = std::chrono::steady_clock::now();
+    const auto process_after = capture_process_counters();
+    const auto measured_counters = subtract_process_counters(process_after, process_before);
+    const auto after_target = inspect_wal_segments(data_directory);
+    if (!after_target.has_value()) {
+      report_wal_error("rotation_measured", "target_segment_snapshot_failed");
+      cleanup();
+      return false;
+    }
+    if (after_target->count < before_target->count) {
+      report_wal_error("rotation_measured", "segment_count_regressed");
+      cleanup();
+      return false;
+    }
+    const auto measured_rotations = after_target->count - before_target->count;
+    const auto expected_rotations = mode == WalRotationDiagnosticMode::control ? 0U : 1U;
+    if (measured_rotations != expected_rotations) {
+      report_wal_error("rotation_measured", "unexpected_rotation_count");
+      cleanup();
+      return false;
+    }
+    const auto target_end_bytes = wal->size_bytes();
+    if (target_end_bytes < target_start_bytes) {
+      report_wal_error("rotation_measured", "target_byte_snapshot_regressed");
+      cleanup();
+      return false;
+    }
+    const auto measured_wal_bytes = target_end_bytes - target_start_bytes;
+    const auto expected_target_bytes = checked_sum(
+        frame_bytes, expected_rotations == 0U ? 0U : initial_wal_bytes);
+    const auto expected_control_offset =
+        checked_sum(before_target->active_offset, frame_bytes);
+    const auto expected_trigger_offset = checked_sum(initial_wal_bytes, frame_bytes);
+    const auto expected_trigger_segments = checked_sum(before_target->count, 1U);
+    const bool position_verified =
+        expected_target_bytes.has_value() && expected_control_offset.has_value() &&
+        expected_trigger_offset.has_value() && expected_trigger_segments.has_value() &&
+        (mode == WalRotationDiagnosticMode::control
+             ? after_target->count == before_target->count &&
+                   after_target->active_engine_seq == before_target->active_engine_seq &&
+                   after_target->active_offset == *expected_control_offset
+             : after_target->count == *expected_trigger_segments &&
+                   after_target->active_engine_seq == *target_sequence &&
+                   after_target->active_offset == *expected_trigger_offset);
+    if (!position_verified) {
+      report_wal_error("rotation_measured", "rotation_target_position_mismatch");
+      cleanup();
+      return false;
+    }
+    if (measured_wal_bytes != *expected_target_bytes) {
+      report_wal_error("rotation_measured", "target_byte_plan_mismatch");
+      cleanup();
+      return false;
+    }
+    if (const auto status = wal->sync(); std::holds_alternative<Error>(status)) {
+      report_wal_error("rotation_finalize", "final_sync_failed",
+                       std::get<Error>(status).message);
+      cleanup();
+      return false;
+    }
+    wal.reset();
+    auto reopened_result = storage::Wal::open(
+        data_directory, 1, kWalCeilingSegmentSize,
+        storage::WalPrepareOptions{options.wal_prepare_workers,
+                                   options.wal_parallel_prepare_min_commands});
+    if (!std::holds_alternative<std::unique_ptr<storage::Wal>>(reopened_result)) {
+      report_wal_error("rotation_reopen", "wal_reopen_failed",
+                       std::get<Error>(reopened_result).message);
+      cleanup();
+      return false;
+    }
+    auto reopened = std::get<std::unique_ptr<storage::Wal>>(std::move(reopened_result));
+    const auto expected_records = static_cast<std::uint64_t>(options.warmup) +
+                                  2U + setup_fill_commands;
+    auto replayed_result = reopened->replay();
+    if (std::holds_alternative<Error>(replayed_result)) {
+      report_wal_error("rotation_replay", "wal_replay_failed",
+                       std::get<Error>(replayed_result).message);
+      cleanup();
+      return false;
+    }
+    if (!validate_wal_replay(
+            std::get<std::vector<domain::CommittedCommand>>(replayed_result),
+            expected_records)) {
+      cleanup();
+      return false;
+    }
+    std::sort(samples.append_ns.begin(), samples.append_ns.end());
+    std::sort(samples.total_ns.begin(), samples.total_ns.end());
+    std::sort(samples.rotation_ns.begin(), samples.rotation_ns.end());
+    std::sort(samples.rotation_sync_ns.begin(), samples.rotation_sync_ns.end());
+    std::sort(samples.rotation_header_write_ns.begin(), samples.rotation_header_write_ns.end());
+    std::sort(samples.rotation_header_sync_ns.begin(), samples.rotation_header_sync_ns.end());
+    std::sort(samples.rotation_directory_sync_ns.begin(),
+              samples.rotation_directory_sync_ns.end());
+    const auto print_one = [](const std::vector<std::uint64_t>& values,
+                              const std::uint64_t fallback) {
+      return values.empty() ? std::to_string(fallback / 1'000.0)
+                            : std::to_string(values.front() / 1'000.0);
+    };
+    const auto measured_elapsed = elapsed_ns(target_start, target_end);
+    std::cout << "wal_rotation_diagnostic case=" << mode_name
+              << " sync_mode=none completion_boundary=append_batch_return"
+              << " warmup_commands=" << options.warmup
+              << " setup_fill_commands=" << setup_fill_commands
+              << " groups=1 group_size=1 commands=1"
+              << " commands_per_second="
+              << (measured_elapsed == 0U ? 0.0 : 1'000'000'000.0 / measured_elapsed)
+              << " elapsed_ms=" << measured_elapsed / 1'000'000.0
+              << " workload_wall_elapsed_ms=" << measured_elapsed / 1'000'000.0
+              << " service_elapsed_ms=" << samples.total.total_ns / 1'000'000.0
+              << " latency_sample_stride=1 append_latency_sample_count="
+              << samples.append_ns.size()
+              << " sync_samples=0 sync_latency_sample_count=0"
+              << " append_group_p50_us=" << print_one(samples.append_ns, samples.append.max_ns)
+              << " append_group_p99_us=" << print_one(samples.append_ns, samples.append.max_ns)
+              << " append_group_p99.9_us=" << print_one(samples.append_ns, samples.append.max_ns)
+              << " append_group_max_us=" << samples.append.max_ns / 1'000.0
+              << " measured_rusage_valid=" << (measured_counters.rusage_valid ? "true" : "false")
+              << " measured_io_valid=" << (measured_counters.io_valid ? "true" : "false")
+              << " measured_meminfo_valid="
+              << (measured_counters.meminfo_valid ? "true" : "false")
+              << " measured_user_seconds=" << measured_counters.user_seconds
+              << " measured_system_seconds=" << measured_counters.system_seconds
+              << " measured_voluntary_context_switches="
+              << measured_counters.voluntary_context_switches
+              << " measured_involuntary_context_switches="
+              << measured_counters.involuntary_context_switches
+              << " measured_syscw="
+              << (measured_counters.io_valid ? std::to_string(measured_counters.syscw)
+                                              : std::string("na"))
+              << " measured_wchar="
+              << (measured_counters.io_valid ? std::to_string(measured_counters.wchar)
+                                              : std::string("na"))
+              << " measured_write_bytes="
+              << (measured_counters.io_valid ? std::to_string(measured_counters.write_bytes)
+                                              : std::string("na"))
+              << " measured_cancelled_write_bytes="
+              << (measured_counters.io_valid
+                      ? std::to_string(measured_counters.cancelled_write_bytes)
+                      : std::string("na"))
+              << " measured_dirty_bytes_before="
+              << (process_before.meminfo_valid ? std::to_string(process_before.dirty_bytes)
+                                                : std::string("na"))
+              << " measured_dirty_bytes_after="
+              << (process_after.meminfo_valid ? std::to_string(process_after.dirty_bytes)
+                                               : std::string("na"))
+              << " measured_writeback_bytes_before="
+              << (process_before.meminfo_valid ? std::to_string(process_before.writeback_bytes)
+                                                : std::string("na"))
+              << " measured_writeback_bytes_after="
+              << (process_after.meminfo_valid ? std::to_string(process_after.writeback_bytes)
+                                               : std::string("na"))
+              << " measured_wal_write_calls="
+              << (measured_counters.io_valid ? std::to_string(measured_counters.syscw)
+                                              : std::string("na"))
+              << " measured_wal_sync_calls=0"
+              << " segment_size_bytes=" << kWalCeilingSegmentSize
+              << " measured_segment_rotations=" << measured_rotations
+              << " rotation_triggered=" << (measured_rotations == 1U ? "true" : "false")
+              << " rotation_scope=rotation_inclusive"
+              << " segment_id_before=" << before_target->active_engine_seq
+              << " segment_id_after=" << after_target->active_engine_seq
+              << " target_sequence=" << *target_sequence
+              << " segment_offset_before=" << before_target->active_offset
+              << " segment_offset_after=" << after_target->active_offset
+              << " wal_bytes_delta=" << measured_wal_bytes
+              << " frame_bytes_per_command=" << frame_bytes
+              << " segment_header_bytes=" << initial_wal_bytes
+              << " planned_wal_bytes_delta=" << *expected_target_bytes
+              << " wal_byte_plan_verified=true"
+              << " wal_path=" << data_directory
+              << " replay_verified=true phase_profile=on"
+              << " profiled_groups=" << samples.profiled_groups
+              << " profiled_commands=" << samples.profiled_commands
+              << " profiled_data_write_calls=" << samples.profiled_data_write_calls
+              << " wal_prepare_group_total_us=" << samples.prepare.total_ns / 1'000.0
+              << " wal_plan_copy_group_total_us=" << samples.plan_copy.total_ns / 1'000.0
+              << " wal_write_group_total_us=" << samples.write.total_ns / 1'000.0
+              << " wal_publish_group_total_us=" << samples.publish.total_ns / 1'000.0
+              << " wal_rotation_group_total_us=" << samples.rotation.total_ns / 1'000.0
+              << " rotation_sync_total_us=" << samples.rotation_sync.total_ns / 1'000.0
+              << " rotation_header_write_total_us="
+              << samples.rotation_header_write.total_ns / 1'000.0
+              << " rotation_header_sync_total_us="
+              << samples.rotation_header_sync.total_ns / 1'000.0
+              << " rotation_directory_sync_total_us="
+              << samples.rotation_directory_sync.total_ns / 1'000.0 << '\n';
+    cleanup();
+    return true;
+  }
+  if (options.wal_no_rotation_epoch_commands != 0U) {
+    return run_wal_write_ceiling_no_rotation(options);
+  }
   if (options.wal_group_size == 0 ||
       options.wal_group_size > std::numeric_limits<std::size_t>::max()) {
     report_wal_error("setup", "invalid_group_size");
@@ -1039,33 +2156,42 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
     return false;
   }
   const auto starting_wal_bytes = wal->size_bytes();
-  const auto starting_segment_count = count_wal_segments(data_directory);
-  if (!starting_segment_count.has_value()) {
-    report_wal_error("warmup", "segment_count_failed", data_directory.string());
+  const auto starting_segments = inspect_wal_segments(data_directory);
+  if (!starting_segments.has_value()) {
+    report_wal_error("warmup", "segment_snapshot_failed", data_directory.string());
     cleanup();
     return false;
   }
   const auto prepare_stats_before_measured = wal->prepare_stats();
+  const auto process_counters_before_measured = capture_process_counters();
 
   WalGroupSamples samples;
-  if (options.iterations <= std::numeric_limits<std::size_t>::max()) {
-    const auto sample_count = static_cast<std::size_t>(options.iterations);
-    samples.append_ns.reserve(sample_count);
-    samples.total_ns.reserve(sample_count);
-    if (options.wal_sync_mode == WalSyncMode::per_group) {
-      samples.sync_ns.reserve(sample_count);
-    }
-    if (options.wal_phase_profile == WalPhaseProfileMode::on) {
-      samples.fixture_build_ns.reserve(sample_count);
-      samples.wal_append_call_ns.reserve(sample_count);
-      samples.lock_wait_ns.reserve(sample_count);
-      samples.prepare_ns.reserve(sample_count);
-      samples.prepare_task_ns.reserve(sample_count);
-      samples.plan_copy_ns.reserve(sample_count);
-      samples.rotation_ns.reserve(sample_count);
-      samples.write_ns.reserve(sample_count);
-      samples.publish_ns.reserve(sample_count);
-    }
+  samples.sample_stride = latency_sample_stride(options.iterations);
+  const auto sample_count = options.iterations / samples.sample_stride +
+                            (options.iterations % samples.sample_stride == 0U ? 0U : 1U);
+  const auto sample_capacity = static_cast<std::size_t>(sample_count);
+  samples.append_ns.reserve(sample_capacity);
+  if (options.wal_sync_mode == WalSyncMode::per_group ||
+      options.wal_phase_profile == WalPhaseProfileMode::on) {
+    samples.total_ns.reserve(sample_capacity);
+  }
+  if (options.wal_sync_mode == WalSyncMode::per_group) {
+    samples.sync_ns.reserve(sample_capacity);
+  }
+  if (options.wal_phase_profile == WalPhaseProfileMode::on) {
+    samples.fixture_build_ns.reserve(sample_capacity);
+    samples.wal_append_call_ns.reserve(sample_capacity);
+    samples.lock_wait_ns.reserve(sample_capacity);
+    samples.prepare_ns.reserve(sample_capacity);
+    samples.prepare_task_ns.reserve(sample_capacity);
+    samples.plan_copy_ns.reserve(sample_capacity);
+    samples.rotation_ns.reserve(sample_capacity);
+    samples.rotation_sync_ns.reserve(sample_capacity);
+    samples.rotation_header_write_ns.reserve(sample_capacity);
+    samples.rotation_header_sync_ns.reserve(sample_capacity);
+    samples.rotation_directory_sync_ns.reserve(sample_capacity);
+    samples.write_ns.reserve(sample_capacity);
+    samples.publish_ns.reserve(sample_capacity);
   }
   const auto measured_start = std::chrono::steady_clock::now();
   if (!run_wal_groups(*wal, options.iterations, options.wal_group_size,
@@ -1076,6 +2202,9 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
     return false;
   }
   const auto measured_end = std::chrono::steady_clock::now();
+  const auto process_counters_after_measured = capture_process_counters();
+  const auto measured_process_counters = subtract_process_counters(
+      process_counters_after_measured, process_counters_before_measured);
   const auto prepare_stats_after_measured = wal->prepare_stats();
   const auto actual_prepare_stats =
       prepare_stats_delta(prepare_stats_before_measured, prepare_stats_after_measured);
@@ -1085,10 +2214,10 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
     return false;
   }
   const auto ending_wal_bytes = wal->size_bytes();
-  const auto ending_segment_count = count_wal_segments(data_directory);
-  if (!ending_segment_count.has_value() || *ending_segment_count < *starting_segment_count ||
+  const auto ending_segments = inspect_wal_segments(data_directory);
+  if (!ending_segments.has_value() || ending_segments->count < starting_segments->count ||
       ending_wal_bytes < starting_wal_bytes) {
-    report_wal_error("measured", "wal_observation_failed", data_directory.string());
+    report_wal_error("measured", "wal_observation_snapshot_failed", data_directory.string());
     cleanup();
     return false;
   }
@@ -1137,6 +2266,16 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
     return false;
   }
   const auto measured_elapsed = elapsed_ns(measured_start, measured_end);
+  const auto service_elapsed_value =
+      options.wal_sync_mode == WalSyncMode::none
+          ? samples.append.total_ns
+          : samples.total.total_ns;
+  if (service_elapsed_value == 0U) {
+    report_wal_error("report", "service_elapsed_invalid");
+    cleanup();
+    return false;
+  }
+  const auto service_elapsed = service_elapsed_value;
   const auto wal_bytes_delta = ending_wal_bytes - starting_wal_bytes;
   const auto commands_per_second = measured_elapsed == 0
                                        ? 0.0
@@ -1144,19 +2283,31 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
                                              static_cast<double>(options.wal_group_size) *
                                              1'000'000'000.0 /
                                              static_cast<double>(measured_elapsed);
-  const auto wal_mib_per_second = measured_elapsed == 0
-                                      ? 0.0
-                                      : static_cast<double>(wal_bytes_delta) *
-                                            1'000'000'000.0 /
-                                            static_cast<double>(measured_elapsed) /
-                                            (1024.0 * 1024.0);
+  const auto workload_wall_wal_mib_per_second = measured_elapsed == 0
+                                                    ? 0.0
+                                                    : static_cast<double>(wal_bytes_delta) *
+                                                          1'000'000'000.0 /
+                                                          static_cast<double>(measured_elapsed) /
+                                                          (1024.0 * 1024.0);
+  const auto service_commands_per_second =
+      static_cast<double>(options.iterations) * static_cast<double>(options.wal_group_size) *
+      1'000'000'000.0 / static_cast<double>(service_elapsed);
+  const auto service_wal_mib_per_second =
+      static_cast<double>(wal_bytes_delta) * 1'000'000'000.0 /
+      static_cast<double>(service_elapsed) / (1024.0 * 1024.0);
+  // Keep the historical headline fields tied to process wall time.  The
+  // component runner consumes the explicitly named service fields below, so
+  // wall and service rates cannot be mixed accidentally.
+  const auto wal_mib_per_second = workload_wall_wal_mib_per_second;
   const auto target_attainment = commands_per_second / 1'000'000.0 * 100.0;
+  const auto service_target_attainment = service_commands_per_second / 1'000'000.0 * 100.0;
+  const auto workload_wall_target_attainment = commands_per_second / 1'000'000.0 * 100.0;
   const auto average_wal_bytes = options.iterations == 0 || options.wal_group_size == 0
                                      ? 0.0
                                      : static_cast<double>(wal_bytes_delta) /
                                            (static_cast<double>(options.iterations) *
                                             static_cast<double>(options.wal_group_size));
-  const auto measured_rotations = *ending_segment_count - *starting_segment_count;
+  const auto measured_rotations = ending_segments->count - starting_segments->count;
   std::sort(samples.append_ns.begin(), samples.append_ns.end());
   std::sort(samples.sync_ns.begin(), samples.sync_ns.end());
   std::sort(samples.total_ns.begin(), samples.total_ns.end());
@@ -1168,6 +2319,11 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
     std::sort(samples.prepare_task_ns.begin(), samples.prepare_task_ns.end());
     std::sort(samples.plan_copy_ns.begin(), samples.plan_copy_ns.end());
     std::sort(samples.rotation_ns.begin(), samples.rotation_ns.end());
+    std::sort(samples.rotation_sync_ns.begin(), samples.rotation_sync_ns.end());
+    std::sort(samples.rotation_header_write_ns.begin(), samples.rotation_header_write_ns.end());
+    std::sort(samples.rotation_header_sync_ns.begin(), samples.rotation_header_sync_ns.end());
+    std::sort(samples.rotation_directory_sync_ns.begin(),
+              samples.rotation_directory_sync_ns.end());
     std::sort(samples.write_ns.begin(), samples.write_ns.end());
     std::sort(samples.publish_ns.begin(), samples.publish_ns.end());
   };
@@ -1176,15 +2332,17 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
     const auto expected_commands = options.iterations * options.wal_group_size;
     if (samples.profiled_groups != options.iterations ||
         samples.profiled_commands != expected_commands ||
-        samples.fixture_build_ns.size() != options.iterations ||
-        samples.wal_append_call_ns.size() != options.iterations ||
-        samples.lock_wait_ns.size() != options.iterations ||
-        samples.prepare_ns.size() != options.iterations ||
-        samples.prepare_task_ns.size() != options.iterations ||
-        samples.plan_copy_ns.size() != options.iterations ||
-        samples.rotation_ns.size() > options.iterations ||
-        samples.write_ns.size() != options.iterations ||
-        samples.publish_ns.size() != options.iterations ||
+        samples.append.observed != options.iterations ||
+        samples.total.observed != options.iterations ||
+        samples.fixture_build.observed != options.iterations ||
+        samples.wal_append_call.observed != options.iterations ||
+        samples.lock_wait.observed != options.iterations ||
+        samples.prepare.observed != options.iterations ||
+        samples.prepare_task.observed != options.iterations ||
+        samples.plan_copy.observed != options.iterations ||
+        samples.rotation.observed > options.iterations ||
+        samples.write.observed != options.iterations ||
+        samples.publish.observed != options.iterations ||
         samples.profiled_rotations != measured_rotations ||
         samples.profiled_frame_bytes > wal_bytes_delta) {
       report_wal_error("report", "profile_counter_mismatch");
@@ -1218,14 +2376,14 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
   const auto print_profile_percentiles = [&print_percentile](
                                              const std::string_view name,
                                              const std::vector<std::uint64_t>& values,
-                                             const std::uint64_t total_ns) {
-    std::cout << ' ' << name << "_total_us=" << total_ns / 1'000.0
+                                             const LatencyAggregate& aggregate) {
+    std::cout << ' ' << name << "_total_us=" << aggregate.total_ns / 1'000.0
               << ' ' << name << "_p50_us=" << print_percentile(values, 50, 100)
               << ' ' << name << "_p99_us=" << print_percentile(values, 99, 100)
               << ' ' << name << "_p99.9_us=" << print_percentile(values, 999, 1000)
               << ' ' << name << "_max_us="
-              << (values.empty() ? std::string("na")
-                                  : std::to_string(values.back() / 1'000.0));
+              << (aggregate.observed == 0U ? std::string("na")
+                                            : std::to_string(aggregate.max_ns / 1'000.0));
   };
   std::optional<std::uint64_t> profile_denominator;
   std::optional<std::uint64_t> profile_unattributed;
@@ -1274,7 +2432,7 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
   };
   std::cout << "wal_write_ceiling sync_mode=" << wal_sync_mode_name(options.wal_sync_mode)
             << " completion_boundary="
-            << (options.wal_sync_mode == WalSyncMode::none ? "append_return" : "group_fsync")
+            << (options.wal_sync_mode == WalSyncMode::none ? "append_batch_return" : "group_fsync")
             << " warmup_groups=" << options.warmup << " groups=" << options.iterations
             << " group_size=" << options.wal_group_size
             << " wal_prepare_workers=" << options.wal_prepare_workers
@@ -1284,36 +2442,108 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
             << " actual_prepare_tasks=" << actual_prepare_stats->tasks
             << " commands=" << options.iterations * options.wal_group_size
             << " commands_per_second=" << commands_per_second
+            << " workload_wall_commands_per_second=" << commands_per_second
+            << " service_commands_per_second=" << service_commands_per_second
             << " target_commands_per_second=1000000"
             << " target_attainment_percent=" << target_attainment
+            << " workload_wall_target_attainment_percent="
+            << workload_wall_target_attainment
+            << " service_target_attainment_percent=" << service_target_attainment
             << " wal_mib_per_second=" << wal_mib_per_second
+            << " workload_wall_wal_mib_per_second=" << workload_wall_wal_mib_per_second
+            << " service_wal_mib_per_second=" << service_wal_mib_per_second
+            << " measured_rusage_valid="
+            << (measured_process_counters.rusage_valid ? "true" : "false")
+            << " measured_io_valid="
+            << (measured_process_counters.io_valid ? "true" : "false")
+            << " measured_meminfo_valid="
+            << (measured_process_counters.meminfo_valid ? "true" : "false")
+            << " measured_user_seconds=" << measured_process_counters.user_seconds
+            << " measured_system_seconds=" << measured_process_counters.system_seconds
+            << " measured_voluntary_context_switches="
+            << measured_process_counters.voluntary_context_switches
+            << " measured_involuntary_context_switches="
+            << measured_process_counters.involuntary_context_switches
+            << " measured_syscw="
+            << (measured_process_counters.io_valid
+                    ? std::to_string(measured_process_counters.syscw)
+                    : std::string("na"))
+            << " measured_write_bytes="
+            << (measured_process_counters.io_valid
+                    ? std::to_string(measured_process_counters.write_bytes)
+                    : std::string("na"))
+            << " measured_cancelled_write_bytes="
+            << (measured_process_counters.io_valid
+                    ? std::to_string(measured_process_counters.cancelled_write_bytes)
+                    : std::string("na"))
             << " average_wal_bytes_per_command=" << average_wal_bytes
+            << " latency_sample_stride=" << samples.sample_stride
+            << " append_latency_sample_count=" << samples.append_ns.size()
             << " append_group_p50_us="
             << print_percentile(samples.append_ns, 50, 100)
             << " append_group_p99_us=" << print_percentile(samples.append_ns, 99, 100)
             << " append_group_p99.9_us=" << print_percentile(samples.append_ns, 999, 1000)
             << " append_group_max_us="
-            << (samples.append_ns.empty() ? std::string("na")
-                                           : std::to_string(samples.append_ns.back() / 1'000.0))
-            << " sync_samples=" << samples.sync_ns.size()
+            << (samples.append.observed == 0U ? std::string("na")
+                                               : std::to_string(samples.append.max_ns / 1'000.0))
+            << " sync_samples=" << samples.sync.observed
+            << " sync_latency_sample_count=" << samples.sync_ns.size()
             << " sync_p50_us=" << print_percentile(samples.sync_ns, 50, 100)
             << " sync_p99_us=" << print_percentile(samples.sync_ns, 99, 100)
             << " sync_p99.9_us=" << print_percentile(samples.sync_ns, 999, 1000)
             << " sync_max_us="
-            << (samples.sync_ns.empty() ? std::string("na")
-                                         : std::to_string(samples.sync_ns.back() / 1'000.0))
+            << (samples.sync.observed == 0U ? std::string("na")
+                                             : std::to_string(samples.sync.max_ns / 1'000.0))
+            << " group_total_latency_sample_count=" << samples.total_ns.size()
             << " group_total_p50_us=" << print_percentile(samples.total_ns, 50, 100)
             << " group_total_p99_us=" << print_percentile(samples.total_ns, 99, 100)
             << " group_total_p99.9_us=" << print_percentile(samples.total_ns, 999, 1000)
             << " group_total_max_us="
-            << (samples.total_ns.empty() ? std::string("na")
-                                         : std::to_string(samples.total_ns.back() / 1'000.0))
+            << (samples.total.observed == 0U ? std::string("na")
+                                              : std::to_string(samples.total.max_ns / 1'000.0))
+            << " measured_wchar="
+            << (measured_process_counters.io_valid
+                    ? std::to_string(measured_process_counters.wchar)
+                    : std::string("na"))
+            << " measured_dirty_bytes_after="
+            << (measured_process_counters.meminfo_valid
+                    ? std::to_string(measured_process_counters.dirty_bytes)
+                    : std::string("na"))
+            << " measured_writeback_bytes_after="
+            << (measured_process_counters.meminfo_valid
+                    ? std::to_string(measured_process_counters.writeback_bytes)
+                    : std::string("na"))
             << " elapsed_ms=" << measured_elapsed / 1'000'000.0
+            << " workload_wall_elapsed_ms=" << measured_elapsed / 1'000'000.0
+            << " service_elapsed_ms=" << service_elapsed / 1'000'000.0
             << " wal_bytes_delta=" << wal_bytes_delta
             << " wal_bytes=" << ending_wal_bytes
+            << " measured_wal_write_calls="
+            << (measured_process_counters.io_valid
+                    ? std::to_string(measured_process_counters.syscw)
+                    : std::string("na"))
+            << " measured_wal_sync_calls=" << samples.sync.observed
+            << " measured_dirty_bytes_before="
+            << (process_counters_before_measured.meminfo_valid
+                    ? std::to_string(process_counters_before_measured.dirty_bytes)
+                    : std::string("na"))
+            << " measured_writeback_bytes_before="
+            << (process_counters_before_measured.meminfo_valid
+                    ? std::to_string(process_counters_before_measured.writeback_bytes)
+                    : std::string("na"))
             << " segment_size_bytes=" << kWalCeilingSegmentSize
-            << " segment_count=" << *ending_segment_count
+            << " segment_count=" << ending_segments->count
             << " measured_segment_rotations=" << measured_rotations
+            << " rotation_scope=rotation_inclusive"
+            << " rotation_triggered=" << (measured_rotations == 0U ? "false" : "true")
+            << " segment_count_before=" << starting_segments->count
+            << " segment_count_after=" << ending_segments->count
+            << " segment_id_before=" << starting_segments->active_engine_seq
+            << " segment_id_after=" << ending_segments->active_engine_seq
+            << " segment_offset_before=" << starting_segments->active_offset
+            << " segment_offset_after=" << ending_segments->active_offset
+            << " wal_bytes_before=" << starting_wal_bytes
+            << " wal_bytes_after=" << ending_wal_bytes
             << " wal_path=" << resolved_path << " replay_verified=true"
             << " phase_profile="
             << (options.wal_phase_profile == WalPhaseProfileMode::on ? "on" : "off");
@@ -1332,17 +2562,28 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
               << " sync_total_us=" << totals.sync / 1'000.0
               << " group_total_us=" << totals.group_total / 1'000.0;
     print_profile_percentiles("fixture_build_group", samples.fixture_build_ns,
-                              totals.fixture_build);
+                              samples.fixture_build);
     print_profile_percentiles("wal_append_call_group", samples.wal_append_call_ns,
-                              totals.wal_append_call);
-    print_profile_percentiles("wal_lock_wait_group", samples.lock_wait_ns, totals.lock_wait);
-    print_profile_percentiles("wal_prepare_group", samples.prepare_ns, totals.prepare);
+                              samples.wal_append_call);
+    print_profile_percentiles("wal_lock_wait_group", samples.lock_wait_ns, samples.lock_wait);
+    print_profile_percentiles("wal_prepare_group", samples.prepare_ns, samples.prepare);
     print_profile_percentiles("wal_prepare_task_group", samples.prepare_task_ns,
-                              totals.prepare_task);
-    print_profile_percentiles("wal_plan_copy_group", samples.plan_copy_ns, totals.plan_copy);
-    print_profile_percentiles("wal_rotation_group", samples.rotation_ns, totals.rotation);
-    print_profile_percentiles("wal_write_group", samples.write_ns, totals.write);
-    print_profile_percentiles("wal_publish_group", samples.publish_ns, totals.publish);
+                              samples.prepare_task);
+    print_profile_percentiles("wal_plan_copy_group", samples.plan_copy_ns, samples.plan_copy);
+    print_profile_percentiles("wal_rotation_group", samples.rotation_ns, samples.rotation);
+    print_profile_percentiles("wal_rotation_sync_group", samples.rotation_sync_ns,
+                              samples.rotation_sync);
+    print_profile_percentiles("wal_rotation_header_write_group",
+                              samples.rotation_header_write_ns,
+                              samples.rotation_header_write);
+    print_profile_percentiles("wal_rotation_header_sync_group",
+                              samples.rotation_header_sync_ns,
+                              samples.rotation_header_sync);
+    print_profile_percentiles("wal_rotation_directory_sync_group",
+                              samples.rotation_directory_sync_ns,
+                              samples.rotation_directory_sync);
+    print_profile_percentiles("wal_write_group", samples.write_ns, samples.write);
+    print_profile_percentiles("wal_publish_group", samples.publish_ns, samples.publish);
     std::cout << " lock_wait_share_percent="
               << share_percent(totals.lock_wait, denominator)
               << " prepare_share_percent="
@@ -1351,6 +2592,14 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
               << share_percent(totals.plan_copy, denominator)
               << " rotation_share_percent="
               << share_percent(totals.rotation, denominator)
+              << " rotation_sync_total_us="
+              << totals.rotation_sync / 1'000.0
+              << " rotation_header_write_total_us="
+              << totals.rotation_header_write / 1'000.0
+              << " rotation_header_sync_total_us="
+              << totals.rotation_header_sync / 1'000.0
+              << " rotation_directory_sync_total_us="
+              << totals.rotation_directory_sync / 1'000.0
               << " write_share_percent="
               << share_percent(totals.write, denominator)
               << " publish_share_percent="
@@ -1878,7 +3127,9 @@ void print_usage() {
                "[--workload=all|engine_durable_single_instrument|wal_write_ceiling|"
                "engine_pipeline_ceiling|engine_writer_hot_path_profile] [--data-dir=PATH] "
                "[--wal-group-size=N] "
+               "[--wal-no-rotation-epoch-commands=N] "
                "[--wal-sync=none|per_group] [--wal-phase-profile=off|on] "
+               "[--wal-rotation-diagnostic=control|trigger] "
                "[--writer-phase-profile=off|on] [--writer-profile-sample-every=N] "
                "[--writer-apply-subprofile=off|on] "
                "[--engine-group-size=N] "
@@ -1886,6 +3137,8 @@ void print_usage() {
                "[--wal-prepare-workers=1|2|4] "
                "[--wal-parallel-prepare-min-commands=N] "
                "[--pipeline-stage=STAGE] "
+               "[--pipeline-command-scenario=new_crossing_pair|new_resting_cancel|"
+               "amend_quantity|replace_order] "
                "[--pipeline-batch-size=N] [--pipeline-active-orders=N] "
                "[--pipeline-producer-lanes=N] "
                "[--publisher-cursor-persist-max-commands=N] "
@@ -1927,6 +3180,18 @@ int main(const int argc, char** argv) {
     print_usage();
     return 2;
   }
+  if (options->wal_rotation_diagnostic_parse_error) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=wal_rotation_diagnostic_invalid\n";
+    print_usage();
+    return 2;
+  }
+  if (options->wal_no_rotation_epoch_parse_error) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=wal_no_rotation_epoch_commands_invalid\n";
+    print_usage();
+    return 2;
+  }
   if (options->writer_phase_profile_parse_error) {
     std::cerr << "workload=" << workload_name(options->workload)
               << " phase=cli error_code=writer_phase_profile_invalid\n";
@@ -1955,6 +3220,12 @@ int main(const int argc, char** argv) {
   if (options->engine_tail_state_sampling_parse_error) {
     std::cerr << "workload=" << workload_name(options->workload)
               << " phase=cli error_code=engine_tail_state_sampling_invalid\n";
+    print_usage();
+    return 2;
+  }
+  if (options->pipeline_command_scenario_parse_error) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=pipeline_command_scenario_invalid\n";
     print_usage();
     return 2;
   }
@@ -2014,6 +3285,14 @@ int main(const int argc, char** argv) {
     print_usage();
     return 2;
   }
+  if (options->workload == WorkloadSelection::engine_pipeline_ceiling &&
+      options->pipeline_stage == benchmark::PipelineStage::state_machine &&
+      options->pipeline_batch_size % 2U != 0U) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=batch_size_must_be_even\n";
+    print_usage();
+    return 2;
+  }
   if (options->pipeline_producer_lanes == 0) {
     std::cerr << "workload=" << workload_name(options->workload)
               << " phase=cli error_code=pipeline_producer_lanes_must_be_positive\n";
@@ -2044,6 +3323,37 @@ int main(const int argc, char** argv) {
       options->workload != WorkloadSelection::wal_write_ceiling) {
     std::cerr << "workload=" << workload_name(options->workload)
               << " phase=cli error_code=wal_phase_profile_requires_wal_workload\n";
+    print_usage();
+    return 2;
+  }
+  if (options->wal_no_rotation_epoch_option_set &&
+      options->workload != WorkloadSelection::wal_write_ceiling) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=wal_no_rotation_epoch_requires_wal_workload\n";
+    print_usage();
+    return 2;
+  }
+  if (options->wal_no_rotation_epoch_commands != 0U &&
+      options->wal_sync_mode != WalSyncMode::none) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=wal_no_rotation_epoch_requires_sync_none\n";
+    print_usage();
+    return 2;
+  }
+  if (options->wal_rotation_diagnostic_option_set &&
+      options->workload != WorkloadSelection::wal_write_ceiling) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=wal_rotation_diagnostic_requires_wal_workload\n";
+    print_usage();
+    return 2;
+  }
+  if (options->wal_rotation_diagnostic.has_value() &&
+      (options->wal_group_size != 1U || options->iterations != 1U ||
+       options->wal_sync_mode != WalSyncMode::none ||
+       options->wal_phase_profile != WalPhaseProfileMode::on ||
+       options->wal_no_rotation_epoch_commands != 0U)) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=wal_rotation_diagnostic_requires_b1_profiled_single_group\n";
     print_usage();
     return 2;
   }
@@ -2156,6 +3466,7 @@ int main(const int argc, char** argv) {
         options->pipeline_producer_lanes,
         options->publisher_cursor_persist_max_commands,
         options->publisher_cursor_persist_max_delay,
+        options->pipeline_command_scenario,
         options->data_directory,
     };
     return benchmark::run_pipeline_ceiling(pipeline_options, options->pipeline_stage) ? 0 : 1;

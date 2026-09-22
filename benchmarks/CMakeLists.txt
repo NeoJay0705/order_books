@@ -5,6 +5,23 @@ add_executable(order_books_benchmark
   pipeline_ceiling_benchmark.cpp
 )
 
+if(BUILD_TESTING)
+  add_executable(order_books_wal_latency_sampler_test
+    wal_latency_sampler_test.cpp
+  )
+  set_target_properties(order_books_wal_latency_sampler_test PROPERTIES
+    CXX_EXTENSIONS OFF
+  )
+  target_link_libraries(order_books_wal_latency_sampler_test
+    PRIVATE
+      order_books::project_options
+  )
+  add_test(
+    NAME order_books_benchmark_wal_latency_sampler
+    COMMAND $<TARGET_FILE:order_books_wal_latency_sampler_test>
+  )
+endif()
+
 find_program(ENGINE_WRITER_DIAGNOSTICS_BASH bash)
 
 set_target_properties(order_books_benchmark PROPERTIES
@@ -22,6 +39,58 @@ target_link_libraries(order_books_benchmark
 )
 
 if(BUILD_TESTING)
+  foreach(scenario IN ITEMS new_crossing_pair new_resting_cancel amend_quantity replace_order)
+    if(scenario STREQUAL "new_crossing_pair")
+      set(expected_scenario_results "trades=2.*events=8")
+      set(expected_active_orders "active_orders=0")
+    else()
+      set(expected_scenario_results "trades=0.*events=4")
+      if(scenario STREQUAL "new_resting_cancel")
+        set(expected_active_orders "active_orders=0")
+      else()
+        set(expected_active_orders "active_orders=1")
+      endif()
+    endif()
+    add_test(
+      NAME "order_books_benchmark_pipeline_state_machine_${scenario}"
+      COMMAND $<TARGET_FILE:order_books_benchmark>
+              --workload=engine_pipeline_ceiling
+              --pipeline-stage=state_machine
+              --pipeline-command-scenario=${scenario}
+              --pipeline-batch-size=2
+              --pipeline-active-orders=0
+              --iterations=2
+              --warmup=1
+    )
+    set_tests_properties(
+      "order_books_benchmark_pipeline_state_machine_${scenario}"
+      PROPERTIES
+        PASS_REGULAR_EXPRESSION
+        "scenario=${scenario}.*measured_commands=4.*${expected_scenario_results}.*${expected_active_orders}.*correctness_verified=true"
+    )
+  endforeach()
+
+  add_test(
+    NAME order_books_benchmark_pipeline_command_scenario_invalid
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--workload=engine_pipeline_ceiling
+            -DCLI_ARGUMENT_2=--pipeline-command-scenario=invalid
+            -DEXPECTED_ERROR=pipeline_command_scenario_invalid
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_pipeline_state_machine_odd_batch
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DWORKLOAD=engine_pipeline_ceiling
+            -DCLI_ARGUMENT=--pipeline-stage=state_machine
+            -DCLI_ARGUMENT_2=--pipeline-batch-size=3
+            -DEXPECTED_ERROR=batch_size_must_be_even
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
   if(ENGINE_WRITER_DIAGNOSTICS_BASH)
     add_test(
       NAME order_books_engine_writer_diagnostics_runner_dry_run
@@ -91,6 +160,138 @@ if(BUILD_TESTING)
   )
 
   add_test(
+    NAME order_books_benchmark_wal_no_rotation_epoch_invalid
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--workload=wal_write_ceiling
+            -DCLI_ARGUMENT_2=--wal-no-rotation-epoch-commands=invalid
+            -DEXPECTED_ERROR=wal_no_rotation_epoch_commands_invalid
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_wal_no_rotation_epoch_requires_wal_workload
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--wal-no-rotation-epoch-commands=2
+            -DEXPECTED_ERROR=wal_no_rotation_epoch_requires_wal_workload
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_wal_no_rotation_epoch_requires_sync_none
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--workload=wal_write_ceiling
+            -DCLI_ARGUMENT_2=--wal-no-rotation-epoch-commands=2
+            -DCLI_ARGUMENT_3=--wal-sync=per_group
+            -DEXPECTED_ERROR=wal_no_rotation_epoch_requires_sync_none
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_wal_rotation_diagnostic_invalid
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--workload=wal_write_ceiling
+            -DCLI_ARGUMENT_2=--wal-rotation-diagnostic=invalid
+            -DEXPECTED_ERROR=wal_rotation_diagnostic_invalid
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_wal_rotation_diagnostic_requires_wal_workload
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--wal-rotation-diagnostic=control
+            -DEXPECTED_ERROR=wal_rotation_diagnostic_requires_wal_workload
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_wal_rotation_diagnostic_requires_profiled_single_group
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--workload=wal_write_ceiling
+            -DCLI_ARGUMENT_2=--wal-rotation-diagnostic=control
+            -DCLI_ARGUMENT_3=--wal-sync=none
+            -DCLI_ARGUMENT_4=--wal-phase-profile=off
+            -DEXPECTED_ERROR=wal_rotation_diagnostic_requires_b1_profiled_single_group
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_wal_rotation_diagnostic_requires_sync_none
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--workload=wal_write_ceiling
+            -DCLI_ARGUMENT_2=--wal-rotation-diagnostic=control
+            -DCLI_ARGUMENT_3=--wal-group-size=1
+            -DCLI_ARGUMENT_4=--iterations=1
+            -DCLI_ARGUMENT_5=--wal-sync=per_group
+            -DCLI_ARGUMENT_6=--wal-phase-profile=on
+            -DEXPECTED_ERROR=wal_rotation_diagnostic_requires_b1_profiled_single_group
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_wal_rotation_diagnostic_requires_profile_on
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--workload=wal_write_ceiling
+            -DCLI_ARGUMENT_2=--wal-rotation-diagnostic=control
+            -DCLI_ARGUMENT_3=--wal-group-size=1
+            -DCLI_ARGUMENT_4=--iterations=1
+            -DCLI_ARGUMENT_5=--wal-sync=none
+            -DCLI_ARGUMENT_6=--wal-phase-profile=off
+            -DEXPECTED_ERROR=wal_rotation_diagnostic_requires_b1_profiled_single_group
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_wal_rotation_diagnostic_requires_group_one
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--workload=wal_write_ceiling
+            -DCLI_ARGUMENT_2=--wal-rotation-diagnostic=control
+            -DCLI_ARGUMENT_3=--wal-group-size=2
+            -DCLI_ARGUMENT_4=--iterations=1
+            -DCLI_ARGUMENT_5=--wal-sync=none
+            -DCLI_ARGUMENT_6=--wal-phase-profile=on
+            -DEXPECTED_ERROR=wal_rotation_diagnostic_requires_b1_profiled_single_group
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_wal_rotation_diagnostic_requires_one_iteration
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--workload=wal_write_ceiling
+            -DCLI_ARGUMENT_2=--wal-rotation-diagnostic=control
+            -DCLI_ARGUMENT_3=--wal-group-size=1
+            -DCLI_ARGUMENT_4=--iterations=2
+            -DCLI_ARGUMENT_5=--wal-sync=none
+            -DCLI_ARGUMENT_6=--wal-phase-profile=on
+            -DEXPECTED_ERROR=wal_rotation_diagnostic_requires_b1_profiled_single_group
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_wal_rotation_diagnostic_conflicts_no_rotation_epoch
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--workload=wal_write_ceiling
+            -DCLI_ARGUMENT_2=--wal-rotation-diagnostic=control
+            -DCLI_ARGUMENT_3=--wal-group-size=1
+            -DCLI_ARGUMENT_4=--iterations=1
+            -DCLI_ARGUMENT_5=--wal-sync=none
+            -DCLI_ARGUMENT_6=--wal-phase-profile=on
+            -DCLI_ARGUMENT_7=--wal-no-rotation-epoch-commands=2
+            -DEXPECTED_ERROR=wal_rotation_diagnostic_requires_b1_profiled_single_group
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
     NAME order_books_benchmark_wal_phase_profile_smoke
     COMMAND $<TARGET_FILE:order_books_benchmark>
             --workload=wal_write_ceiling
@@ -104,7 +305,20 @@ if(BUILD_TESTING)
     order_books_benchmark_wal_phase_profile_smoke
     PROPERTIES
       PASS_REGULAR_EXPRESSION
-      "sync_samples=0.*sync_p50_us=na.*replay_verified=true.*phase_profile=on.*profiled_groups=2.*profiled_commands=4.*sync_total_us=0.*group_total_us=.*fixture_build_group_total_us=.*wal_append_call_group_total_us=.*wal_lock_wait_group_total_us=.*wal_prepare_group_total_us=.*wal_plan_copy_group_total_us=.*wal_rotation_group_total_us=0.*wal_write_group_total_us=.*wal_publish_group_total_us=.*sync_share_percent=na"
+      "service_target_attainment_percent=.*sync_samples=0.*replay_verified=true.*phase_profile=on.*profiled_groups=2.*profiled_commands=4.*sync_total_us=0.*group_total_us=.*fixture_build_group_total_us=.*wal_append_call_group_total_us=.*wal_lock_wait_group_total_us=.*wal_prepare_group_total_us=.*wal_plan_copy_group_total_us=.*wal_rotation_group_total_us=0.*wal_write_group_total_us=.*wal_publish_group_total_us=.*sync_share_percent=na"
+  )
+
+  add_test(
+    NAME order_books_benchmark_wal_no_rotation_epoch_smoke
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT_1=--workload=wal_write_ceiling
+            -DCLI_ARGUMENT_2=--wal-sync=none
+            -DCLI_ARGUMENT_3=--wal-no-rotation-epoch-commands=2
+            -DCLI_ARGUMENT_4=--wal-group-size=2
+            -DCLI_ARGUMENT_5=--iterations=2
+            -DCLI_ARGUMENT_6=--warmup=1
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_wal_no_rotation_output.cmake"
   )
 
   add_test(
@@ -120,7 +334,7 @@ if(BUILD_TESTING)
   set_tests_properties(
     order_books_benchmark_wal_phase_profile_off_smoke
     PROPERTIES
-      PASS_REGULAR_EXPRESSION "replay_verified=true.*phase_profile=off"
+      PASS_REGULAR_EXPRESSION "service_target_attainment_percent=.*replay_verified=true.*phase_profile=off"
       FAIL_REGULAR_EXPRESSION "profiled_groups=;sync_total_us=;group_total_us=;fixture_build_group_total_us=;wal_append_call_group_total_us=;wal_lock_wait_group_total_us=;wal_prepare_group_total_us=;wal_plan_copy_group_total_us=;wal_rotation_group_total_us=;wal_write_group_total_us=;wal_publish_group_total_us=;lock_wait_share_percent="
   )
 
@@ -137,7 +351,7 @@ if(BUILD_TESTING)
   set_tests_properties(
     order_books_benchmark_wal_phase_profile_per_group_smoke
     PROPERTIES
-      PASS_REGULAR_EXPRESSION "sync_samples=2.*replay_verified=true.*phase_profile=on.*sync_total_us="
+      PASS_REGULAR_EXPRESSION "service_target_attainment_percent=.*sync_samples=2.*replay_verified=true.*phase_profile=on.*sync_total_us="
   )
   add_test(
     NAME order_books_benchmark_writer_phase_profile_invalid

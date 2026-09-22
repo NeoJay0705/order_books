@@ -171,13 +171,28 @@ domain::CommittedCommand make_state_command(const EngineSeq engine_seq,
                                             const ProducerSeq producer_seq,
                                             const ProducerId producer_id,
                                             const Side side, const Price price,
-                                            const std::uint64_t order_id) {
+                                            const std::uint64_t order_id,
+                                            const Quantity quantity = 1) {
   Command command;
   command.identity = CommandIdentity{producer_id, 1, 1, producer_seq};
   command.instrument_id = 1;
   command.command_type = CommandType::new_order;
   command.order_id = OrderId{1, order_id};
-  command.payload = NewOrderPayload{side, price, 1};
+  command.payload = NewOrderPayload{side, price, quantity};
+  return domain::CommittedCommand{std::move(command), engine_seq,
+                                  static_cast<Timestamp>(engine_seq), 1, 1};
+}
+
+domain::CommittedCommand make_state_mutation_command(
+    const EngineSeq engine_seq, const ProducerSeq producer_seq,
+    const CommandType command_type, const OrderId order_id,
+    CommandPayload payload) {
+  Command command;
+  command.identity = CommandIdentity{1, 1, 1, producer_seq};
+  command.instrument_id = 1;
+  command.command_type = command_type;
+  command.order_id = order_id;
+  command.payload = std::move(payload);
   return domain::CommittedCommand{std::move(command), engine_seq,
                                   static_cast<Timestamp>(engine_seq), 1, 1};
 }
@@ -262,106 +277,187 @@ bool run_state_machine(const PipelineBenchmarkOptions& options) {
   }
   try {
     StateFixture fixture(options.active_orders);
-    const auto pairs_per_group = options.batch_size / 2U;
-    const auto verify_output = [](const domain::ExecutionOutput& output,
-                                  const EngineSeq expected_engine_seq) {
+    const auto pairs_per_iteration = options.batch_size / 2U;
+    const auto measured_commands = checked_multiply(options.iterations, options.batch_size);
+    const auto warmup_commands = checked_multiply(options.warmup, options.batch_size);
+    const auto scenario_name = pipeline_command_scenario_name(options.command_scenario);
+    std::optional<OrderId> target_order;
+    Quantity expected_quantity = 2;
+    Price expected_price = 100;
+    std::uint64_t setup_commands = 0;
+    if (options.command_scenario == PipelineCommandScenario::amend_quantity ||
+        options.command_scenario == PipelineCommandScenario::replace_order) {
+      target_order = OrderId{1, fixture.next_order_id};
+      auto setup = apply_or_throw(
+          fixture.machine,
+          make_state_command(fixture.next_engine_seq, fixture.next_producer_seq, 1,
+                             Side::buy, expected_price, fixture.next_order_id, 2));
+      if (setup.result.command_status != CommandStatus::committed) {
+        throw std::runtime_error("scenario target setup was not committed");
+      }
+      ++fixture.next_engine_seq;
+      ++fixture.next_producer_seq;
+      ++fixture.next_order_id;
+      setup_commands = 1;
+    }
+    const auto consume_output = [](const domain::ExecutionOutput& output,
+                                   std::uint64_t& trades, std::uint64_t& events) {
       if (output.result.command_status != CommandStatus::committed ||
           output.result.error_code != ErrorCode::none ||
-          !output.result.engine_seq.has_value() ||
-          *output.result.engine_seq != expected_engine_seq) {
+          !output.result.engine_seq.has_value()) {
         throw std::runtime_error("state command result mismatch");
       }
+      events = checked_add(events, output.events.size());
+      trades = checked_add(
+          trades, static_cast<std::uint64_t>(std::count_if(
+                      output.events.begin(), output.events.end(), [](const Event& event) {
+                        return event.event_type == EventType::trade;
+                      })));
     };
-    auto run_group = [&fixture, pairs_per_group, &verify_output](std::uint64_t& trades,
-                                                                  std::uint64_t& events) {
-      for (std::size_t pair = 0; pair < pairs_per_group; ++pair) {
-        const auto sell_engine_seq = fixture.next_engine_seq;
-        auto sell = apply_or_throw(
-            fixture.machine,
-            make_state_command(fixture.next_engine_seq, fixture.next_producer_seq, 1,
-                               Side::sell, 100, fixture.next_order_id));
-        verify_output(sell, sell_engine_seq);
-        ++fixture.next_engine_seq;
-        ++fixture.next_producer_seq;
-        ++fixture.next_order_id;
-        const auto buy_engine_seq = fixture.next_engine_seq;
-        auto buy = apply_or_throw(
-            fixture.machine,
-            make_state_command(fixture.next_engine_seq, fixture.next_producer_seq, 1,
-                               Side::buy, 100, fixture.next_order_id));
-        verify_output(buy, buy_engine_seq);
-        ++fixture.next_engine_seq;
-        ++fixture.next_producer_seq;
-        ++fixture.next_order_id;
-        for (const auto* output : {&sell, &buy}) {
-          events = checked_add(events, output->events.size());
-          trades = checked_add(
-              trades, static_cast<std::uint64_t>(std::count_if(
-                          output->events.begin(), output->events.end(),
-                          [](const Event& event) { return event.event_type == EventType::trade; })));
+    auto apply_next = [&fixture](domain::CommittedCommand command) {
+      const auto expected_engine_seq = fixture.next_engine_seq;
+      auto output = apply_or_throw(fixture.machine, std::move(command));
+      if (!output.result.engine_seq.has_value() ||
+          *output.result.engine_seq != expected_engine_seq) {
+        throw std::runtime_error("state sequence result mismatch");
+      }
+      ++fixture.next_engine_seq;
+      ++fixture.next_producer_seq;
+      return output;
+    };
+    const auto run_cycle = [&](const std::size_t pairs, std::uint64_t& trades,
+                               std::uint64_t& events) {
+      for (std::size_t pair = 0; pair < pairs; ++pair) {
+        domain::ExecutionOutput first;
+        domain::ExecutionOutput second;
+        switch (options.command_scenario) {
+          case PipelineCommandScenario::new_crossing_pair:
+            first = apply_next(make_state_command(fixture.next_engine_seq,
+                                                   fixture.next_producer_seq, 1, Side::sell,
+                                                   100, fixture.next_order_id));
+            ++fixture.next_order_id;
+            second = apply_next(make_state_command(fixture.next_engine_seq,
+                                                    fixture.next_producer_seq, 1, Side::buy,
+                                                    100, fixture.next_order_id));
+            ++fixture.next_order_id;
+            break;
+          case PipelineCommandScenario::new_resting_cancel: {
+            const auto order_id = fixture.next_order_id++;
+            first = apply_next(make_state_command(fixture.next_engine_seq,
+                                                   fixture.next_producer_seq, 1, Side::buy,
+                                                   100, order_id));
+            second = apply_next(make_state_mutation_command(
+                fixture.next_engine_seq, fixture.next_producer_seq,
+                CommandType::cancel_order, OrderId{1, order_id}, CancelOrderPayload{}));
+            break;
+          }
+          case PipelineCommandScenario::amend_quantity: {
+            const auto previous_quantity = expected_quantity;
+            const auto updated_quantity = previous_quantity == 1 ? Quantity{2} : Quantity{1};
+            first = apply_next(make_state_mutation_command(
+                fixture.next_engine_seq, fixture.next_producer_seq,
+                CommandType::amend_quantity, *target_order,
+                AmendQuantityPayload{updated_quantity}));
+            second = apply_next(make_state_mutation_command(
+                fixture.next_engine_seq, fixture.next_producer_seq,
+                CommandType::amend_quantity, *target_order,
+                AmendQuantityPayload{previous_quantity}));
+            break;
+          }
+          case PipelineCommandScenario::replace_order: {
+            const auto previous_price = expected_price;
+            const auto updated_price = previous_price == 100 ? Price{101} : Price{100};
+            first = apply_next(make_state_mutation_command(
+                fixture.next_engine_seq, fixture.next_producer_seq,
+                CommandType::replace_order, *target_order,
+                ReplaceOrderPayload{updated_price, std::nullopt}));
+            second = apply_next(make_state_mutation_command(
+                fixture.next_engine_seq, fixture.next_producer_seq,
+                CommandType::replace_order, *target_order,
+                ReplaceOrderPayload{previous_price, std::nullopt}));
+            break;
+          }
         }
+        consume_output(first, trades, events);
+        consume_output(second, trades, events);
       }
     };
 
     std::uint64_t ignored_trades = 0;
     std::uint64_t ignored_events = 0;
-    for (std::uint64_t group = 0; group < options.warmup; ++group) {
-      run_group(ignored_trades, ignored_events);
+    for (std::uint64_t iteration = 0; iteration < options.warmup; ++iteration) {
+      run_cycle(pairs_per_iteration, ignored_trades, ignored_events);
     }
-    Samples samples;
-    samples.values.reserve(options.iterations);
     std::uint64_t trades = 0;
     std::uint64_t events = 0;
-    for (std::uint64_t group = 0; group < options.iterations; ++group) {
-      const auto start = std::chrono::steady_clock::now();
-      run_group(trades, events);
-      samples.values.push_back(static_cast<std::uint64_t>(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(
-              std::chrono::steady_clock::now() - start)
-              .count()));
+    const auto measured_start = std::chrono::steady_clock::now();
+    for (std::uint64_t iteration = 0; iteration < options.iterations; ++iteration) {
+      run_cycle(pairs_per_iteration, trades, events);
     }
-    if (std::holds_alternative<Error>(domain::validate_state(fixture.machine.state())) ||
-        fixture.machine.state().active_order_count != options.active_orders) {
-      report_error("state_machine", "validation", "state_validation_failed");
-      return false;
-    }
-    const auto commands = checked_multiply(options.iterations, options.batch_size);
-    const auto expected_trades = checked_multiply(options.iterations, pairs_per_group);
-    const auto warmup_commands = checked_multiply(options.warmup, options.batch_size);
-    const auto expected_events = checked_multiply(commands, 2U);
+    const auto measured_end = std::chrono::steady_clock::now();
+    const auto elapsed = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(measured_end - measured_start)
+            .count());
+    const auto expected_trades = options.command_scenario ==
+                                         PipelineCommandScenario::new_crossing_pair
+                                     ? measured_commands / 2U
+                                     : 0U;
+    const auto expected_events = options.command_scenario ==
+                                         PipelineCommandScenario::new_crossing_pair
+                                     ? checked_multiply(measured_commands, 2U)
+                                     : measured_commands;
     const auto expected_last_engine_seq = checked_add(
         static_cast<std::uint64_t>(options.active_orders),
-        checked_add(warmup_commands, commands));
-    if (trades != expected_trades || events != expected_events ||
+        checked_add(setup_commands, checked_add(warmup_commands, measured_commands)));
+    if (std::holds_alternative<Error>(domain::validate_state(fixture.machine.state())) ||
+        fixture.machine.state().active_order_count !=
+            options.active_orders + (target_order.has_value() ? 1U : 0U) ||
+        trades != expected_trades || events != expected_events ||
         fixture.machine.state().last_committed_engine_seq != expected_last_engine_seq) {
-      report_error("state_machine", "validation", "result_count_mismatch");
+      report_error("state_machine", "validation", "result_count_or_state_mismatch");
       return false;
     }
-    const auto elapsed_ns = samples.elapsed_ns();
-    const auto command_rate = elapsed_ns == 0
+    if (target_order.has_value()) {
+      const auto& book = fixture.machine.state().books.at(1);
+      const auto target = book.find(*target_order);
+      if (!target.has_value() || target->status == OrderStatus::cancelled ||
+          target->status == OrderStatus::filled ||
+          (options.command_scenario == PipelineCommandScenario::amend_quantity &&
+           target->total_quantity != expected_quantity) ||
+          (options.command_scenario == PipelineCommandScenario::replace_order &&
+           target->price != expected_price)) {
+        report_error("state_machine", "validation", "scenario_target_mismatch");
+        return false;
+      }
+    }
+    const auto command_rate = elapsed == 0
                                   ? 0.0
-                                  : static_cast<double>(commands) * 1'000'000'000.0 /
-                                        static_cast<double>(elapsed_ns);
-    print_timing("state_machine", "crossing_pair", options, samples, commands,
-                 elapsed_ns, "state_apply_return", "command_group",
-                 "commands=" + std::to_string(commands) +
-                     " trades=" + std::to_string(trades) +
-                     " events=" + std::to_string(events) +
-                     " active_orders=" +
-                     std::to_string(fixture.machine.state().active_order_count) +
-                     " active_levels=" +
-                     std::to_string([&fixture] {
-                       std::size_t levels = 0;
-                       for (const auto& [unused, book] : fixture.machine.state().books) {
-                         (void)unused;
-                         levels += book.active_price_level_count();
-                       }
-                       return levels;
-                     }()) +
-                     " tombstone_limit=" + std::to_string(kTombstoneLimit) +
-                     " last_engine_seq=" +
-                     std::to_string(fixture.machine.state().last_committed_engine_seq),
-                 command_rate);
+                                  : static_cast<double>(measured_commands) * 1'000'000'000.0 /
+                                        static_cast<double>(elapsed);
+    const auto average_ns = measured_commands == 0
+                                ? 0.0
+                                : static_cast<double>(elapsed) /
+                                      static_cast<double>(measured_commands);
+    std::size_t active_levels = 0;
+    for (const auto& [unused, book] : fixture.machine.state().books) {
+      (void)unused;
+      active_levels += book.active_price_level_count();
+    }
+    std::cout << "engine_pipeline_ceiling stage=state_machine scenario=" << scenario_name
+              << " iterations=" << options.iterations << " warmup=" << options.warmup
+              << " measured_commands=" << measured_commands
+              << " warmup_commands=" << warmup_commands
+              << " commands_per_second=" << command_rate
+              << " average_ns_per_command=" << average_ns
+              << " elapsed_ms=" << elapsed / 1'000'000.0
+              << " target_commands_per_second=1000000"
+              << " target_attainment_percent=" << command_rate / 10'000.0
+              << " completion_boundary=state_apply_return latency_scope=run_average"
+              << " trades=" << trades << " events=" << events
+              << " active_orders=" << fixture.machine.state().active_order_count
+              << " active_levels=" << active_levels
+              << " last_engine_seq=" << fixture.machine.state().last_committed_engine_seq
+              << " correctness_verified=true\n";
     return true;
   } catch (const std::exception& error) {
     report_error("state_machine", "measured", "exception", error.what());
@@ -1168,6 +1264,38 @@ std::string_view pipeline_stage_name(const PipelineStage stage) noexcept {
       return "runtime_handoff";
     case PipelineStage::publisher_drain:
       return "publisher_drain";
+  }
+  return "unknown";
+}
+
+std::optional<PipelineCommandScenario> parse_pipeline_command_scenario(
+    const std::string_view value) {
+  if (value == "new_crossing_pair") {
+    return PipelineCommandScenario::new_crossing_pair;
+  }
+  if (value == "new_resting_cancel") {
+    return PipelineCommandScenario::new_resting_cancel;
+  }
+  if (value == "amend_quantity") {
+    return PipelineCommandScenario::amend_quantity;
+  }
+  if (value == "replace_order") {
+    return PipelineCommandScenario::replace_order;
+  }
+  return std::nullopt;
+}
+
+std::string_view pipeline_command_scenario_name(
+    const PipelineCommandScenario scenario) noexcept {
+  switch (scenario) {
+    case PipelineCommandScenario::new_crossing_pair:
+      return "new_crossing_pair";
+    case PipelineCommandScenario::new_resting_cancel:
+      return "new_resting_cancel";
+    case PipelineCommandScenario::amend_quantity:
+      return "amend_quantity";
+    case PipelineCommandScenario::replace_order:
+      return "replace_order";
   }
   return "unknown";
 }
