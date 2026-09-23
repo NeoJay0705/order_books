@@ -44,6 +44,7 @@ constexpr std::size_t kDurableIngressQueueCapacity = 65'536;
 constexpr std::size_t kPipelineProducerLanes = 1'024;
 constexpr std::size_t kPipelineIngressQueueCapacity = 65'536;
 constexpr auto kDurablePhaseTimeout = std::chrono::seconds(60);
+constexpr std::size_t kWalCeilingSegmentSize = 256U * 1024U * 1024U;
 
 enum class WorkloadSelection {
   all,
@@ -63,6 +64,7 @@ struct BenchmarkOptions {
   std::uint64_t warmup{kWarmup};
   WorkloadSelection workload{WorkloadSelection::all};
   std::uint64_t wal_group_size{256};
+  std::size_t wal_segment_size_bytes{kWalCeilingSegmentSize};
   std::uint64_t wal_no_rotation_epoch_commands{};
   WalSyncMode wal_sync_mode{WalSyncMode::per_group};
   WalPhaseProfileMode wal_phase_profile{WalPhaseProfileMode::off};
@@ -89,12 +91,16 @@ struct BenchmarkOptions {
   bool wal_prepare_workers_parse_error{};
   bool wal_prepare_min_commands_parse_error{};
   bool wal_prepare_options_set{};
+  bool wal_segment_size_parse_error{};
+  bool wal_segment_size_option_set{};
   bool wal_phase_profile_parse_error{};
   bool wal_phase_profile_option_set{};
   bool wal_rotation_diagnostic_parse_error{};
   bool wal_rotation_diagnostic_option_set{};
   bool wal_no_rotation_epoch_parse_error{};
   bool wal_no_rotation_epoch_option_set{};
+  bool wal_measurement_marker_parse_error{};
+  bool wal_measurement_marker_option_set{};
   bool writer_phase_profile_parse_error{};
   bool writer_phase_profile_option_set{};
   bool writer_apply_subprofile_parse_error{};
@@ -107,6 +113,7 @@ struct BenchmarkOptions {
   bool engine_tail_state_sampling_parse_error{};
   bool engine_tail_state_sampling_option_set{};
   std::optional<std::filesystem::path> data_directory;
+  std::optional<std::filesystem::path> wal_measurement_marker;
   std::optional<std::filesystem::path> engine_tail_telemetry_output;
 };
 
@@ -315,6 +322,16 @@ std::optional<BenchmarkOptions> parse_options(const int argc, char** argv) {
       options.warmup = *warmup;
     } else if (const auto group_size = parse_positive_option(argument, "--wal-group-size=")) {
       options.wal_group_size = *group_size;
+    } else if (argument.starts_with("--wal-segment-size-bytes=")) {
+      options.wal_segment_size_option_set = true;
+      const auto segment_size = parse_positive_option(
+          argument, "--wal-segment-size-bytes=");
+      if (!segment_size.has_value() ||
+          *segment_size > std::numeric_limits<std::size_t>::max()) {
+        options.wal_segment_size_parse_error = true;
+      } else {
+        options.wal_segment_size_bytes = static_cast<std::size_t>(*segment_size);
+      }
     } else if (argument.starts_with("--wal-no-rotation-epoch-commands=")) {
       options.wal_no_rotation_epoch_option_set = true;
       const auto epoch_commands = parse_positive_option(
@@ -323,6 +340,15 @@ std::optional<BenchmarkOptions> parse_options(const int argc, char** argv) {
         options.wal_no_rotation_epoch_parse_error = true;
       } else {
         options.wal_no_rotation_epoch_commands = *epoch_commands;
+      }
+    } else if (argument.starts_with("--wal-measurement-marker=")) {
+      options.wal_measurement_marker_option_set = true;
+      const auto path = argument.substr(
+          std::string_view("--wal-measurement-marker=").size());
+      if (path.empty()) {
+        options.wal_measurement_marker_parse_error = true;
+      } else {
+        options.wal_measurement_marker = std::filesystem::path(path);
       }
     } else if (argument.starts_with("--wal-rotation-diagnostic=")) {
       options.wal_rotation_diagnostic_option_set = true;
@@ -583,6 +609,27 @@ void report_wal_error(const std::string_view phase, const std::string_view code,
     std::cerr << " detail=" << detail;
   }
   std::cerr << '\n';
+}
+
+bool write_wal_measurement_marker(const std::optional<std::filesystem::path>& path,
+                                  const std::string_view marker,
+                                  const bool truncate) {
+  if (!path.has_value()) {
+    return true;
+  }
+  std::ofstream output(*path, truncate ? std::ios::out | std::ios::trunc
+                                       : std::ios::out | std::ios::app);
+  if (!output) {
+    report_wal_error("measurement", "marker_open_failed", path->string());
+    return false;
+  }
+  output << marker << '\n';
+  output.flush();
+  if (!output) {
+    report_wal_error("measurement", "marker_write_failed", path->string());
+    return false;
+  }
+  return true;
 }
 
 std::optional<std::uint64_t> count_wal_segments(const std::filesystem::path& directory) {
@@ -861,8 +908,6 @@ std::optional<std::string_view> prepare_data_directory(
   }
   return std::nullopt;
 }
-
-constexpr std::size_t kWalCeilingSegmentSize = 256U * 1024U * 1024U;
 
 using benchmark_wal::LatencyAggregate;
 using benchmark_wal::latency_sample_stride;
@@ -1411,7 +1456,7 @@ bool run_wal_write_ceiling_no_rotation(const BenchmarkOptions& options) {
       return false;
     }
     auto wal_result = storage::Wal::open(
-        epoch_path, 1, kWalCeilingSegmentSize,
+        epoch_path, 1, options.wal_segment_size_bytes,
         storage::WalPrepareOptions{options.wal_prepare_workers,
                                    options.wal_parallel_prepare_min_commands});
     if (!std::holds_alternative<std::unique_ptr<storage::Wal>>(wal_result)) {
@@ -1482,6 +1527,12 @@ bool run_wal_write_ceiling_no_rotation(const BenchmarkOptions& options) {
       cleanup();
       return false;
     }
+    if (epoch_count == 0U &&
+        !write_wal_measurement_marker(options.wal_measurement_marker,
+                                      "measured-window-start", true)) {
+      cleanup();
+      return false;
+    }
     const auto process_counters_before_measured = capture_process_counters();
     if (epoch_count == 0U) {
       measured_process_before = process_counters_before_measured;
@@ -1493,6 +1544,13 @@ bool run_wal_write_ceiling_no_rotation(const BenchmarkOptions& options) {
       return false;
     }
     const auto measured_end = std::chrono::steady_clock::now();
+    const bool final_epoch = remaining_commands == this_epoch_commands;
+    if (final_epoch &&
+        !write_wal_measurement_marker(options.wal_measurement_marker,
+                                      "measured-window-end", false)) {
+      cleanup();
+      return false;
+    }
     const auto process_counters_after_measured = capture_process_counters();
     if (!add_process_counters(
             measured_process_counters,
@@ -1536,7 +1594,7 @@ bool run_wal_write_ceiling_no_rotation(const BenchmarkOptions& options) {
     }
     wal.reset();
     auto reopened_result = storage::Wal::open(
-        epoch_path, 1, kWalCeilingSegmentSize,
+        epoch_path, 1, options.wal_segment_size_bytes,
         storage::WalPrepareOptions{options.wal_prepare_workers,
                                    options.wal_parallel_prepare_min_commands});
     if (!std::holds_alternative<std::unique_ptr<storage::Wal>>(reopened_result)) {
@@ -1686,7 +1744,7 @@ bool run_wal_write_ceiling_no_rotation(const BenchmarkOptions& options) {
                     ? std::to_string(measured_process_counters.syscw)
                     : std::string("na"))
             << " measured_wal_sync_calls=0"
-            << " segment_size_bytes=" << kWalCeilingSegmentSize
+            << " segment_size_bytes=" << options.wal_segment_size_bytes
             << " segment_count_before=1 segment_count_after=1"
             << " segment_id_before=" << segment_id_before
             << " segment_id_after=" << segment_id_after
@@ -1712,7 +1770,11 @@ bool run_wal_write_ceiling_no_rotation(const BenchmarkOptions& options) {
                     : std::string("na"))
             << " actual_parallel_prepare_groups=" << prepare_parallel_groups
             << " actual_prepare_tasks=" << prepare_tasks
-            << " wal_path=" << resolved_path << " replay_verified=true phase_profile=off\n";
+            << " wal_path=" << resolved_path << " replay_verified=true phase_profile=off";
+  if (options.wal_measurement_marker.has_value()) {
+    std::cout << " wal_measurement_marker=" << *options.wal_measurement_marker;
+  }
+  std::cout << '\n';
   cleanup();
   return true;
 }
@@ -1742,7 +1804,7 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
       }
     };
     auto wal_result = storage::Wal::open(
-        data_directory, 1, kWalCeilingSegmentSize,
+        data_directory, 1, options.wal_segment_size_bytes,
         storage::WalPrepareOptions{options.wal_prepare_workers,
                                    options.wal_parallel_prepare_min_commands});
     if (!std::holds_alternative<std::unique_ptr<storage::Wal>>(wal_result)) {
@@ -1804,8 +1866,8 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
     }
     const auto frame_bytes = probe_end_bytes - probe_start_bytes;
     const auto setup_snapshot = probe_end_segments.value();
-    if (setup_snapshot.active_offset > kWalCeilingSegmentSize ||
-        frame_bytes > kWalCeilingSegmentSize) {
+    if (setup_snapshot.active_offset > options.wal_segment_size_bytes ||
+        frame_bytes > options.wal_segment_size_bytes) {
       report_wal_error("rotation_setup", "frame_size_invalid");
       cleanup();
       return false;
@@ -1818,7 +1880,7 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
       return false;
     }
     next_sequence = static_cast<EngineSeq>(*sequence_after_probe);
-    const auto available = kWalCeilingSegmentSize - setup_snapshot.active_offset;
+    const auto available = options.wal_segment_size_bytes - setup_snapshot.active_offset;
     std::uint64_t setup_fill_commands = 0;
     if (mode == WalRotationDiagnosticMode::control) {
       if (available < frame_bytes) {
@@ -1859,7 +1921,7 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
       cleanup();
       return false;
     }
-    const auto target_available = kWalCeilingSegmentSize - before_target->active_offset;
+    const auto target_available = options.wal_segment_size_bytes - before_target->active_offset;
     const bool target_fits = target_available >= frame_bytes;
     if ((mode == WalRotationDiagnosticMode::control && !target_fits) ||
         (mode == WalRotationDiagnosticMode::trigger && target_fits)) {
@@ -1957,7 +2019,7 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
     }
     wal.reset();
     auto reopened_result = storage::Wal::open(
-        data_directory, 1, kWalCeilingSegmentSize,
+        data_directory, 1, options.wal_segment_size_bytes,
         storage::WalPrepareOptions{options.wal_prepare_workers,
                                    options.wal_parallel_prepare_min_commands});
     if (!std::holds_alternative<std::unique_ptr<storage::Wal>>(reopened_result)) {
@@ -2052,7 +2114,7 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
               << (measured_counters.io_valid ? std::to_string(measured_counters.syscw)
                                               : std::string("na"))
               << " measured_wal_sync_calls=0"
-              << " segment_size_bytes=" << kWalCeilingSegmentSize
+              << " segment_size_bytes=" << options.wal_segment_size_bytes
               << " measured_segment_rotations=" << measured_rotations
               << " rotation_triggered=" << (measured_rotations == 1U ? "true" : "false")
               << " rotation_scope=rotation_inclusive"
@@ -2123,7 +2185,7 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
   };
 
   auto wal_result = storage::Wal::open(
-      data_directory, 1, kWalCeilingSegmentSize,
+      data_directory, 1, options.wal_segment_size_bytes,
       storage::WalPrepareOptions{options.wal_prepare_workers,
                                  options.wal_parallel_prepare_min_commands});
   if (!std::holds_alternative<std::unique_ptr<storage::Wal>>(wal_result)) {
@@ -2234,7 +2296,7 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
 
   wal.reset();
   auto reopened_result = storage::Wal::open(
-      data_directory, 1, kWalCeilingSegmentSize,
+      data_directory, 1, options.wal_segment_size_bytes,
       storage::WalPrepareOptions{options.wal_prepare_workers,
                                  options.wal_parallel_prepare_min_commands});
   if (!std::holds_alternative<std::unique_ptr<storage::Wal>>(reopened_result)) {
@@ -2531,7 +2593,7 @@ bool run_wal_write_ceiling(const BenchmarkOptions& options) {
             << (process_counters_before_measured.meminfo_valid
                     ? std::to_string(process_counters_before_measured.writeback_bytes)
                     : std::string("na"))
-            << " segment_size_bytes=" << kWalCeilingSegmentSize
+            << " segment_size_bytes=" << options.wal_segment_size_bytes
             << " segment_count=" << ending_segments->count
             << " measured_segment_rotations=" << measured_rotations
             << " rotation_scope=rotation_inclusive"
@@ -3128,6 +3190,8 @@ void print_usage() {
                "engine_pipeline_ceiling|engine_writer_hot_path_profile] [--data-dir=PATH] "
                "[--wal-group-size=N] "
                "[--wal-no-rotation-epoch-commands=N] "
+               "[--wal-measurement-marker=PATH] "
+               "[--wal-segment-size-bytes=N] "
                "[--wal-sync=none|per_group] [--wal-phase-profile=off|on] "
                "[--wal-rotation-diagnostic=control|trigger] "
                "[--writer-phase-profile=off|on] [--writer-profile-sample-every=N] "
@@ -3174,6 +3238,12 @@ int main(const int argc, char** argv) {
     print_usage();
     return 2;
   }
+  if (options->wal_segment_size_parse_error) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=wal_segment_size_bytes_invalid\n";
+    print_usage();
+    return 2;
+  }
   if (options->wal_phase_profile_parse_error) {
     std::cerr << "workload=" << workload_name(options->workload)
               << " phase=cli error_code=wal_phase_profile_invalid\n";
@@ -3189,6 +3259,12 @@ int main(const int argc, char** argv) {
   if (options->wal_no_rotation_epoch_parse_error) {
     std::cerr << "workload=" << workload_name(options->workload)
               << " phase=cli error_code=wal_no_rotation_epoch_commands_invalid\n";
+    print_usage();
+    return 2;
+  }
+  if (options->wal_measurement_marker_parse_error) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=wal_measurement_marker_invalid\n";
     print_usage();
     return 2;
   }
@@ -3238,6 +3314,12 @@ int main(const int argc, char** argv) {
   if (options->wal_group_size == 0) {
     std::cerr << "workload=" << workload_name(options->workload)
               << " phase=cli error_code=wal_group_size_must_be_positive\n";
+    print_usage();
+    return 2;
+  }
+  if (options->wal_segment_size_bytes == 0U) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=wal_segment_size_bytes_must_be_positive\n";
     print_usage();
     return 2;
   }
@@ -3333,10 +3415,39 @@ int main(const int argc, char** argv) {
     print_usage();
     return 2;
   }
+  if (options->wal_measurement_marker_option_set &&
+      options->workload != WorkloadSelection::wal_write_ceiling) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=wal_measurement_marker_requires_wal_workload\n";
+    print_usage();
+    return 2;
+  }
+  if (options->wal_measurement_marker_option_set &&
+      options->wal_no_rotation_epoch_commands == 0U) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=wal_measurement_marker_requires_no_rotation\n";
+    print_usage();
+    return 2;
+  }
+  if (options->wal_segment_size_option_set &&
+      options->workload != WorkloadSelection::wal_write_ceiling) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=wal_segment_size_bytes_requires_wal_workload\n";
+    print_usage();
+    return 2;
+  }
   if (options->wal_no_rotation_epoch_commands != 0U &&
       options->wal_sync_mode != WalSyncMode::none) {
     std::cerr << "workload=" << workload_name(options->workload)
               << " phase=cli error_code=wal_no_rotation_epoch_requires_sync_none\n";
+    print_usage();
+    return 2;
+  }
+  if (options->wal_measurement_marker_option_set &&
+      options->iterations >
+          options->wal_no_rotation_epoch_commands / options->wal_group_size) {
+    std::cerr << "workload=" << workload_name(options->workload)
+              << " phase=cli error_code=wal_measurement_marker_requires_single_epoch\n";
     print_usage();
     return 2;
   }

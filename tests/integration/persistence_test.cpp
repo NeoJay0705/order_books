@@ -184,6 +184,33 @@ TEST(PersistenceTest, WalParallelPreparePreservesBytesOrderingAndReplay) {
   }
 }
 
+TEST(PersistenceTest, WalPrepareFailureIsConsistentAcrossLaneCounts) {
+  TemporaryDirectory temporary("order_books_wal_prepare_failure_test");
+  constexpr std::size_t segment_size = 55U;
+  const std::vector<domain::CommittedCommand> commands{
+      command(1), command(2), command(3), command(4)};
+
+  for (const std::size_t lane_count : {1U, 2U, 4U}) {
+    auto opened = Wal::open(temporary.path() / std::to_string(lane_count), 1,
+                            segment_size, WalPrepareOptions{lane_count, 1});
+    ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Wal>>(opened));
+    auto wal = std::get<std::unique_ptr<Wal>>(std::move(opened));
+    const auto size_before = wal->size_bytes();
+
+    const auto appended = wal->append_batch(commands);
+    ASSERT_TRUE(std::holds_alternative<Error>(appended));
+    const auto& error = std::get<Error>(appended);
+    EXPECT_EQ(error.code, ErrorCode::wal_failure);
+    EXPECT_EQ(error.message, "WAL record cannot fit in a segment");
+    EXPECT_EQ(wal->size_bytes(), size_before);
+    EXPECT_EQ(wal->last_engine_seq(), 0U);
+
+    auto replayed = wal->replay();
+    ASSERT_TRUE(std::holds_alternative<std::vector<domain::CommittedCommand>>(replayed));
+    EXPECT_TRUE(std::get<std::vector<domain::CommittedCommand>>(replayed).empty());
+  }
+}
+
 TEST(PersistenceTest, WalParallelPrepareFallsBackBelowThreshold) {
   TemporaryDirectory temporary("order_books_wal_parallel_prepare_fallback_test");
   auto opened = Wal::open(temporary.path(), 1, 1U * 1024U * 1024U,
@@ -472,6 +499,40 @@ TEST(PersistenceTest, WalSingleAndBatchAppendShareIndexes) {
   const auto removed_cursor = wal->bytes_after(0, 3);
   ASSERT_TRUE(std::holds_alternative<Error>(removed_cursor));
   EXPECT_EQ(std::get<Error>(removed_cursor).code, ErrorCode::corrupt_wal);
+}
+
+TEST(PersistenceTest, WalRecordCacheRollbackDiscardsUnpublishedRotationRecords) {
+  TemporaryDirectory temporary("order_books_wal_record_cache_rollback_test");
+  const auto wal_directory = temporary.path() / "wal";
+  const auto first = command(1);
+  const auto frame_bytes = 4U + encode_committed_command(first).size() + 6U;
+  const auto segment_size = std::size_t{22} + frame_bytes + 1U;
+
+  auto opened = Wal::open(wal_directory, 1, segment_size);
+  ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Wal>>(opened));
+  auto wal = std::get<std::unique_ptr<Wal>>(std::move(opened));
+
+  ASSERT_TRUE(std::holds_alternative<WalPosition>(wal->append(first)));
+  ASSERT_TRUE(std::holds_alternative<std::monostate>(wal->sync()));
+  auto replayed = wal->replay();
+  ASSERT_TRUE(std::holds_alternative<std::vector<domain::CommittedCommand>>(replayed));
+  ASSERT_EQ(std::get<std::vector<domain::CommittedCommand>>(replayed).size(), 1U);
+
+  ASSERT_TRUE(std::filesystem::create_directory(wal_directory / "2.wal"));
+  const auto failed = wal->append(command(2));
+  ASSERT_TRUE(std::holds_alternative<Error>(failed));
+  EXPECT_EQ(std::get<Error>(failed).code, ErrorCode::wal_failure);
+
+  replayed = wal->replay();
+  ASSERT_TRUE(std::holds_alternative<std::vector<domain::CommittedCommand>>(replayed));
+  const auto& retained = std::get<std::vector<domain::CommittedCommand>>(replayed);
+  ASSERT_EQ(retained.size(), 1U);
+  EXPECT_EQ(retained.front().engine_seq, 1U);
+  EXPECT_EQ(wal->last_engine_seq(), 1U);
+
+  const auto unpublished = wal->bytes_after(0, 2);
+  ASSERT_TRUE(std::holds_alternative<Error>(unpublished));
+  EXPECT_EQ(std::get<Error>(unpublished).code, ErrorCode::corrupt_wal);
 }
 
 TEST(PersistenceTest, WalReopenKeepsActiveDescriptorForBatchAppend) {

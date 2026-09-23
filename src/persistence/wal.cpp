@@ -122,7 +122,21 @@ Result<EngineSeq> segment_sequence_checked(const std::filesystem::path& path) {
   return value;
 }
 
-Result<std::vector<std::byte>> encode_frame(
+struct PreparedFrame {
+  std::size_t offset{};
+  std::size_t size{};
+};
+
+void write_le32_at(std::vector<std::byte>& bytes, const std::size_t offset,
+                   const std::uint32_t value) noexcept {
+  for (unsigned index = 0; index < 4U; ++index) {
+    bytes[offset + index] =
+        static_cast<std::byte>((value >> (index * 8U)) & 0xffU);
+  }
+}
+
+Result<PreparedFrame> append_frame_to_buffer(
+    std::vector<std::byte>& frame_bytes,
     const domain::CommittedCommand& command, WalAppendProfile* profile) {
   const auto payload_start = profile == nullptr ? ProfileClock::time_point{}
                                                 : ProfileClock::now();
@@ -136,13 +150,16 @@ Result<std::vector<std::byte>> encode_frame(
 
   const auto assembly_before_crc_start =
       profile == nullptr ? ProfileClock::time_point{} : ProfileClock::now();
-  BinaryWriter body_writer;
-  body_writer.u16(kRecordVersion);
-  body_writer.data().insert(body_writer.data().end(), payload.begin(), payload.end());
+  const auto frame_offset = frame_bytes.size();
+  frame_bytes.resize(frame_offset + sizeof(std::uint32_t));
+  const auto body_offset = frame_bytes.size();
+  write_le16(frame_bytes, kRecordVersion);
+  frame_bytes.insert(frame_bytes.end(), payload.begin(), payload.end());
 
   const auto crc_start = profile == nullptr ? ProfileClock::time_point{}
                                             : ProfileClock::now();
-  const auto body_crc = crc32c(body_writer.data());
+  const auto body_crc = crc32c(
+      std::span<const std::byte>(frame_bytes).subspan(body_offset));
   const auto crc_end = profile == nullptr ? ProfileClock::time_point{}
                                           : ProfileClock::now();
   if (profile != nullptr) {
@@ -150,20 +167,19 @@ Result<std::vector<std::byte>> encode_frame(
                    profile_elapsed_ns(assembly_before_crc_start, crc_start));
     add_profile_ns(profile->crc_ns, profile_elapsed_ns(crc_start, crc_end));
   }
-  body_writer.u32(body_crc);
-  const auto& body = body_writer.data();
-  if (body.size() > kMaxRecordSize) {
+  write_le32(frame_bytes, body_crc);
+  const auto body_size = frame_bytes.size() - body_offset;
+  if (body_size > kMaxRecordSize) {
+    frame_bytes.resize(frame_offset);
     return wal_error(ErrorCode::wal_failure, "WAL record exceeds maximum size");
   }
-
-  BinaryWriter frame_writer;
-  frame_writer.u32(static_cast<std::uint32_t>(body.size()));
-  frame_writer.data().insert(frame_writer.data().end(), body.begin(), body.end());
+  write_le32_at(frame_bytes, frame_offset,
+                static_cast<std::uint32_t>(body_size));
   if (profile != nullptr) {
     add_profile_ns(profile->frame_assembly_ns,
                    profile_elapsed_ns(crc_end, ProfileClock::now()));
   }
-  return frame_writer.data();
+  return PreparedFrame{frame_offset, frame_bytes.size() - frame_offset};
 }
 
 }  // namespace
@@ -175,8 +191,7 @@ struct Wal::PrepareWorkers {
   };
 
   struct LaneResult {
-    std::vector<PreparedRecord> records;
-    WalAppendProfile profile{};
+    PreparedLane lane;
     std::uint64_t task_ns{};
     std::optional<Error> error;
     std::exception_ptr exception;
@@ -210,7 +225,7 @@ struct Wal::PrepareWorkers {
 
   ~PrepareWorkers() { stop(); }
 
-  Result<std::vector<PreparedRecord>> prepare(
+  Result<std::vector<PreparedLane>> prepare(
       const std::span<const domain::CommittedCommand> commands,
       const std::size_t min_parallel_commands, WalAppendProfile* profile,
       WalPrepareStats* stats) {
@@ -219,7 +234,7 @@ struct Wal::PrepareWorkers {
                                range_count > 1U;
     if (!use_parallel) {
       auto result = prepare_sequential(commands, segment_size_, profile);
-      if (stats != nullptr && std::holds_alternative<std::vector<PreparedRecord>>(result)) {
+      if (stats != nullptr && std::holds_alternative<std::vector<PreparedLane>>(result)) {
         add_profile_ns(stats->tasks, 1U);
       }
       return result;
@@ -274,8 +289,8 @@ struct Wal::PrepareWorkers {
       }
     }
 
-    std::vector<PreparedRecord> records;
-    records.reserve(commands.size());
+    std::vector<PreparedLane> lanes;
+    lanes.reserve(job.lanes.size());
     if (profile != nullptr) {
       add_profile_ns(profile->parallel_prepare_groups, 1U);
       add_profile_ns(profile->prepare_tasks,
@@ -284,17 +299,15 @@ struct Wal::PrepareWorkers {
     for (auto& lane : job.lanes) {
       if (profile != nullptr) {
         add_profile_ns(profile->prepare_task_ns, lane.task_ns);
-        merge_profile(profile, lane.profile);
+        merge_profile(profile, lane.lane.profile);
       }
-      for (auto& record : lane.records) {
-        records.push_back(std::move(record));
-      }
+      lanes.push_back(std::move(lane.lane));
     }
     if (stats != nullptr) {
       add_profile_ns(stats->parallel_groups, 1U);
       add_profile_ns(stats->tasks, static_cast<std::uint64_t>(job.lanes.size()));
     }
-    return records;
+    return lanes;
   }
 
   void stop() noexcept {
@@ -310,30 +323,34 @@ struct Wal::PrepareWorkers {
   }
 
  private:
-  static Result<std::vector<PreparedRecord>> prepare_sequential(
+  static Result<std::vector<PreparedLane>> prepare_sequential(
       const std::span<const domain::CommittedCommand> commands,
       const std::size_t segment_size, WalAppendProfile* profile) {
     const auto task_start = profile == nullptr ? ProfileClock::time_point{}
                                                 : ProfileClock::now();
-    std::vector<PreparedRecord> records;
-    records.reserve(commands.size());
+    PreparedLane lane;
+    lane.records.reserve(commands.size());
     for (const auto& command : commands) {
-      auto frame = encode_frame(command, profile);
+      auto frame = append_frame_to_buffer(lane.frame_bytes, command, profile);
       if (std::holds_alternative<Error>(frame)) {
         return std::get<Error>(frame);
       }
-      auto prepared_frame = std::get<std::vector<std::byte>>(std::move(frame));
-      if (prepared_frame.size() > segment_size - kHeaderSize) {
+      const auto prepared_frame = std::get<PreparedFrame>(frame);
+      if (prepared_frame.size > segment_size - kHeaderSize) {
         return wal_error(ErrorCode::wal_failure, "WAL record cannot fit in a segment");
       }
-      records.push_back(PreparedRecord{command, std::move(prepared_frame)});
+      lane.records.push_back(
+          PreparedRecord{command, prepared_frame.offset, prepared_frame.size});
     }
     if (profile != nullptr) {
       add_profile_ns(profile->prepare_task_ns,
                      profile_elapsed_ns(task_start, ProfileClock::now()));
       profile->prepare_tasks = 1U;
     }
-    return records;
+    std::vector<PreparedLane> lanes;
+    lanes.reserve(1U);
+    lanes.push_back(std::move(lane));
+    return lanes;
   }
 
   static void merge_profile(WalAppendProfile* destination,
@@ -346,35 +363,37 @@ struct Wal::PrepareWorkers {
 
   static void run_lane(Job& job, const std::size_t lane_index,
                        const std::size_t segment_size, const bool profiled) noexcept {
-    auto& lane = job.lanes[lane_index];
+    auto& lane_result = job.lanes[lane_index];
+    auto& lane = lane_result.lane;
     const auto range = job.ranges[lane_index];
     const auto start = profiled ? ProfileClock::now() : ProfileClock::time_point{};
     try {
       lane.records.reserve(range.end - range.begin);
       for (std::size_t index = range.begin; index < range.end; ++index) {
-        auto frame = encode_frame(job.commands[index], profiled ? &lane.profile : nullptr);
+        auto frame = append_frame_to_buffer(
+            lane.frame_bytes, job.commands[index], profiled ? &lane.profile : nullptr);
         if (std::holds_alternative<Error>(frame)) {
-          lane.failure_index = index;
-          lane.error = std::get<Error>(std::move(frame));
+          lane_result.failure_index = index;
+          lane_result.error = std::get<Error>(std::move(frame));
           break;
         }
-        auto prepared_frame =
-            std::get<std::vector<std::byte>>(std::move(frame));
-        if (prepared_frame.size() > segment_size - kHeaderSize) {
-          lane.failure_index = index;
-          lane.error = wal_error(ErrorCode::wal_failure,
-                                 "WAL record cannot fit in a segment");
+        const auto prepared_frame = std::get<PreparedFrame>(frame);
+        if (prepared_frame.size > segment_size - kHeaderSize) {
+          lane_result.failure_index = index;
+          lane_result.error = wal_error(ErrorCode::wal_failure,
+                                        "WAL record cannot fit in a segment");
           break;
         }
-        lane.records.push_back(
-            PreparedRecord{job.commands[index], std::move(prepared_frame)});
+        lane.records.push_back(PreparedRecord{job.commands[index],
+                                              prepared_frame.offset,
+                                              prepared_frame.size});
       }
     } catch (...) {
-      lane.failure_index = range.begin + lane.records.size();
-      lane.exception = std::current_exception();
+      lane_result.failure_index = range.begin + lane.records.size();
+      lane_result.exception = std::current_exception();
     }
     if (profiled) {
-      lane.task_ns = profile_elapsed_ns(start, ProfileClock::now());
+      lane_result.task_ns = profile_elapsed_ns(start, ProfileClock::now());
     }
   }
 
@@ -665,7 +684,7 @@ Status Wal::rebuild_record_index_unlocked() {
   return std::monostate{};
 }
 
-Result<std::vector<Wal::PreparedRecord>> Wal::prepare_records_unlocked(
+Result<std::vector<Wal::PreparedLane>> Wal::prepare_records_unlocked(
     const std::span<const domain::CommittedCommand> commands,
     WalAppendProfile* profile) {
   if (prepare_workers_ != nullptr) {
@@ -673,21 +692,21 @@ Result<std::vector<Wal::PreparedRecord>> Wal::prepare_records_unlocked(
                                      prepare_options_.min_parallel_commands,
                                      profile, &prepare_stats_);
   }
-  std::vector<PreparedRecord> records;
-  records.reserve(commands.size());
+  PreparedLane lane;
+  lane.records.reserve(commands.size());
   const auto task_start = profile == nullptr ? ProfileClock::time_point{}
                                               : ProfileClock::now();
   for (const auto& command : commands) {
-    auto frame = encode_frame(command, profile);
+    auto frame = append_frame_to_buffer(lane.frame_bytes, command, profile);
     if (std::holds_alternative<Error>(frame)) {
       return std::get<Error>(frame);
     }
-    const auto& frame_bytes = std::get<std::vector<std::byte>>(frame);
-    if (frame_bytes.size() > segment_size_ - kHeaderSize) {
+    const auto prepared_frame = std::get<PreparedFrame>(frame);
+    if (prepared_frame.size > segment_size_ - kHeaderSize) {
       return wal_error(ErrorCode::wal_failure, "WAL record cannot fit in a segment");
     }
-    records.push_back(PreparedRecord{command,
-                                     std::get<std::vector<std::byte>>(std::move(frame))});
+    lane.records.push_back(
+        PreparedRecord{command, prepared_frame.offset, prepared_frame.size});
   }
   if (profile != nullptr) {
     add_profile_ns(profile->prepare_task_ns,
@@ -695,7 +714,10 @@ Result<std::vector<Wal::PreparedRecord>> Wal::prepare_records_unlocked(
     profile->prepare_tasks = 1U;
   }
   add_profile_ns(prepare_stats_.tasks, 1U);
-  return records;
+  std::vector<PreparedLane> lanes;
+  lanes.reserve(1U);
+  lanes.push_back(std::move(lane));
+  return lanes;
 }
 
 Result<WalPosition> Wal::append(const domain::CommittedCommand& command) {
@@ -706,7 +728,7 @@ Result<WalPosition> Wal::append(const domain::CommittedCommand& command) {
     return std::get<Error>(prepared);
   }
   return append_prepared_unlocked(
-      std::get<std::vector<PreparedRecord>>(std::move(prepared)), nullptr);
+      std::get<std::vector<PreparedLane>>(std::move(prepared)), nullptr);
 }
 
 Result<WalPosition> Wal::append_batch(
@@ -744,17 +766,49 @@ Result<WalPosition> Wal::append_batch_unlocked(
     profile->prepare_ns = profile_elapsed_ns(prepare_start, ProfileClock::now());
   }
   return append_prepared_unlocked(
-      std::get<std::vector<PreparedRecord>>(std::move(prepared)), profile);
+      std::get<std::vector<PreparedLane>>(std::move(prepared)), profile);
 }
 
 Result<WalPosition> Wal::append_prepared_unlocked(
-    std::vector<PreparedRecord> records, WalAppendProfile* profile) {
-  if (records.empty()) {
+    std::vector<PreparedLane> lanes, WalAppendProfile* profile) {
+  if (lanes.empty()) {
     return wal_error(ErrorCode::wal_failure, "WAL append batch is empty");
   }
-  if (records.size() > records_.max_size() - records_.size()) {
+
+  struct PreparedFrameRef {
+    const PreparedLane* lane{};
+    const PreparedRecord* record{};
+  };
+  std::size_t record_count = 0;
+  for (const auto& lane : lanes) {
+    if (lane.records.size() > std::numeric_limits<std::size_t>::max() - record_count) {
+      return wal_error(ErrorCode::wal_failure, "WAL record count overflow");
+    }
+    record_count += lane.records.size();
+  }
+  if (record_count == 0) {
+    return wal_error(ErrorCode::wal_failure, "WAL append batch is empty");
+  }
+  if (record_count > records_.max_size() - records_.size()) {
     return wal_error(ErrorCode::wal_failure, "WAL record count overflow");
   }
+
+  std::vector<PreparedFrameRef> records;
+  records.reserve(record_count);
+  for (const auto& lane : lanes) {
+    for (const auto& record : lane.records) {
+      if (record.frame_offset > lane.frame_bytes.size() ||
+          record.frame_size > lane.frame_bytes.size() - record.frame_offset) {
+        return wal_error(ErrorCode::wal_failure, "WAL prepared frame range is invalid");
+      }
+      records.push_back(PreparedFrameRef{&lane, &record});
+    }
+  }
+
+  const auto frame_span = [](const PreparedFrameRef& record) {
+    return std::span<const std::byte>(record.lane->frame_bytes)
+        .subspan(record.record->frame_offset, record.record->frame_size);
+  };
 
   const auto plan_start = profile == nullptr ? ProfileClock::time_point{}
                                              : ProfileClock::now();
@@ -771,7 +825,7 @@ Result<WalPosition> Wal::append_prepared_unlocked(
   }
   std::uint64_t frame_bytes_total = 0;
   for (const auto& record : records) {
-    const auto frame_bytes = static_cast<std::uint64_t>(record.frame.size());
+    const auto frame_bytes = static_cast<std::uint64_t>(record.record->frame_size);
     if (frame_bytes > std::numeric_limits<std::uint64_t>::max() - cumulative_frame_bytes ||
         frame_bytes > std::numeric_limits<std::uint64_t>::max() - frame_bytes_total) {
       return wal_error(ErrorCode::wal_failure, "WAL frame byte index overflow");
@@ -780,30 +834,20 @@ Result<WalPosition> Wal::append_prepared_unlocked(
     frame_bytes_total += frame_bytes;
     if (previous_sequence.has_value() &&
         (*previous_sequence == std::numeric_limits<EngineSeq>::max() ||
-         record.command.engine_seq != *previous_sequence + 1U)) {
+         record.record->command.engine_seq != *previous_sequence + 1U)) {
       if (continuity_id == std::numeric_limits<std::uint64_t>::max()) {
         return wal_error(ErrorCode::wal_failure, "WAL continuity index overflow");
       }
       ++continuity_id;
     }
     cached_records.push_back(
-        CachedRecord{record.command, frame_bytes, cumulative_frame_bytes, continuity_id});
-    previous_sequence = record.command.engine_seq;
+        CachedRecord{record.record->command, frame_bytes, cumulative_frame_bytes,
+                     continuity_id});
+    previous_sequence = record.record->command.engine_seq;
   }
   if (frame_bytes_total > std::numeric_limits<std::uint64_t>::max() - size_bytes_) {
     return wal_error(ErrorCode::wal_failure, "WAL size overflow");
   }
-  const auto required_capacity = records_.size() + records.size();
-  if (required_capacity > records_.capacity()) {
-    const auto current_capacity = records_.capacity();
-    const auto growth = std::max(records.size(), current_capacity / 2U);
-    const auto grown_capacity =
-        growth > records_.max_size() - current_capacity
-            ? records_.max_size()
-            : current_capacity + growth;
-    records_.reserve(std::max(required_capacity, grown_capacity));
-  }
-
   struct PreparedChunk {
     std::size_t first_record{};
     std::size_t record_count{};
@@ -823,7 +867,8 @@ Result<WalPosition> Wal::append_prepared_unlocked(
     std::size_t end_record = first_record;
     std::uint64_t chunk_bytes = 0;
     while (end_record < records.size()) {
-      const auto frame_size = static_cast<std::uint64_t>(records[end_record].frame.size());
+      const auto frame_size = static_cast<std::uint64_t>(
+          records[end_record].record->frame_size);
       const auto available = static_cast<std::uint64_t>(segment_size_) - simulated_active_bytes;
       if (chunk_bytes > available || frame_size > available - chunk_bytes ||
           frame_size > std::numeric_limits<std::uint64_t>::max() - chunk_bytes) {
@@ -842,7 +887,7 @@ Result<WalPosition> Wal::append_prepared_unlocked(
     std::vector<std::byte> bytes;
     bytes.reserve(static_cast<std::size_t>(chunk_bytes));
     for (std::size_t index = first_record; index < end_record; ++index) {
-      const auto& frame = records[index].frame;
+      const auto frame = frame_span(records[index]);
       bytes.insert(bytes.end(), frame.begin(), frame.end());
     }
     if (profile != nullptr) {
@@ -859,6 +904,35 @@ Result<WalPosition> Wal::append_prepared_unlocked(
   if (profile != nullptr) {
     profile->plan_copy_ns = profile_elapsed_ns(plan_start, ProfileClock::now());
     profile->frame_bytes = frame_bytes_total;
+  }
+
+  struct RecordStageGuard {
+    std::deque<CachedRecord>& records;
+    const std::size_t original_size;
+    std::size_t published_size{};
+    bool committed{false};
+
+    ~RecordStageGuard() noexcept {
+      if (!committed) {
+        records.resize(original_size + published_size);
+      }
+    }
+
+    void mark_published(const std::size_t count) noexcept { published_size += count; }
+    void commit() noexcept { committed = true; }
+  } record_stage{records_, records_.size()};
+
+  // Stage all cache entries before rotation or data I/O.  This keeps possible
+  // container allocation failures outside the write-success boundary.  The
+  // guard removes entries for chunks whose writes do not complete.
+  const auto cache_stage_start = profile != nullptr ? ProfileClock::now()
+                                                    : ProfileClock::time_point{};
+  for (auto& cached_record : cached_records) {
+    records_.push_back(std::move(cached_record));
+  }
+  if (profile != nullptr) {
+    add_profile_ns(profile->publish_ns,
+                   profile_elapsed_ns(cache_stage_start, ProfileClock::now()));
   }
 
   WalPosition last_position;
@@ -879,7 +953,8 @@ Result<WalPosition> Wal::append_prepared_unlocked(
                          profile_elapsed_ns(rotation_sync_start, ProfileClock::now()));
         }
       }
-      auto status = create_segment(records[chunk.first_record].command.engine_seq, profile);
+      auto status = create_segment(
+          records[chunk.first_record].record->command.engine_seq, profile);
       if (std::holds_alternative<Error>(status)) {
         return std::get<Error>(status);
       }
@@ -907,15 +982,12 @@ Result<WalPosition> Wal::append_prepared_unlocked(
     }
     const auto publish_start = profile == nullptr ? ProfileClock::time_point{}
                                                   : ProfileClock::now();
-    for (std::size_t offset = 0; offset < chunk.record_count; ++offset) {
-      const auto record_index = chunk.first_record + offset;
-      records_.push_back(std::move(cached_records[record_index]));
-    }
+    record_stage.mark_published(chunk.record_count);
     const auto chunk_bytes = static_cast<std::uint64_t>(chunk.bytes.size());
     active_bytes_ += chunk_bytes;
     size_bytes_ += chunk_bytes;
     const auto last_record_index = chunk.first_record + chunk.record_count - 1U;
-    last_position = WalPosition{records[last_record_index].command.engine_seq,
+    last_position = WalPosition{records[last_record_index].record->command.engine_seq,
                                 active_segment_, active_bytes_};
     last_appended_position_ = last_position;
     active_dirty_ = true;
@@ -924,6 +996,7 @@ Result<WalPosition> Wal::append_prepared_unlocked(
                      profile_elapsed_ns(publish_start, ProfileClock::now()));
     }
   }
+  record_stage.commit();
   return last_position;
 }
 
@@ -951,7 +1024,7 @@ Result<std::vector<domain::CommittedCommand>> Wal::replay() {
   }
   std::sort(segments.begin(), segments.end(), segment_less);
   std::vector<domain::CommittedCommand> commands;
-  std::vector<CachedRecord> cached_records;
+  std::deque<CachedRecord> cached_records;
   std::optional<EngineSeq> previous;
   for (std::size_t segment_index = 0; segment_index < segments.size(); ++segment_index) {
     const auto& segment = segments[segment_index];

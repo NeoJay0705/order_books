@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -111,12 +112,19 @@ class Wal {
 
   struct PreparedRecord {
     domain::CommittedCommand command;
-    std::vector<std::byte> frame;
+    std::size_t frame_offset{};
+    std::size_t frame_size{};
+  };
+
+  struct PreparedLane {
+    std::vector<std::byte> frame_bytes;
+    std::vector<PreparedRecord> records;
+    WalAppendProfile profile{};
   };
 
   struct PrepareWorkers;
 
-  Result<std::vector<PreparedRecord>> prepare_records_unlocked(
+  Result<std::vector<PreparedLane>> prepare_records_unlocked(
       std::span<const domain::CommittedCommand> commands,
       WalAppendProfile* profile);
   Status initialize_prepare_workers();
@@ -124,7 +132,7 @@ class Wal {
       std::span<const domain::CommittedCommand> commands,
       WalAppendProfile* profile);
   Result<WalPosition> append_prepared_unlocked(
-      std::vector<PreparedRecord> records, WalAppendProfile* profile);
+      std::vector<PreparedLane> lanes, WalAppendProfile* profile);
   Status rebuild_record_index_unlocked();
 
   std::filesystem::path directory_;
@@ -137,7 +145,7 @@ class Wal {
   WalPosition last_appended_position_;
   WalPosition durable_position_;
   bool active_dirty_{false};
-  std::vector<CachedRecord> records_;
+  std::deque<CachedRecord> records_;
   bool records_loaded_{false};
   WalPrepareOptions prepare_options_{};
   WalPrepareStats prepare_stats_{};

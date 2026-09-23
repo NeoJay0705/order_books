@@ -190,6 +190,78 @@ if(BUILD_TESTING)
   )
 
   add_test(
+    NAME order_books_benchmark_wal_measurement_marker_requires_wal_workload
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--wal-measurement-marker=/tmp/order-books-marker
+            -DEXPECTED_ERROR=wal_measurement_marker_requires_wal_workload
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_wal_measurement_marker_requires_no_rotation
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DWORKLOAD=wal_write_ceiling
+            -DCLI_ARGUMENT=--wal-measurement-marker=/tmp/order-books-marker
+            -DEXPECTED_ERROR=wal_measurement_marker_requires_no_rotation
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_wal_measurement_marker_requires_single_epoch
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DWORKLOAD=wal_write_ceiling
+            -DCLI_ARGUMENT=--wal-measurement-marker=/tmp/order-books-marker
+            -DCLI_ARGUMENT_2=--wal-no-rotation-epoch-commands=2
+            -DCLI_ARGUMENT_3=--wal-group-size=2
+            -DCLI_ARGUMENT_4=--iterations=2
+            -DCLI_ARGUMENT_5=--wal-sync=none
+            -DEXPECTED_ERROR=wal_measurement_marker_requires_single_epoch
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_wal_segment_size_invalid
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--workload=wal_write_ceiling
+            -DCLI_ARGUMENT_2=--wal-segment-size-bytes=abc
+            -DEXPECTED_ERROR=wal_segment_size_bytes_invalid
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_wal_segment_size_zero
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--workload=wal_write_ceiling
+            -DCLI_ARGUMENT_2=--wal-segment-size-bytes=0
+            -DEXPECTED_ERROR=wal_segment_size_bytes_must_be_positive
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_wal_segment_size_overflow
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--workload=wal_write_ceiling
+            -DCLI_ARGUMENT_2=--wal-segment-size-bytes=18446744073709551616
+            -DEXPECTED_ERROR=wal_segment_size_bytes_invalid
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_wal_segment_size_requires_wal_workload
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DCLI_ARGUMENT=--wal-segment-size-bytes=1048576
+            -DEXPECTED_ERROR=wal_segment_size_bytes_requires_wal_workload
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_invalid_cli.cmake"
+  )
+
+  add_test(
     NAME order_books_benchmark_wal_rotation_diagnostic_invalid
     COMMAND ${CMAKE_COMMAND}
             "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
@@ -318,6 +390,38 @@ if(BUILD_TESTING)
             -DCLI_ARGUMENT_4=--wal-group-size=2
             -DCLI_ARGUMENT_5=--iterations=2
             -DCLI_ARGUMENT_6=--warmup=1
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_wal_no_rotation_output.cmake"
+  )
+
+  add_test(
+    NAME order_books_benchmark_wal_segment_size_smoke
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            -DEXPECTED_SEGMENT_SIZE=1048576
+            -DCLI_ARGUMENT_1=--workload=wal_write_ceiling
+            -DCLI_ARGUMENT_2=--wal-sync=none
+            -DCLI_ARGUMENT_3=--wal-segment-size-bytes=1048576
+            -DCLI_ARGUMENT_4=--wal-no-rotation-epoch-commands=2
+            -DCLI_ARGUMENT_5=--wal-group-size=2
+            -DCLI_ARGUMENT_6=--iterations=2
+            -DCLI_ARGUMENT_7=--warmup=1
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_wal_no_rotation_output.cmake"
+  )
+
+  set(wal_measurement_marker_smoke
+      "${CMAKE_CURRENT_BINARY_DIR}/wal-measurement-marker-smoke.txt")
+  add_test(
+    NAME order_books_benchmark_wal_measurement_marker_smoke
+    COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:order_books_benchmark>"
+            "-DEXPECTED_MARKER=${wal_measurement_marker_smoke}"
+            -DCLI_ARGUMENT_1=--workload=wal_write_ceiling
+            -DCLI_ARGUMENT_2=--wal-sync=none
+            -DCLI_ARGUMENT_3=--wal-no-rotation-epoch-commands=4
+            -DCLI_ARGUMENT_4=--wal-group-size=2
+            -DCLI_ARGUMENT_5=--iterations=2
+            -DCLI_ARGUMENT_6=--warmup=1
+            "-DCLI_ARGUMENT_7=--wal-measurement-marker=${wal_measurement_marker_smoke}"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/check_wal_no_rotation_output.cmake"
   )
 
